@@ -5,6 +5,8 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
+      args:
+        BUILD_PROFILE: ${CODEX_BUILD_PROFILE:-dev}
     stdin_open: true
     tty: true
     working_dir: /workspace
@@ -12,6 +14,10 @@ services:
       CODEX_HOME: /codex-home
       HOME: /codex-home
       DOCKER_HOST: unix:///docker.sock
+      CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG: "1"
+      CODEX_MODEL_PROVIDER_ID: docker-model-runner-container
+      CODEX_MODEL_PROVIDER_NAME: Docker Model Runner
+      CODEX_MODEL_PROVIDER_BASE_URL: http://host.docker.internal:12434/engines/v1
       CODEX_DOCKER_MODEL_CONTEXT_HOST: http://host.docker.internal:12434
       CODEX_DOCKER_MODEL_CONTEXT_NAME: codex-host
     group_add:
@@ -19,20 +25,9 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - .:/workspace
+      - ${CODEX_WORKSPACE:-${PWD}}:/workspace
       - codex-home:/codex-home
       - ${DOCKER_HOST_SOCKET:-${HOME}/.docker/run/docker.sock}:/docker.sock
-    command:
-      - -c
-      - 'model_provider="docker-model-runner-container"'
-      - -c
-      - 'model_providers.docker-model-runner-container.name="Docker Model Runner"'
-      - -c
-      - 'model_providers.docker-model-runner-container.base_url="http://host.docker.internal:12434/engines/v1"'
-      - -c
-      - 'model_providers.docker-model-runner-container.wire_api="chat_completions"'
-      - -c
-      - 'model_providers.docker-model-runner-container.requires_openai_auth=false'
 
 volumes:
   codex-home:

@@ -93,16 +93,47 @@ docker build --build-arg BUILD_PROFILE=dev -t codex-for-docker:dev .
 Run with Compose from this repository:
 
 ```sh
-docker compose run --rm codex
+docker compose run --build --rm codex
+```
+
+Run from any project directory by pointing Docker Compose at this repo's Compose file:
+
+```sh
+docker compose -f /path/to/Local-Codex-for-Docker/compose.yaml run --build --rm codex
+```
+
+By default, Compose mounts the shell's current working directory at `/workspace` and uses the faster `dev` build profile. To launch Codex for Docker against another codebase explicitly, point `CODEX_WORKSPACE` at that folder:
+
+```sh
+CODEX_WORKSPACE="/path/to/your/project" docker compose run --rm codex
+```
+
+Run from the project root when possible. If your shell is inside a subdirectory, set `CODEX_WORKSPACE` to the repository root so Codex can see the project metadata:
+
+```sh
+CODEX_WORKSPACE="$(git rev-parse --show-toplevel)" docker compose run --rm codex
+```
+
+On Linux Docker Engine, use the Linux socket path:
+
+```sh
+CODEX_WORKSPACE="$PWD" DOCKER_HOST_SOCKET=/var/run/docker.sock docker compose run --rm codex
+```
+
+To force the optimized release build through Compose:
+
+```sh
+CODEX_BUILD_PROFILE=release docker compose build codex
 ```
 
 The Compose example:
 
-- Mounts the current directory at `/workspace`.
+- Mounts `CODEX_WORKSPACE` at `/workspace`, defaulting to the shell's current working directory.
 - Persists container Codex state in the `codex-home` volume.
 - Mounts the host Docker socket at `/docker.sock` so Docker CLI commands can talk to the host Docker engine. On Docker Desktop, this defaults to `${HOME}/.docker/run/docker.sock`; on Linux, run with `DOCKER_HOST_SOCKET=/var/run/docker.sock`.
 - Points the container provider at `http://host.docker.internal:12434/engines/v1`.
 - Installs the Docker Model CLI plugin and configures a container-local Docker Model context for `http://host.docker.internal:12434`, so dynamic context matching can call `docker model inspect` and `docker model package` from inside the container without trying to start a second standalone Model Runner.
+- Injects the Docker provider config in the container entrypoint so normal Codex arguments still work, for example `docker compose run --rm codex exec "summarize this repo"`.
 
 To use Docker Model Gateway instead, change the Compose provider URL to `http://host.docker.internal:4000/v1`.
 
