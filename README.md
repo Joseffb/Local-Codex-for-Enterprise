@@ -1,6 +1,8 @@
-# Codex for Docker
+# Local Codex for Enterprise
 
-Codex for Docker is a local-first fork of the open source Codex CLI. Its default runtime uses Docker Model Runner through an OpenAI-compatible Chat Completions adapter, with optional Docker MCP Toolkit setup for local tools.
+Local Codex for Enterprise is an experimental private enterprise extension of Local Codex for Docker. It is not affiliated with, endorsed by, or supported by OpenAI.
+
+This repository starts from the Local Codex for Docker codebase and will add self-hosted enterprise controls for multi-user local Codex deployments: authentication, Postgres-backed state, RBAC, workspace allowlisting, worker supervision, audit trails, and terminal remote access. The current baseline still retains the single-user Docker Model Runner behavior while the enterprise server is under development.
 
 ## Status
 
