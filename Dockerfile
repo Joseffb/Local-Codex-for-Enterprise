@@ -6,6 +6,8 @@ FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG BUILD_PROFILE=release
+ARG CARGO_PROFILE_RELEASE_LTO=thin
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -27,7 +29,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/codex-rs/target \
     cd codex-rs \
     && case "$BUILD_PROFILE" in \
-        release) cargo build --locked --release -p codex-cli --bin codex && install -m 0755 target/release/codex /usr/local/bin/codex ;; \
+        release) CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$CARGO_PROFILE_RELEASE_CODEGEN_UNITS" cargo build --locked --release -p codex-cli --bin codex && install -m 0755 target/release/codex /usr/local/bin/codex ;; \
         dev) cargo build --locked -p codex-cli --bin codex && install -m 0755 target/debug/codex /usr/local/bin/codex ;; \
         *) echo "unsupported BUILD_PROFILE=$BUILD_PROFILE; use release or dev" >&2; exit 1 ;; \
     esac
@@ -38,6 +40,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        bubblewrap \
         ca-certificates \
         curl \
         git \

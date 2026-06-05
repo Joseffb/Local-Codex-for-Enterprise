@@ -6,7 +6,7 @@ Codex for Docker is a local-first fork of the open source Codex CLI. Its default
 
 - Local Docker Model Runner execution has been smoke-tested.
 - Large-prompt handling has been smoke-tested with a Docker Model context-size variant.
-- Container packaging is present. The Dockerfile supports a production `release` build and a faster `dev` build for smoke validation; live container run validation depends on a responsive local Docker daemon.
+- Container packaging is present. The optimized `release` image path and Compose release override have been validated against a responsive local Docker daemon; Compose still defaults to the faster `dev` build profile for iteration.
 
 ## Local-Only Contract
 
@@ -84,6 +84,15 @@ Build the image:
 docker build -t codex-for-docker:local .
 ```
 
+The default release container build still uses Cargo's release profile, but overrides the repo's fat-LTO defaults with Docker-friendly settings:
+
+```text
+CARGO_PROFILE_RELEASE_LTO=thin
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+```
+
+This keeps the image on an optimized release build while avoiding Docker Desktop memory failures during Rust's final link step. On machines with more builder memory, you can override those build args.
+
 For a faster local smoke build, use:
 
 ```sh
@@ -126,6 +135,15 @@ To force the optimized release build through Compose:
 CODEX_BUILD_PROFILE=release docker compose build codex
 ```
 
+Release build tuning can also be overridden:
+
+```sh
+CODEX_BUILD_PROFILE=release \
+CODEX_CARGO_PROFILE_RELEASE_LTO=fat \
+CODEX_CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+docker compose build codex
+```
+
 The Compose example:
 
 - Mounts `CODEX_WORKSPACE` at `/workspace`, defaulting to the shell's current working directory.
@@ -134,6 +152,7 @@ The Compose example:
 - Points the container provider at `http://host.docker.internal:12434/engines/v1`.
 - Installs the Docker Model CLI plugin and configures a container-local Docker Model context for `http://host.docker.internal:12434`, so dynamic context matching can call `docker model inspect` and `docker model package` from inside the container without trying to start a second standalone Model Runner.
 - Injects the Docker provider config in the container entrypoint so normal Codex arguments still work, for example `docker compose run --rm codex exec "summarize this repo"`.
+- Defaults Codex's inner sandbox to `danger-full-access` because Docker is the outer sandbox boundary. Many Docker runtimes do not allow an unprivileged container process to create the nested Linux namespaces that bubblewrap needs. To opt back into nested Codex sandboxing in a privileged/container-runtime-specific setup, set `CODEX_CONTAINER_SANDBOX_MODE=workspace-write`; set it to an empty value to skip the container entrypoint sandbox override entirely.
 
 To use Docker Model Gateway instead, change the Compose provider URL to `http://host.docker.internal:4000/v1`.
 

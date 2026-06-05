@@ -3,6 +3,7 @@
 use super::*;
 
 pub(crate) const SESSION_HEADER_MAX_INNER_WIDTH: usize = 56; // Just an eyeballed value
+const LOCAL_CODEX_DOCKER_TITLE: &str = "Local Codex Docker v1.0.1";
 
 pub(crate) fn card_inner_width(width: u16, max_inner_width: usize) -> Option<usize> {
     if width < 4 {
@@ -239,7 +240,6 @@ pub(crate) fn has_yolo_permissions(
 }
 #[derive(Debug)]
 pub(crate) struct SessionHeaderHistoryCell {
-    version: &'static str,
     model: String,
     model_style: Style,
     reasoning_effort: Option<ReasoningEffortConfig>,
@@ -254,7 +254,7 @@ impl SessionHeaderHistoryCell {
         reasoning_effort: Option<ReasoningEffortConfig>,
         show_fast_status: bool,
         directory: PathBuf,
-        version: &'static str,
+        _version: &'static str,
     ) -> Self {
         Self::new_with_style(
             model,
@@ -262,7 +262,7 @@ impl SessionHeaderHistoryCell {
             reasoning_effort,
             show_fast_status,
             directory,
-            version,
+            _version,
         )
     }
 
@@ -272,10 +272,9 @@ impl SessionHeaderHistoryCell {
         reasoning_effort: Option<ReasoningEffortConfig>,
         show_fast_status: bool,
         directory: PathBuf,
-        version: &'static str,
+        _version: &'static str,
     ) -> Self {
         Self {
-            version,
             model,
             model_style,
             reasoning_effort,
@@ -337,12 +336,10 @@ impl HistoryCell for SessionHeaderHistoryCell {
 
         let make_row = |spans: Vec<Span<'static>>| Line::from(spans);
 
-        // Title line rendered inside the box: ">_ OpenAI Codex (vX)"
+        // Title line rendered inside the box.
         let title_spans: Vec<Span<'static>> = vec![
             Span::from(">_ ").dim(),
-            Span::from("OpenAI Codex").bold(),
-            Span::from(" ").dim(),
-            Span::from(format!("(v{})", self.version)).dim(),
+            Span::from(LOCAL_CODEX_DOCKER_TITLE).bold(),
         ];
 
         const CHANGE_MODEL_HINT_COMMAND: &str = "/model";
@@ -407,7 +404,7 @@ impl HistoryCell for SessionHeaderHistoryCell {
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
         let mut lines = vec![
-            Line::from(format!("OpenAI Codex (v{})", self.version)),
+            Line::from(LOCAL_CODEX_DOCKER_TITLE),
             Line::from(format!(
                 "model: {}{}",
                 self.model,

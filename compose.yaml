@@ -7,6 +7,8 @@ services:
       target: runtime
       args:
         BUILD_PROFILE: ${CODEX_BUILD_PROFILE:-dev}
+        CARGO_PROFILE_RELEASE_LTO: ${CODEX_CARGO_PROFILE_RELEASE_LTO:-thin}
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${CODEX_CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}
     stdin_open: true
     tty: true
     working_dir: /workspace

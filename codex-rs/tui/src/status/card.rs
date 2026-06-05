@@ -6,7 +6,6 @@ use crate::history_cell::with_border_with_inner_width;
 use crate::legacy_core::config::Config;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
-use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
 use chrono::Local;
 use codex_app_server_protocol::AskForApproval;
@@ -54,6 +53,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/codex/settings/usage";
+const LOCAL_CODEX_DOCKER_TITLE: &str = "Local Codex Docker v1.0.1";
 
 #[derive(Debug, Clone)]
 struct StatusContextWindowData {
@@ -710,9 +710,7 @@ impl HistoryCell for StatusHistoryCell {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(vec![
             Span::from(format!("{}>_ ", FieldFormatter::INDENT)).dim(),
-            Span::from("OpenAI Codex").bold(),
-            Span::from(" ").dim(),
-            Span::from(format!("(v{CODEX_CLI_VERSION})")).dim(),
+            Span::from(LOCAL_CODEX_DOCKER_TITLE).bold(),
         ]));
 
         let available_inner_width = usize::from(width.saturating_sub(4));

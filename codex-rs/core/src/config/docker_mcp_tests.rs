@@ -92,3 +92,22 @@ fn should_prompt_only_when_available_unconfigured_and_no_decision() {
         /*toolkit_available*/ false,
     ));
 }
+
+#[test]
+fn docker_mcp_help_requires_gateway_command() {
+    let generic_docker_help = r#"
+Usage:  docker [OPTIONS] COMMAND
+
+Management Commands:
+  model*      Docker Model Runner
+"#;
+    let docker_mcp_help = r#"
+Usage:  docker mcp COMMAND
+
+Commands:
+  gateway     Run the Docker MCP gateway
+"#;
+
+    assert!(!docker_mcp_help_has_gateway(generic_docker_help));
+    assert!(docker_mcp_help_has_gateway(docker_mcp_help));
+}

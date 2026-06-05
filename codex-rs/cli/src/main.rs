@@ -95,7 +95,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Parser)]
 #[clap(
     author,
-    version,
+    name = "Local Codex Docker",
+    version = "v1.0.1",
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like

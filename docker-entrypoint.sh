@@ -26,4 +26,11 @@ if [ "${CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG:-1}" != "0" ]; then
         "$@"
 fi
 
+container_sandbox_mode="${CODEX_CONTAINER_SANDBOX_MODE-danger-full-access}"
+if [ -n "$container_sandbox_mode" ]; then
+    set -- \
+        -c "sandbox_mode=\"$container_sandbox_mode\"" \
+        "$@"
+fi
+
 exec codex "$@"

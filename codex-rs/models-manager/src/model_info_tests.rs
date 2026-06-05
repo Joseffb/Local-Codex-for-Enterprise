@@ -72,3 +72,33 @@ fn model_context_window_uses_model_value_without_override() {
 
     assert_eq!(updated, model);
 }
+
+#[test]
+fn docker_qwen3_coder_has_local_metadata() {
+    let model = model_info_from_slug("ai/qwen3-coder");
+
+    assert!(!model.used_fallback_model_metadata);
+    assert_eq!(model.slug, "ai/qwen3-coder");
+    assert_eq!(model.context_window, Some(262_144));
+    assert_eq!(model.max_context_window, Some(262_144));
+    assert_eq!(
+        model.truncation_policy,
+        TruncationPolicyConfig::tokens(10_000)
+    );
+    assert_eq!(model.shell_type, ConfigShellToolType::ShellCommand);
+}
+
+#[test]
+fn docker_qwen3_coder_aliases_have_local_metadata() {
+    for slug in [
+        "qwen3-coder",
+        "ai/qwen3-coder:latest",
+        "codex-for-docker/ai-qwen3-coder:ctx262144",
+    ] {
+        let model = model_info_from_slug(slug);
+
+        assert!(!model.used_fallback_model_metadata, "{slug}");
+        assert_eq!(model.slug, slug);
+        assert_eq!(model.context_window, Some(262_144));
+    }
+}

@@ -84,8 +84,24 @@ pub fn docker_mcp_server_config() -> McpServerConfig {
 pub fn docker_mcp_toolkit_available() -> bool {
     Command::new("docker")
         .args(["mcp", "--help"])
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && docker_mcp_help_has_gateway(&format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+        })
+}
+
+pub(crate) fn docker_mcp_help_has_gateway(help: &str) -> bool {
+    help.lines().any(|line| {
+        line.trim_start()
+            .split_whitespace()
+            .next()
+            .is_some_and(|command| command == "gateway")
+    })
 }
 
 #[cfg(test)]

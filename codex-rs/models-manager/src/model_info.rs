@@ -1,4 +1,5 @@
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelInstructionsVariables;
@@ -19,6 +20,7 @@ const LOCAL_FRIENDLY_TEMPLATE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+const DOCKER_QWEN3_CODER_CONTEXT_WINDOW: i64 = 262_144;
 
 pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
     if let Some(supports_reasoning_summaries) = config.model_supports_reasoning_summaries
@@ -64,6 +66,10 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
 
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
+    if is_docker_qwen3_coder_slug(slug) {
+        return docker_qwen3_coder_model_info(slug);
+    }
+
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
     ModelInfo {
         slug: slug.to_string(),
@@ -98,6 +104,54 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: true, // this is the fallback model metadata
+        supports_search_tool: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
+    }
+}
+
+fn is_docker_qwen3_coder_slug(slug: &str) -> bool {
+    matches!(
+        slug,
+        "ai/qwen3-coder" | "ai/qwen3-coder:latest" | "qwen3-coder" | "qwen3-coder:latest"
+    ) || (slug.starts_with("codex-for-docker/") && slug.contains("qwen3-coder"))
+}
+
+fn docker_qwen3_coder_model_info(slug: &str) -> ModelInfo {
+    ModelInfo {
+        slug: slug.to_string(),
+        display_name: "Qwen3 Coder (Docker)".to_string(),
+        description: Some("Local Qwen3 Coder model served by Docker Model Runner.".to_string()),
+        default_reasoning_level: None,
+        supported_reasoning_levels: Vec::new(),
+        shell_type: ConfigShellToolType::ShellCommand,
+        visibility: ModelVisibility::List,
+        supported_in_api: true,
+        priority: 10,
+        additional_speed_tiers: Vec::new(),
+        service_tiers: Vec::new(),
+        default_service_tier: None,
+        availability_nux: None,
+        upgrade: None,
+        base_instructions: BASE_INSTRUCTIONS.to_string(),
+        model_messages: None,
+        supports_reasoning_summaries: false,
+        default_reasoning_summary: ReasoningSummary::None,
+        support_verbosity: false,
+        default_verbosity: None,
+        apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+        web_search_tool_type: WebSearchToolType::Text,
+        truncation_policy: TruncationPolicyConfig::tokens(/*limit*/ 10_000),
+        supports_parallel_tool_calls: false,
+        supports_image_detail_original: false,
+        context_window: Some(DOCKER_QWEN3_CODER_CONTEXT_WINDOW),
+        max_context_window: Some(DOCKER_QWEN3_CODER_CONTEXT_WINDOW),
+        auto_compact_token_limit: None,
+        effective_context_window_percent: 95,
+        experimental_supported_tools: Vec::new(),
+        input_modalities: default_input_modalities(),
+        used_fallback_model_metadata: false,
         supports_search_tool: false,
         auto_review_model_override: None,
         tool_mode: None,
