@@ -1,0 +1,3 @@
+-- Local Codex for Enterprise bootstrap schema.
+-- The first production migration will create users, roles, policies,
+-- workspaces, sessions, API tokens, worker records, and audit events.
