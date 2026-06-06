@@ -1,5 +1,11 @@
 use anyhow::Context;
 use anyhow::Result;
+use argon2::Argon2;
+use argon2::PasswordHash;
+use argon2::PasswordHasher;
+use argon2::PasswordVerifier;
+use argon2::password_hash::SaltString;
+use argon2::password_hash::rand_core::OsRng;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
@@ -38,32 +44,23 @@ pub struct WorkerHandoffClaims {
     pub aud: String,
 }
 
-// Scaffold-only password hashing until the Argon2 dependency can be resolved
-// and wired in. This must not ship as the production enterprise password path.
 pub fn hash_password(password: &str) -> Result<String> {
-    let salt = Uuid::new_v4().to_string();
-    Ok(format!(
-        "sha256:{salt}:{}",
-        hash_password_with_salt(password, &salt)
-    ))
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .context("hash password with argon2")?;
+    Ok(hash.to_string())
 }
 
 pub fn verify_password(password: &str, encoded_hash: &str) -> Result<bool> {
-    let Some(("sha256", rest)) = encoded_hash.split_once(':') else {
-        return Ok(false);
+    let parsed = match PasswordHash::new(encoded_hash) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(false),
     };
-    let Some((salt, expected_hash)) = rest.split_once(':') else {
-        return Ok(false);
-    };
-    Ok(hash_password_with_salt(password, salt) == expected_hash)
-}
 
-fn hash_password_with_salt(password: &str, salt: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(salt.as_bytes());
-    hasher.update(b":");
-    hasher.update(password.as_bytes());
-    URL_SAFE_NO_PAD.encode(hasher.finalize())
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
 }
 
 pub fn issue_api_token(label: &str) -> Result<IssuedApiToken> {

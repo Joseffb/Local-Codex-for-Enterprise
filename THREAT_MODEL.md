@@ -39,7 +39,6 @@ This document tracks the security boundaries and known risks for the enterprise 
 - OIDC is not implemented in v1.
 - Cedar/ABAC policy packs are reserved for future work.
 - The current scaffold does not yet launch real Codex workers.
-- Casbin, Argon2, and Utoipa are the selected production libraries for RBAC,
-  password hashing, and OpenAPI, but the first scaffold keeps them documented
-  rather than linked because Cargo registry access was unavailable during the
-  initial private branch setup.
+- Argon2, Casbin, and Utoipa are wired at scaffold level for password hashing,
+  RBAC policy evaluation, and OpenAPI generation; production database adapters,
+  persistent policy loading, and full route coverage are still incomplete.

@@ -45,9 +45,31 @@ fn owner_can_administer_but_viewer_cannot() {
 fn password_hashes_verify_without_storing_plaintext() {
     let hash = auth::hash_password("correct horse battery staple").expect("hash password");
 
+    assert!(hash.starts_with("$argon2"));
     assert_ne!(hash, "correct horse battery staple");
     assert!(auth::verify_password("correct horse battery staple", &hash).expect("verify password"));
     assert!(!auth::verify_password("wrong", &hash).expect("reject wrong password"));
+}
+
+#[tokio::test]
+async fn casbin_policy_allows_owner_but_rejects_viewer_admin() {
+    assert!(
+        rbac::casbin_role_allows(EnterpriseRole::Owner, EnterpriseAction::AdministerUsers)
+            .await
+            .expect("owner policy")
+    );
+    assert!(
+        !rbac::casbin_role_allows(EnterpriseRole::Viewer, EnterpriseAction::AdministerUsers)
+            .await
+            .expect("viewer policy")
+    );
+}
+
+#[test]
+fn openapi_document_describes_health_route() {
+    let document = api::openapi_document();
+
+    assert!(document.paths.paths.contains_key("/healthz"));
 }
 
 #[test]
