@@ -10,8 +10,8 @@ This repository starts from the Local Codex for Docker codebase and will add sel
 - Large-prompt handling has been smoke-tested with a Docker Model context-size variant.
 - Container packaging is present. The optimized `release` image path and Compose release override have been validated against a responsive local Docker daemon; Compose still defaults to the faster `dev` build profile for iteration.
 - Enterprise server scaffold is now runnable as `codex-enterprise-server`.
-- Enterprise server currently supports health/config endpoints, first-run owner setup, opaque owner API token issuance, token-authenticated worker start/list records, Postgres migrations, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
-- Enterprise server does not yet launch real Codex workers, broker remote TUI sessions, persist chat/thread history, or enforce full workspace path policy through every route.
+- Enterprise server currently supports health/config endpoints, first-run owner setup, opaque owner API token issuance, token-authenticated worker start/list/stop, Postgres migrations, workspace allowlist enforcement for worker launch, supervised worker process launch, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
+- Enterprise server does not yet broker remote TUI sessions, persist chat/thread history, expose worker websocket handoff, or provide full audit coverage for every route.
 
 ## Enterprise Server Smoke
 
@@ -21,6 +21,18 @@ Run the enterprise control plane against Postgres:
 DATABASE_URL="postgres://codex:codex@127.0.0.1:5432/codex_enterprise" \
   cargo run -p codex-enterprise-server -- \
   --bind-addr 127.0.0.1:8787
+```
+
+By default, workers launch:
+
+```sh
+codex-app-server --listen unix://{socket_path}
+```
+
+For smoke tests, override the worker command:
+
+```sh
+--worker-command /bin/sh --worker-arg=-c --worker-arg 'sleep 30'
 ```
 
 First-run setup:
@@ -35,10 +47,29 @@ curl -X POST http://127.0.0.1:8787/v1/setup/enterprise \
   }'
 ```
 
+Workspace roots must exist on the enterprise server host. Worker launch
+canonicalizes the requested workspace path and rejects paths outside the
+registered roots.
+
 The setup response returns the owner API token once. Use it with:
 
 ```sh
 curl http://127.0.0.1:8787/v1/workers \
+  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
+```
+
+Start and stop a worker:
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/workers \
+  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "workspace_path": "/srv/workspaces/project-a",
+    "session_id": "session-1"
+  }'
+
+curl -X DELETE http://127.0.0.1:8787/v1/workers/$WORKER_ID \
   -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
 ```
 

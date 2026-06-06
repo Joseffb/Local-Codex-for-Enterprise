@@ -3,6 +3,13 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::process::Child;
+use tokio::process::Command;
+use tokio::sync::Mutex;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -40,10 +47,90 @@ pub struct WorkerRecord {
     pub worker_id: String,
     pub owner_user_id: String,
     pub workspace_id: String,
+    pub workspace_path: String,
     pub session_id: String,
     pub state: WorkerState,
+    pub pid: Option<u32>,
+    pub socket_path: Option<String>,
+    pub log_path: Option<String>,
     #[schema(value_type = String)]
     pub last_heartbeat_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRuntime {
+    pub pid: u32,
+    pub socket_path: String,
+    pub log_path: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkerRuntimeSupervisor {
+    children: Arc<Mutex<HashMap<String, Child>>>,
+}
+
+impl WorkerRuntimeSupervisor {
+    pub async fn launch(
+        &self,
+        worker: &WorkerRecord,
+        config: &crate::config::EnterpriseConfig,
+    ) -> anyhow::Result<WorkerRuntime> {
+        std::fs::create_dir_all(&config.worker_socket_dir)?;
+        std::fs::create_dir_all(&config.worker_log_dir)?;
+
+        let socket_path = Path::new(&config.worker_socket_dir)
+            .join(format!("{}.sock", worker.worker_id))
+            .to_string_lossy()
+            .to_string();
+        let log_path = Path::new(&config.worker_log_dir)
+            .join(format!("{}.log", worker.worker_id))
+            .to_string_lossy()
+            .to_string();
+
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let stderr = log.try_clone()?;
+        let args = config
+            .worker_args
+            .iter()
+            .map(|arg| {
+                arg.replace("{worker_id}", &worker.worker_id)
+                    .replace("{socket_path}", &socket_path)
+                    .replace("{workspace_path}", &worker.workspace_path)
+            })
+            .collect::<Vec<_>>();
+
+        let mut command = Command::new(&config.worker_command);
+        command
+            .args(args)
+            .current_dir(PathBuf::from(&worker.workspace_path))
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr));
+        let child = command.spawn()?;
+        let pid = child.id().unwrap_or_default();
+        self.children
+            .lock()
+            .await
+            .insert(worker.worker_id.clone(), child);
+
+        Ok(WorkerRuntime {
+            pid,
+            socket_path,
+            log_path,
+        })
+    }
+
+    pub async fn stop(&self, worker_id: &str) -> anyhow::Result<bool> {
+        let child = self.children.lock().await.remove(worker_id);
+        let Some(mut child) = child else {
+            return Ok(false);
+        };
+
+        child.kill().await?;
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -62,8 +149,12 @@ impl WorkerSupervisor {
             worker_id: Uuid::new_v4().to_string(),
             owner_user_id: owner_user_id.into(),
             workspace_id: workspace_id.into(),
+            workspace_path: String::new(),
             session_id: session_id.into(),
             state: WorkerState::Starting,
+            pid: None,
+            socket_path: None,
+            log_path: None,
             last_heartbeat_at: Utc::now(),
         };
         self.workers

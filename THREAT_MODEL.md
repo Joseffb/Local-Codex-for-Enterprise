@@ -27,6 +27,8 @@ This document tracks the security boundaries and known risks for the enterprise 
 - Workers must be tracked from startup through shutdown or failure.
 - The supervisor must record owner user, workspace, session, PID/container ID, state, heartbeat time, logs pointer, and cleanup policy.
 - Abandoned or failed workers must be cleaned up deterministically.
+- Worker process launch must use canonicalized, allowlisted workspace paths as the process working directory.
+- Worker command and argument templates must not allow user-controlled shell expansion.
 
 ## Audit Requirements
 
@@ -38,7 +40,7 @@ This document tracks the security boundaries and known risks for the enterprise 
 - Enterprise mode is private MVP work and not yet ready for public use.
 - OIDC is not implemented in v1.
 - Cedar/ABAC policy packs are reserved for future work.
-- The current scaffold does not yet launch real Codex workers.
+- Worker process launch is implemented, but websocket handoff and remote TUI brokerage are not yet implemented.
 - Argon2, Casbin, and Utoipa are wired at scaffold level for password hashing,
   RBAC policy evaluation, and OpenAPI generation; production database adapters,
   persistent policy loading, and full route coverage are still incomplete.

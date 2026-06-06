@@ -34,8 +34,12 @@ CREATE TABLE IF NOT EXISTS enterprise_workers (
     worker_id UUID PRIMARY KEY,
     owner_user_id UUID NOT NULL REFERENCES enterprise_users(user_id),
     workspace_id TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
     session_id TEXT NOT NULL,
     state TEXT NOT NULL,
+    pid BIGINT,
+    socket_path TEXT,
+    log_path TEXT,
     last_heartbeat_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

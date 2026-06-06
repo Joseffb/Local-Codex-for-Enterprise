@@ -14,6 +14,10 @@ pub struct EnterpriseConfig {
     pub default_model: String,
     pub bind_addr: String,
     pub database_url: Option<String>,
+    pub worker_command: String,
+    pub worker_args: Vec<String>,
+    pub worker_socket_dir: String,
+    pub worker_log_dir: String,
 }
 
 impl Default for EnterpriseConfig {
@@ -24,6 +28,10 @@ impl Default for EnterpriseConfig {
             default_model: "ai/qwen3-coder".to_string(),
             bind_addr: "127.0.0.1:8787".to_string(),
             database_url: None,
+            worker_command: "codex-app-server".to_string(),
+            worker_args: vec!["--listen".to_string(), "unix://{socket_path}".to_string()],
+            worker_socket_dir: "/tmp/local-codex-enterprise/workers".to_string(),
+            worker_log_dir: "/tmp/local-codex-enterprise/logs".to_string(),
         }
     }
 }

@@ -11,6 +11,7 @@ use codex_enterprise_server::rbac::EnterpriseAction;
 use codex_enterprise_server::rbac::EnterpriseRole;
 use codex_enterprise_server::setup::BootstrapReceipt;
 use codex_enterprise_server::setup::SetupMode;
+use codex_enterprise_server::storage::InMemoryEnterpriseStore;
 use codex_enterprise_server::worker::WorkerState;
 use codex_enterprise_server::worker::WorkerSupervisor;
 use codex_enterprise_server::workspace::WorkspacePolicy;
@@ -80,6 +81,9 @@ fn openapi_document_describes_health_route() {
 #[tokio::test]
 async fn setup_endpoint_bootstraps_once_and_returns_owner_api_token() {
     let router = api::build_test_router();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
     let request = Request::builder()
         .method("POST")
         .uri("/v1/setup/enterprise")
@@ -88,7 +92,7 @@ async fn setup_endpoint_bootstraps_once_and_returns_owner_api_token() {
             serde_json::json!({
                 "owner_email": "owner@example.com",
                 "owner_password": "correct horse battery staple",
-                "workspace_roots": ["/srv/workspaces"]
+                "workspace_roots": [workspace_root]
             })
             .to_string(),
         ))
@@ -116,7 +120,7 @@ async fn setup_endpoint_bootstraps_once_and_returns_owner_api_token() {
             serde_json::json!({
                 "owner_email": "owner@example.com",
                 "owner_password": "correct horse battery staple",
-                "workspace_roots": ["/srv/workspaces"]
+                "workspace_roots": [temp.path().join("workspaces")]
             })
             .to_string(),
         ))
@@ -128,7 +132,19 @@ async fn setup_endpoint_bootstraps_once_and_returns_owner_api_token() {
 
 #[tokio::test]
 async fn workers_api_requires_token_then_tracks_started_worker() {
-    let router = api::build_test_router();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    let project = workspace_root.join("project");
+    let socket_dir = temp.path().join("sockets");
+    let log_dir = temp.path().join("logs");
+    std::fs::create_dir_all(&project).expect("project workspace");
+
+    let mut config = EnterpriseConfig::default();
+    config.worker_command = "/bin/sh".to_string();
+    config.worker_args = vec!["-c".to_string(), "sleep 30".to_string()];
+    config.worker_socket_dir = socket_dir.to_string_lossy().to_string();
+    config.worker_log_dir = log_dir.to_string_lossy().to_string();
+    let router = api::build_router_with_store(InMemoryEnterpriseStore::default(), config);
     let unauthenticated = Request::builder()
         .method("GET")
         .uri("/v1/workers")
@@ -150,7 +166,7 @@ async fn workers_api_requires_token_then_tracks_started_worker() {
             serde_json::json!({
                 "owner_email": "owner@example.com",
                 "owner_password": "correct horse battery staple",
-                "workspace_roots": ["/srv/workspaces"]
+                "workspace_roots": [workspace_root]
             })
             .to_string(),
         ))
@@ -169,7 +185,7 @@ async fn workers_api_requires_token_then_tracks_started_worker() {
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(
             serde_json::json!({
-                "workspace_id": "workspace-1",
+                "workspace_path": project,
                 "session_id": "session-1"
             })
             .to_string(),
@@ -181,6 +197,22 @@ async fn workers_api_requires_token_then_tracks_started_worker() {
         .await
         .expect("start worker response");
     assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("start worker body");
+    let started: serde_json::Value = serde_json::from_slice(&body).expect("start json body");
+    assert_eq!(started["worker"]["state"], "Running");
+    assert!(started["worker"]["pid"].as_u64().expect("pid") > 0);
+    assert!(
+        started["worker"]["log_path"]
+            .as_str()
+            .expect("log path")
+            .starts_with(log_dir.to_str().expect("log dir"))
+    );
+    let worker_id = started["worker"]["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
 
     let list_workers = Request::builder()
         .method("GET")
@@ -189,6 +221,7 @@ async fn workers_api_requires_token_then_tracks_started_worker() {
         .body(Body::empty())
         .expect("request");
     let response = router
+        .clone()
         .oneshot(list_workers)
         .await
         .expect("list worker response");
@@ -198,7 +231,81 @@ async fn workers_api_requires_token_then_tracks_started_worker() {
         .expect("body");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
     assert_eq!(json["workers"].as_array().expect("workers").len(), 1);
-    assert_eq!(json["workers"][0]["workspace_id"], "workspace-1");
+    assert_eq!(json["workers"][0]["state"], "Running");
+    assert_eq!(json["workers"][0]["session_id"], "session-1");
+
+    let stop_worker = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/workers/{worker_id}"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .oneshot(stop_worker)
+        .await
+        .expect("stop worker response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stop body");
+    let stopped: serde_json::Value = serde_json::from_slice(&body).expect("stop json body");
+    assert_eq!(stopped["worker"]["state"], "Stopped");
+}
+
+#[tokio::test]
+async fn workers_api_rejects_workspace_escape_before_launching_worker() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    let allowed_project = workspace_root.join("project");
+    let outside_project = temp.path().join("outside");
+    std::fs::create_dir_all(&allowed_project).expect("allowed project");
+    std::fs::create_dir_all(&outside_project).expect("outside project");
+
+    let mut config = EnterpriseConfig::default();
+    config.worker_command = "/bin/sh".to_string();
+    config.worker_args = vec!["-c".to_string(), "sleep 30".to_string()];
+    config.worker_socket_dir = temp.path().join("sockets").to_string_lossy().to_string();
+    config.worker_log_dir = temp.path().join("logs").to_string_lossy().to_string();
+    let router = api::build_router_with_store(InMemoryEnterpriseStore::default(), config);
+
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": [workspace_root]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let setup_response = router.clone().oneshot(setup).await.expect("setup response");
+    let body = to_bytes(setup_response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let token = json["api_token"].as_str().expect("api token");
+
+    let start_worker = Request::builder()
+        .method("POST")
+        .uri("/v1/workers")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_path": outside_project,
+                "session_id": "session-1"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .oneshot(start_worker)
+        .await
+        .expect("start worker response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[test]

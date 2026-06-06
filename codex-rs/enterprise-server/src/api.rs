@@ -4,8 +4,11 @@ use crate::storage::BootstrapInput;
 use crate::storage::EnterpriseStore;
 use crate::storage::InMemoryEnterpriseStore;
 use crate::worker::WorkerRecord;
+use crate::worker::WorkerRuntimeSupervisor;
+use crate::worker::WorkerState;
 use axum::Json;
 use axum::Router;
+use axum::extract::Path;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
@@ -27,11 +30,20 @@ pub struct HealthResponse {
 pub struct AppState<S> {
     store: S,
     config: EnterpriseConfig,
+    worker_runtime: WorkerRuntimeSupervisor,
 }
 
 impl<S> AppState<S> {
-    pub fn new(store: S, config: EnterpriseConfig) -> Self {
-        Self { store, config }
+    pub fn new(
+        store: S,
+        config: EnterpriseConfig,
+        worker_runtime: WorkerRuntimeSupervisor,
+    ) -> Self {
+        Self {
+            store,
+            config,
+            worker_runtime,
+        }
     }
 }
 
@@ -59,7 +71,7 @@ pub struct EnterpriseSetupResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct StartWorkerRequest {
-    pub workspace_id: String,
+    pub workspace_path: String,
     pub session_id: String,
 }
 
@@ -95,6 +107,17 @@ impl ApiError {
     fn internal(error: anyhow::Error) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
     }
+
+    fn storage(error: anyhow::Error) -> Self {
+        let message = error.to_string();
+        if message.contains("workspace path is not allowlisted") {
+            return Self::new(StatusCode::FORBIDDEN, message);
+        }
+        if message.contains("canonicalize workspace") {
+            return Self::new(StatusCode::BAD_REQUEST, message);
+        }
+        Self::internal(error)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -127,7 +150,7 @@ async fn healthz() -> Json<HealthResponse> {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(healthz, get_config, setup_enterprise::<InMemoryEnterpriseStore>, list_workers::<InMemoryEnterpriseStore>, start_worker::<InMemoryEnterpriseStore>),
+    paths(healthz, get_config, setup_enterprise::<InMemoryEnterpriseStore>, list_workers::<InMemoryEnterpriseStore>, start_worker::<InMemoryEnterpriseStore>, stop_worker::<InMemoryEnterpriseStore>),
     components(schemas(
         ConfigResponse,
         EnterpriseSetupRequest,
@@ -168,7 +191,15 @@ where
             "/v1/workers",
             get(list_workers::<S>).post(start_worker::<S>),
         )
-        .with_state(AppState::new(store, config))
+        .route(
+            "/v1/workers/{worker_id}",
+            axum::routing::delete(stop_worker::<S>),
+        )
+        .with_state(AppState::new(
+            store,
+            config,
+            WorkerRuntimeSupervisor::default(),
+        ))
 }
 
 #[utoipa::path(
@@ -283,12 +314,72 @@ where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
+    let starting_worker = state
+        .store
+        .start_worker(&principal, request.workspace_path, request.session_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let runtime = match state
+        .worker_runtime
+        .launch(&starting_worker, &state.config)
+        .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = state
+                .store
+                .update_worker_runtime(
+                    &principal,
+                    &starting_worker.worker_id,
+                    WorkerState::Failed,
+                    None,
+                )
+                .await;
+            return Err(ApiError::internal(error));
+        }
+    };
     let worker = state
         .store
-        .start_worker(&principal, request.workspace_id, request.session_id)
+        .update_worker_runtime(
+            &principal,
+            &starting_worker.worker_id,
+            WorkerState::Running,
+            Some(runtime),
+        )
         .await
         .map_err(ApiError::internal)?;
     Ok((StatusCode::CREATED, Json(WorkerResponse { worker })))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/workers/{worker_id}",
+    responses(
+        (status = 200, description = "Worker stopped", body = WorkerResponse),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse)
+    ),
+    security(("bearer" = []))
+)]
+async fn stop_worker<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    Path(worker_id): Path<String>,
+) -> Result<Json<WorkerResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    state
+        .worker_runtime
+        .stop(&worker_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let worker = state
+        .store
+        .stop_worker(&principal, &worker_id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(WorkerResponse { worker }))
 }
 
 async fn authenticate<S>(

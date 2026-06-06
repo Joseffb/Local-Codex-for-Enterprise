@@ -18,6 +18,18 @@ struct Args {
         default_value = "127.0.0.1:8787"
     )]
     bind_addr: String,
+
+    #[arg(long, env = "LOCAL_CODEX_ENTERPRISE_WORKER_COMMAND")]
+    worker_command: Option<String>,
+
+    #[arg(long = "worker-arg", env = "LOCAL_CODEX_ENTERPRISE_WORKER_ARGS")]
+    worker_args: Vec<String>,
+
+    #[arg(long, env = "LOCAL_CODEX_ENTERPRISE_WORKER_SOCKET_DIR")]
+    worker_socket_dir: Option<String>,
+
+    #[arg(long, env = "LOCAL_CODEX_ENTERPRISE_WORKER_LOG_DIR")]
+    worker_log_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -25,7 +37,19 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let config = EnterpriseConfig::from_runtime_parts(args.bind_addr, Some(args.database_url));
+    let mut config = EnterpriseConfig::from_runtime_parts(args.bind_addr, Some(args.database_url));
+    if let Some(worker_command) = args.worker_command {
+        config.worker_command = worker_command;
+    }
+    if !args.worker_args.is_empty() {
+        config.worker_args = args.worker_args;
+    }
+    if let Some(worker_socket_dir) = args.worker_socket_dir {
+        config.worker_socket_dir = worker_socket_dir;
+    }
+    if let Some(worker_log_dir) = args.worker_log_dir {
+        config.worker_log_dir = worker_log_dir;
+    }
     let database_url = config
         .database_url
         .clone()

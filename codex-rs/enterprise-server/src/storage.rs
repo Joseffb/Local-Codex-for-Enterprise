@@ -2,7 +2,9 @@ use crate::auth;
 use crate::setup::BootstrapReceipt;
 use crate::setup::SetupMode;
 use crate::worker::WorkerRecord;
+use crate::worker::WorkerRuntime;
 use crate::worker::WorkerState;
+use crate::workspace::WorkspacePolicy;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,6 +14,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use sqlx::Row;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -45,9 +48,18 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
-        workspace_id: String,
+        workspace_path: String,
         session_id: String,
     ) -> Result<WorkerRecord>;
+    async fn update_worker_runtime(
+        &self,
+        principal: &AuthPrincipal,
+        worker_id: &str,
+        state: WorkerState,
+        runtime: Option<WorkerRuntime>,
+    ) -> Result<WorkerRecord>;
+    async fn stop_worker(&self, principal: &AuthPrincipal, worker_id: &str)
+    -> Result<WorkerRecord>;
     async fn list_workers(&self, principal: &AuthPrincipal) -> Result<Vec<WorkerRecord>>;
 }
 
@@ -55,6 +67,7 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
 struct MemoryState {
     bootstrap: Option<BootstrapOutcome>,
     users: HashMap<String, AuthPrincipal>,
+    workspace_roots: Vec<String>,
     token_hashes: HashMap<String, String>,
     workers: Vec<WorkerRecord>,
 }
@@ -86,15 +99,17 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             .insert(input.issued_token_hash, owner_user_id.clone());
         state.users.insert(owner_user_id.clone(), principal);
 
+        let workspace_roots = canonicalize_workspace_roots(input.workspace_roots)?;
         let outcome = BootstrapOutcome {
             owner_user_id,
             owner_email: input.owner_email.clone(),
             receipt: BootstrapReceipt::new(
                 SetupMode::EnterpriseServer,
                 input.owner_email,
-                input.workspace_roots,
+                workspace_roots.clone(),
             ),
         };
+        state.workspace_roots = workspace_roots;
         state.bootstrap = Some(outcome.clone());
         Ok(outcome)
     }
@@ -112,20 +127,59 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
-        workspace_id: String,
+        workspace_path: String,
         session_id: String,
     ) -> Result<WorkerRecord> {
         let mut state = self.state.lock().await;
+        let resolved_workspace_path = authorize_workspace(&state.workspace_roots, workspace_path)?;
         let worker = WorkerRecord {
             worker_id: Uuid::new_v4().to_string(),
             owner_user_id: principal.user_id.clone(),
-            workspace_id,
+            workspace_id: resolved_workspace_path.clone(),
+            workspace_path: resolved_workspace_path,
             session_id,
             state: WorkerState::Starting,
+            pid: None,
+            socket_path: None,
+            log_path: None,
             last_heartbeat_at: Utc::now(),
         };
         state.workers.push(worker.clone());
         Ok(worker)
+    }
+
+    async fn update_worker_runtime(
+        &self,
+        principal: &AuthPrincipal,
+        worker_id: &str,
+        state_value: WorkerState,
+        runtime: Option<WorkerRuntime>,
+    ) -> Result<WorkerRecord> {
+        let mut state = self.state.lock().await;
+        let worker = state
+            .workers
+            .iter_mut()
+            .find(|worker| {
+                worker.worker_id == worker_id && worker.owner_user_id == principal.user_id
+            })
+            .context("worker not found")?;
+        worker.state = state_value;
+        worker.last_heartbeat_at = Utc::now();
+        if let Some(runtime) = runtime {
+            worker.pid = Some(runtime.pid);
+            worker.socket_path = Some(runtime.socket_path);
+            worker.log_path = Some(runtime.log_path);
+        }
+        Ok(worker.clone())
+    }
+
+    async fn stop_worker(
+        &self,
+        principal: &AuthPrincipal,
+        worker_id: &str,
+    ) -> Result<WorkerRecord> {
+        self.update_worker_runtime(principal, worker_id, WorkerState::Stopped, None)
+            .await
     }
 
     async fn list_workers(&self, principal: &AuthPrincipal) -> Result<Vec<WorkerRecord>> {
@@ -192,7 +246,9 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .await
         .context("insert owner api token")?;
 
-        for root in &input.workspace_roots {
+        let workspace_roots = canonicalize_workspace_roots(input.workspace_roots)?;
+
+        for root in &workspace_roots {
             sqlx::query(
                 "INSERT INTO enterprise_workspaces (workspace_id, root_path, created_by)
                  VALUES ($1, $2, $3)",
@@ -235,7 +291,7 @@ impl EnterpriseStore for PostgresEnterpriseStore {
             receipt: BootstrapReceipt::new(
                 SetupMode::EnterpriseServer,
                 input.owner_email,
-                input.workspace_roots,
+                workspace_roots,
             ),
         })
     }
@@ -265,26 +321,32 @@ impl EnterpriseStore for PostgresEnterpriseStore {
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
-        workspace_id: String,
+        workspace_path: String,
         session_id: String,
     ) -> Result<WorkerRecord> {
+        let resolved_workspace_path = self.authorize_workspace_path(workspace_path).await?;
         let worker = WorkerRecord {
             worker_id: Uuid::new_v4().to_string(),
             owner_user_id: principal.user_id.clone(),
-            workspace_id,
+            workspace_id: resolved_workspace_path.clone(),
+            workspace_path: resolved_workspace_path,
             session_id,
             state: WorkerState::Starting,
+            pid: None,
+            socket_path: None,
+            log_path: None,
             last_heartbeat_at: Utc::now(),
         };
 
         sqlx::query(
             "INSERT INTO enterprise_workers
-             (worker_id, owner_user_id, workspace_id, session_id, state, last_heartbeat_at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (worker_id, owner_user_id, workspace_id, workspace_path, session_id, state, last_heartbeat_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(Uuid::parse_str(&worker.worker_id).context("parse worker id")?)
         .bind(Uuid::parse_str(&worker.owner_user_id).context("parse owner user id")?)
         .bind(&worker.workspace_id)
+        .bind(&worker.workspace_path)
         .bind(&worker.session_id)
         .bind(worker.state.as_str())
         .bind(worker.last_heartbeat_at)
@@ -295,9 +357,52 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         Ok(worker)
     }
 
+    async fn update_worker_runtime(
+        &self,
+        principal: &AuthPrincipal,
+        worker_id: &str,
+        state: WorkerState,
+        runtime: Option<WorkerRuntime>,
+    ) -> Result<WorkerRecord> {
+        let pid = runtime.as_ref().map(|runtime| runtime.pid as i64);
+        let socket_path = runtime.as_ref().map(|runtime| runtime.socket_path.as_str());
+        let log_path = runtime.as_ref().map(|runtime| runtime.log_path.as_str());
+        let row = sqlx::query(
+            "UPDATE enterprise_workers
+             SET state = $1,
+                 pid = COALESCE($2, pid),
+                 socket_path = COALESCE($3, socket_path),
+                 log_path = COALESCE($4, log_path),
+                 last_heartbeat_at = now()
+             WHERE worker_id = $5 AND owner_user_id = $6
+             RETURNING worker_id::text, owner_user_id::text, workspace_id, workspace_path, session_id, state, pid, socket_path, log_path, last_heartbeat_at",
+        )
+        .bind(state.as_str())
+        .bind(pid)
+        .bind(socket_path)
+        .bind(log_path)
+        .bind(Uuid::parse_str(worker_id).context("parse worker id")?)
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("update worker runtime")?
+        .context("worker not found")?;
+
+        worker_from_row(row)
+    }
+
+    async fn stop_worker(
+        &self,
+        principal: &AuthPrincipal,
+        worker_id: &str,
+    ) -> Result<WorkerRecord> {
+        self.update_worker_runtime(principal, worker_id, WorkerState::Stopped, None)
+            .await
+    }
+
     async fn list_workers(&self, principal: &AuthPrincipal) -> Result<Vec<WorkerRecord>> {
         let rows = sqlx::query(
-            "SELECT worker_id::text, owner_user_id::text, workspace_id, session_id, state, last_heartbeat_at
+            "SELECT worker_id::text, owner_user_id::text, workspace_id, workspace_path, session_id, state, pid, socket_path, log_path, last_heartbeat_at
              FROM enterprise_workers
              WHERE owner_user_id = $1
              ORDER BY created_at DESC",
@@ -307,19 +412,59 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .await
         .context("list worker records")?;
 
-        rows.into_iter()
-            .map(|row| {
-                let state: String = row.try_get("state")?;
-                Ok(WorkerRecord {
-                    worker_id: row.try_get("worker_id")?,
-                    owner_user_id: row.try_get("owner_user_id")?,
-                    workspace_id: row.try_get("workspace_id")?,
-                    session_id: row.try_get("session_id")?,
-                    state: WorkerState::from_storage(&state)
-                        .context("unknown stored worker state")?,
-                    last_heartbeat_at: row.try_get("last_heartbeat_at")?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(worker_from_row).collect()
     }
+}
+
+impl PostgresEnterpriseStore {
+    async fn authorize_workspace_path(&self, requested_path: String) -> Result<String> {
+        let rows = sqlx::query("SELECT root_path FROM enterprise_workspaces")
+            .fetch_all(&self.pool)
+            .await
+            .context("load workspace allowlist")?;
+        let roots = rows
+            .into_iter()
+            .map(|row| row.try_get("root_path"))
+            .collect::<Result<Vec<String>, sqlx::Error>>()
+            .context("read workspace allowlist")?;
+        authorize_workspace(&roots, requested_path)
+    }
+}
+
+fn canonicalize_workspace_roots(roots: Vec<String>) -> Result<Vec<String>> {
+    roots
+        .into_iter()
+        .map(|root| {
+            PathBuf::from(&root)
+                .canonicalize()
+                .with_context(|| format!("canonicalize workspace root {root}"))
+                .map(|path| path.to_string_lossy().to_string())
+        })
+        .collect()
+}
+
+fn authorize_workspace(roots: &[String], requested_path: String) -> Result<String> {
+    let policy = WorkspacePolicy::new(roots.iter().map(PathBuf::from).collect())?;
+    let decision = policy.authorize(PathBuf::from(&requested_path))?;
+    if !decision.allowed {
+        anyhow::bail!("workspace path is not allowlisted");
+    }
+    Ok(decision.resolved_path.to_string_lossy().to_string())
+}
+
+fn worker_from_row(row: sqlx::postgres::PgRow) -> Result<WorkerRecord> {
+    let state: String = row.try_get("state")?;
+    let pid: Option<i64> = row.try_get("pid")?;
+    Ok(WorkerRecord {
+        worker_id: row.try_get("worker_id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        workspace_id: row.try_get("workspace_id")?,
+        workspace_path: row.try_get("workspace_path")?,
+        session_id: row.try_get("session_id")?,
+        state: WorkerState::from_storage(&state).context("unknown stored worker state")?,
+        pid: pid.map(|pid| pid as u32),
+        socket_path: row.try_get("socket_path")?,
+        log_path: row.try_get("log_path")?,
+        last_heartbeat_at: row.try_get("last_heartbeat_at")?,
+    })
 }
