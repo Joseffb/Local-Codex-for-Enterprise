@@ -7,10 +7,12 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 argon2 = { workspace = true }
-axum = { workspace = true, features = ["json", "tokio"] }
+async-trait = { workspace = true }
+axum = { workspace = true, features = ["http1", "json", "tokio"] }
 base64 = { workspace = true }
 casbin = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+clap = { workspace = true, features = ["derive", "env"] }
 jsonwebtoken = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -18,7 +20,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tower = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 utoipa = { workspace = true, features = ["axum_extras"] }
 uuid = { workspace = true, features = ["serde", "v4"] }
 

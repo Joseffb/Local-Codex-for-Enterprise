@@ -2772,10 +2772,12 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "casbin",
  "chrono",
+ "clap",
  "jsonwebtoken",
  "rand 0.9.3",
  "serde",
@@ -2785,6 +2787,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
+ "tracing-subscriber",
  "utoipa",
  "uuid",
 ]

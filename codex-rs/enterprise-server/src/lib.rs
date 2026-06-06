@@ -5,5 +5,6 @@ pub mod auth;
 pub mod config;
 pub mod rbac;
 pub mod setup;
+pub mod storage;
 pub mod worker;
 pub mod workspace;

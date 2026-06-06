@@ -70,16 +70,16 @@ pub fn issue_api_token(label: &str) -> Result<IssuedApiToken> {
         Uuid::new_v4().simple()
     );
     Ok(IssuedApiToken {
-        token_hash: hash_api_token(&token),
+        token_hash: api_token_hash(&token),
         plaintext: token,
     })
 }
 
 pub fn verify_api_token(plaintext: &str, expected_hash: &str) -> bool {
-    hash_api_token(plaintext) == expected_hash
+    api_token_hash(plaintext) == expected_hash
 }
 
-fn hash_api_token(plaintext: &str) -> String {
+pub fn api_token_hash(plaintext: &str) -> String {
     let digest = Sha256::digest(plaintext.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)
 }

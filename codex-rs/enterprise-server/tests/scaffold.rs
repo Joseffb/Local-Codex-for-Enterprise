@@ -1,3 +1,7 @@
+use axum::body::Body;
+use axum::body::to_bytes;
+use axum::http::Request;
+use axum::http::StatusCode;
 use codex_enterprise_server::api;
 use codex_enterprise_server::auth;
 use codex_enterprise_server::config::EnterpriseConfig;
@@ -11,6 +15,7 @@ use codex_enterprise_server::worker::WorkerState;
 use codex_enterprise_server::worker::WorkerSupervisor;
 use codex_enterprise_server::workspace::WorkspacePolicy;
 use std::time::Duration;
+use tower::ServiceExt;
 
 #[test]
 fn default_config_selects_enterprise_mode_and_local_model_defaults() {
@@ -70,6 +75,130 @@ fn openapi_document_describes_health_route() {
     let document = api::openapi_document();
 
     assert!(document.paths.paths.contains_key("/healthz"));
+}
+
+#[tokio::test]
+async fn setup_endpoint_bootstraps_once_and_returns_owner_api_token() {
+    let router = api::build_test_router();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": ["/srv/workspaces"]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+
+    let response = router.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(json["owner_email"], "owner@example.com");
+    assert!(
+        json["api_token"]
+            .as_str()
+            .expect("api token")
+            .starts_with("lce_owner_")
+    );
+
+    let second = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": ["/srv/workspaces"]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+
+    let response = router.oneshot(second).await.expect("second response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn workers_api_requires_token_then_tracks_started_worker() {
+    let router = api::build_test_router();
+    let unauthenticated = Request::builder()
+        .method("GET")
+        .uri("/v1/workers")
+        .body(Body::empty())
+        .expect("request");
+
+    let response = router
+        .clone()
+        .oneshot(unauthenticated)
+        .await
+        .expect("unauthenticated response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": ["/srv/workspaces"]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let setup_response = router.clone().oneshot(setup).await.expect("setup response");
+    let body = to_bytes(setup_response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let token = json["api_token"].as_str().expect("api token");
+
+    let start_worker = Request::builder()
+        .method("POST")
+        .uri("/v1/workers")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_id": "workspace-1",
+                "session_id": "session-1"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(start_worker)
+        .await
+        .expect("start worker response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let list_workers = Request::builder()
+        .method("GET")
+        .uri("/v1/workers")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .oneshot(list_workers)
+        .await
+        .expect("list worker response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(json["workers"].as_array().expect("workers").len(), 1);
+    assert_eq!(json["workers"][0]["workspace_id"], "workspace-1");
 }
 
 #[test]

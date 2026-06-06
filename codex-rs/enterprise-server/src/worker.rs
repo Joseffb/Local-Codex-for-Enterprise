@@ -3,9 +3,10 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum WorkerState {
     Starting,
     Running,
@@ -13,13 +14,35 @@ pub enum WorkerState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl WorkerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "starting" => Some(Self::Starting),
+            "running" => Some(Self::Running),
+            "stopped" => Some(Self::Stopped),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct WorkerRecord {
     pub worker_id: String,
     pub owner_user_id: String,
     pub workspace_id: String,
     pub session_id: String,
     pub state: WorkerState,
+    #[schema(value_type = String)]
     pub last_heartbeat_at: DateTime<Utc>,
 }
 
