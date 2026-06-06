@@ -2,6 +2,9 @@ use crate::auth;
 use crate::rbac::EnterpriseRole;
 use crate::setup::BootstrapReceipt;
 use crate::setup::SetupMode;
+use crate::trace::EvidenceRecordContext;
+use crate::trace::ExecutionReceipt;
+use crate::trace::TraceResult;
 use crate::worker::WorkerRecord;
 use crate::worker::WorkerRuntime;
 use crate::worker::WorkerState;
@@ -72,10 +75,25 @@ pub struct SessionRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEventRecord {
+    pub trace_id: String,
     pub actor_user_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub session_id: Option<String>,
+    pub worker_id: Option<String>,
     pub event_type: String,
-    pub event_json: serde_json::Value,
+    pub result: TraceResult,
+    pub metadata_json: serde_json::Value,
     pub created_at: DateTime<Utc>,
+}
+
+pub type ExecutionReceiptRecord = ExecutionReceipt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRecordInput {
+    pub context: EvidenceRecordContext,
+    pub event_type: String,
+    pub result: TraceResult,
+    pub metadata_json: serde_json::Value,
 }
 
 #[async_trait]
@@ -136,12 +154,8 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
         &self,
         claims: &auth::WorkerHandoffClaims,
     ) -> Result<WorkerHandoffRecord>;
-    async fn record_audit_event(
-        &self,
-        actor_user_id: Option<&str>,
-        event_type: &str,
-        event_json: serde_json::Value,
-    ) -> Result<()>;
+    async fn record_audit_event(&self, input: EvidenceRecordInput) -> Result<()>;
+    async fn record_execution_receipt(&self, input: EvidenceRecordInput) -> Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -155,6 +169,7 @@ struct MemoryState {
     handoffs: HashMap<String, WorkerHandoffRecord>,
     sessions: HashMap<String, SessionRecord>,
     audit_events: Vec<AuditEventRecord>,
+    execution_receipts: Vec<ExecutionReceiptRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +198,10 @@ impl InMemoryEnterpriseStore {
 
     pub async fn audit_events_for_test(&self) -> Vec<AuditEventRecord> {
         self.state.lock().await.audit_events.clone()
+    }
+
+    pub async fn execution_receipts_for_test(&self) -> Vec<ExecutionReceiptRecord> {
+        self.state.lock().await.execution_receipts.clone()
     }
 }
 
@@ -459,18 +478,39 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         Ok(handoff.clone())
     }
 
-    async fn record_audit_event(
-        &self,
-        actor_user_id: Option<&str>,
-        event_type: &str,
-        event_json: serde_json::Value,
-    ) -> Result<()> {
+    async fn record_audit_event(&self, input: EvidenceRecordInput) -> Result<()> {
         self.state.lock().await.audit_events.push(AuditEventRecord {
-            actor_user_id: actor_user_id.map(ToString::to_string),
-            event_type: event_type.to_string(),
-            event_json,
+            trace_id: input.context.trace_id,
+            actor_user_id: input.context.actor_user_id,
+            workspace_id: input.context.workspace_id,
+            session_id: input.context.session_id,
+            worker_id: input.context.worker_id,
+            event_type: input.event_type,
+            result: input.result,
+            metadata_json: input.metadata_json,
             created_at: Utc::now(),
         });
+        Ok(())
+    }
+
+    async fn record_execution_receipt(&self, input: EvidenceRecordInput) -> Result<()> {
+        self.state
+            .lock()
+            .await
+            .execution_receipts
+            .push(ExecutionReceiptRecord {
+                receipt_id: Uuid::new_v4().to_string(),
+                execution_id: Uuid::new_v4().to_string(),
+                trace_id: input.context.trace_id,
+                actor_user_id: input.context.actor_user_id,
+                workspace_id: input.context.workspace_id,
+                session_id: input.context.session_id,
+                worker_id: input.context.worker_id,
+                event_type: input.event_type,
+                result: input.result,
+                metadata_json: input.metadata_json,
+                created_at: Utc::now(),
+            });
         Ok(())
     }
 }
@@ -900,26 +940,73 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         Ok(handoff)
     }
 
-    async fn record_audit_event(
-        &self,
-        actor_user_id: Option<&str>,
-        event_type: &str,
-        event_json: serde_json::Value,
-    ) -> Result<()> {
-        let actor_user_id = actor_user_id
+    async fn record_audit_event(&self, input: EvidenceRecordInput) -> Result<()> {
+        let trace_id = Uuid::parse_str(&input.context.trace_id).context("parse audit trace id")?;
+        let actor_user_id = input
+            .context
+            .actor_user_id
+            .as_deref()
             .map(|value| Uuid::parse_str(value).context("parse audit actor user id"))
             .transpose()?;
+        let worker_id = input
+            .context
+            .worker_id
+            .as_deref()
+            .map(|value| Uuid::parse_str(value).context("parse audit worker id"))
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO enterprise_audit_events (event_id, actor_user_id, event_type, event_json)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO enterprise_audit_events
+             (event_id, trace_id, actor_user_id, workspace_id, session_id, worker_id, event_type, result, metadata_json)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(Uuid::new_v4())
+        .bind(trace_id)
         .bind(actor_user_id)
-        .bind(event_type)
-        .bind(event_json)
+        .bind(&input.context.workspace_id)
+        .bind(&input.context.session_id)
+        .bind(worker_id)
+        .bind(&input.event_type)
+        .bind(input.result.as_str())
+        .bind(input.metadata_json)
         .execute(&self.pool)
         .await
         .context("insert audit event")?;
+        Ok(())
+    }
+
+    async fn record_execution_receipt(&self, input: EvidenceRecordInput) -> Result<()> {
+        let trace_id =
+            Uuid::parse_str(&input.context.trace_id).context("parse receipt trace id")?;
+        let actor_user_id = input
+            .context
+            .actor_user_id
+            .as_deref()
+            .map(|value| Uuid::parse_str(value).context("parse receipt actor user id"))
+            .transpose()?;
+        let worker_id = input
+            .context
+            .worker_id
+            .as_deref()
+            .map(|value| Uuid::parse_str(value).context("parse receipt worker id"))
+            .transpose()?;
+        sqlx::query(
+            "INSERT INTO enterprise_execution_receipts
+             (receipt_id, execution_id, trace_id, actor_user_id, workspace_id, session_id, worker_id, event_type, result, metadata_json)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(trace_id)
+        .bind(actor_user_id)
+        .bind(&input.context.workspace_id)
+        .bind(&input.context.session_id)
+        .bind(worker_id)
+        .bind(&input.event_type)
+        .bind(input.result.as_str())
+        .bind(input.metadata_json)
+        .execute(&self.pool)
+        .await
+        .context("insert execution receipt")?;
         Ok(())
     }
 }

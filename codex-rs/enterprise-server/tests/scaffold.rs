@@ -18,6 +18,7 @@ use codex_enterprise_server::worker::WorkerSupervisor;
 use codex_enterprise_server::workspace::WorkspacePolicy;
 use std::time::Duration;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 #[test]
 fn default_config_selects_enterprise_mode_and_local_model_defaults() {
@@ -129,6 +130,69 @@ async fn setup_endpoint_bootstraps_once_and_returns_owner_api_token() {
 
     let response = router.oneshot(second).await.expect("second response");
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn traced_responses_emit_generated_preserved_and_replaced_trace_ids() {
+    let router = api::build_test_router();
+    let generated = Request::builder()
+        .method("GET")
+        .uri("/v1/config")
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(generated)
+        .await
+        .expect("generated trace response");
+    let generated_trace = response
+        .headers()
+        .get("x-trace-id")
+        .expect("generated trace header")
+        .to_str()
+        .expect("generated trace string");
+    Uuid::parse_str(generated_trace).expect("generated trace is uuid");
+
+    let supplied_trace = Uuid::new_v4().to_string();
+    let preserved = Request::builder()
+        .method("GET")
+        .uri("/v1/config")
+        .header("x-trace-id", &supplied_trace)
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(preserved)
+        .await
+        .expect("preserved trace response");
+    assert_eq!(
+        response
+            .headers()
+            .get("x-trace-id")
+            .expect("preserved trace header")
+            .to_str()
+            .expect("preserved trace string"),
+        supplied_trace
+    );
+
+    let replaced = Request::builder()
+        .method("GET")
+        .uri("/v1/config")
+        .header("x-trace-id", "not-a-uuid")
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .oneshot(replaced)
+        .await
+        .expect("replaced trace response");
+    let replaced_trace = response
+        .headers()
+        .get("x-trace-id")
+        .expect("replaced trace header")
+        .to_str()
+        .expect("replaced trace string");
+    Uuid::parse_str(replaced_trace).expect("replaced trace is uuid");
+    assert_ne!(replaced_trace, "not-a-uuid");
 }
 
 #[tokio::test]
@@ -755,6 +819,260 @@ async fn worker_handoff_tokens_are_scoped_and_single_use() {
         .expect("request");
     let response = router.oneshot(replay).await.expect("replay response");
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn trace_continues_across_session_worker_and_handoff_receipts() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    let project = workspace_root.join("project");
+    let socket_dir = temp.path().join("sockets");
+    let log_dir = temp.path().join("logs");
+    std::fs::create_dir_all(&project).expect("project workspace");
+
+    let mut config = EnterpriseConfig::default();
+    config.worker_command = "/bin/sh".to_string();
+    config.worker_args = vec!["-c".to_string(), "sleep 30".to_string()];
+    config.worker_socket_dir = socket_dir.to_string_lossy().to_string();
+    config.worker_log_dir = log_dir.to_string_lossy().to_string();
+    let trace_id = Uuid::new_v4().to_string();
+    let store = InMemoryEnterpriseStore::default();
+    let router = api::build_router_with_store(store.clone(), config);
+
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .header("x-trace-id", &trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": [workspace_root]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let setup_response = router.clone().oneshot(setup).await.expect("setup response");
+    let body = to_bytes(setup_response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let token = json["api_token"].as_str().expect("api token");
+    let owner_user_id = json["owner_user_id"].as_str().expect("owner user id");
+
+    let create_session = Request::builder()
+        .method("POST")
+        .uri("/v1/sessions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-trace-id", &trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "session_id": "session-1",
+                "workspace_path": project,
+                "title": "Trace sprint"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(create_session)
+        .await
+        .expect("create session response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let start_worker = Request::builder()
+        .method("POST")
+        .uri("/v1/workers")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-trace-id", &trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_path": project,
+                "session_id": "session-1"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(start_worker)
+        .await
+        .expect("start worker response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("start worker body");
+    let started: serde_json::Value = serde_json::from_slice(&body).expect("start json body");
+    let worker_id = started["worker"]["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
+    let workspace_id = started["worker"]["workspace_id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let issue_handoff = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/workers/{worker_id}/handoff"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-trace-id", &trace_id)
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .oneshot(issue_handoff)
+        .await
+        .expect("handoff response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let audit = store.audit_events_for_test().await;
+    let traced_events = audit
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.create" | "worker.start" | "worker.handoff.issue"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(traced_events.len(), 3);
+    assert!(traced_events.iter().all(|event| event.trace_id == trace_id));
+    assert!(
+        traced_events
+            .iter()
+            .all(|event| event.result.as_str() == "completed")
+    );
+    assert!(
+        traced_events
+            .iter()
+            .all(|event| event.actor_user_id.as_deref() == Some(owner_user_id))
+    );
+
+    let receipts = store.execution_receipts_for_test().await;
+    assert!(receipts.iter().any(|receipt| {
+        receipt.trace_id == trace_id
+            && receipt.actor_user_id.as_deref() == Some(owner_user_id)
+            && receipt.workspace_id.as_deref() == Some(workspace_id.as_str())
+            && receipt.session_id.as_deref() == Some("session-1")
+            && receipt.worker_id.as_deref() == Some(worker_id.as_str())
+            && receipt.event_type == "worker.start"
+            && receipt.result.as_str() == "completed"
+    }));
+    assert!(receipts.iter().all(|receipt| {
+        Uuid::parse_str(&receipt.execution_id).is_ok() && Uuid::parse_str(&receipt.trace_id).is_ok()
+    }));
+}
+
+#[tokio::test]
+async fn trace_metadata_redacts_passwords_tokens_and_credentialed_repo_urls() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let trace_id = Uuid::new_v4().to_string();
+    let store = InMemoryEnterpriseStore::default();
+    let router = api::build_router_with_store(store.clone(), EnterpriseConfig::default());
+
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .header("x-trace-id", &trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": [workspace_root]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let setup_response = router.clone().oneshot(setup).await.expect("setup response");
+    let body = to_bytes(setup_response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let token = json["api_token"].as_str().expect("api token");
+
+    let login = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/login")
+        .header("content-type", "application/json")
+        .header("x-trace-id", &trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "email": "owner@example.com",
+                "password": "wrong secret password"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.clone().oneshot(login).await.expect("login response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let clone = Request::builder()
+        .method("POST")
+        .uri("/v1/workspaces/clone")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-trace-id", &trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "repo_url": "https://secret-token@example.com/org/repo.git",
+                "workspace_root": workspace_root,
+                "destination_name": "repo"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.clone().oneshot(clone).await.expect("clone response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let file_clone = Request::builder()
+        .method("POST")
+        .uri("/v1/workspaces/clone")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-trace-id", &trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "repo_url": "file:///private/local-secret/repo.git",
+                "workspace_root": workspace_root,
+                "destination_name": "repo"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .oneshot(file_clone)
+        .await
+        .expect("file clone response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let audit = store.audit_events_for_test().await;
+    assert!(
+        audit
+            .iter()
+            .any(|event| event.event_type == "auth.login.failure"
+                && event.result.as_str() == "denied"
+                && event.trace_id == trace_id)
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|event| event.event_type == "workspace.clone"
+                && event.result.as_str() == "denied"
+                && event.trace_id == trace_id)
+    );
+    let evidence_json = serde_json::to_string(&audit).expect("audit json");
+    assert!(!evidence_json.contains("wrong secret password"));
+    assert!(!evidence_json.contains(token));
+    assert!(!evidence_json.contains("Bearer"));
+    assert!(!evidence_json.contains("secret-token"));
+    assert!(!evidence_json.contains("local-secret"));
 }
 
 #[tokio::test]

@@ -5,13 +5,19 @@ use crate::rbac::EnterpriseAction;
 use crate::repo_clone;
 use crate::storage::BootstrapInput;
 use crate::storage::EnterpriseStore;
+use crate::storage::EvidenceRecordInput;
 use crate::storage::InMemoryEnterpriseStore;
 use crate::storage::SessionRecord;
+use crate::trace;
+use crate::trace::EvidenceRecordContext;
+use crate::trace::TraceContext;
+use crate::trace::TraceResult;
 use crate::worker::WorkerRecord;
 use crate::worker::WorkerRuntimeSupervisor;
 use crate::worker::WorkerState;
 use axum::Json;
 use axum::Router;
+use axum::extract::Extension;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
@@ -20,6 +26,7 @@ use axum::extract::ws::WebSocket;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use axum::middleware::from_fn;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::routing::post;
@@ -353,6 +360,7 @@ where
             "/v1/worker-handoffs/{jti}/consume",
             post(consume_worker_handoff::<S>),
         )
+        .layer(from_fn(trace::trace_middleware))
         .with_state(AppState::new(
             store,
             config,
@@ -388,6 +396,7 @@ where
 )]
 async fn setup_enterprise<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     Json(request): Json<EnterpriseSetupRequest>,
 ) -> Result<(StatusCode, Json<EnterpriseSetupResponse>), ApiError>
 where
@@ -419,8 +428,9 @@ where
         .map_err(ApiError::internal)?;
     record_audit(
         &state,
-        Some(&outcome.owner_user_id),
+        EvidenceRecordContext::new(&trace).actor(outcome.owner_user_id.clone()),
         "enterprise.bootstrap",
+        TraceResult::Completed,
         serde_json::json!({ "owner_email": outcome.owner_email.clone() }),
     )
     .await?;
@@ -446,6 +456,7 @@ where
 )]
 async fn login<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError>
 where
@@ -462,8 +473,9 @@ where
         Err(error) => {
             record_audit(
                 &state,
-                None,
+                EvidenceRecordContext::new(&trace),
                 "auth.login.failure",
+                TraceResult::Denied,
                 serde_json::json!({ "email": request.email }),
             )
             .await?;
@@ -478,8 +490,9 @@ where
         .map_err(ApiError::internal)?;
     record_audit(
         &state,
-        Some(&principal.user_id),
+        EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
         "auth.login.success",
+        TraceResult::Completed,
         serde_json::json!({ "email": principal.email.clone() }),
     )
     .await?;
@@ -503,13 +516,14 @@ where
 )]
 async fn list_workers<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     headers: HeaderMap,
 ) -> Result<Json<WorkersResponse>, ApiError>
 where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
-    authorize(&state, &principal, EnterpriseAction::ReadThreads).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
     let workers = state
         .store
         .list_workers(&principal)
@@ -532,6 +546,7 @@ where
 )]
 async fn create_session<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     headers: HeaderMap,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<SessionResponse>), ApiError>
@@ -539,7 +554,7 @@ where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
-    authorize(&state, &principal, EnterpriseAction::StartWorker).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::StartWorker).await?;
     let session = state
         .store
         .create_session(
@@ -552,13 +567,28 @@ where
         .map_err(ApiError::storage)?;
     record_audit(
         &state,
-        Some(&principal.user_id),
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(session.workspace_id.clone())
+            .session(session.session_id.clone()),
         "session.create",
+        TraceResult::Completed,
         serde_json::json!({
             "session_id": session.session_id.clone(),
             "workspace_id": session.workspace_id.clone(),
             "title": session.title.clone(),
         }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(session.workspace_id.clone())
+            .session(session.session_id.clone()),
+        "session.create",
+        TraceResult::Completed,
+        serde_json::json!({ "title": session.title.clone() }),
     )
     .await?;
 
@@ -576,18 +606,27 @@ where
 )]
 async fn list_sessions<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     headers: HeaderMap,
 ) -> Result<Json<SessionsResponse>, ApiError>
 where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
-    authorize(&state, &principal, EnterpriseAction::ReadThreads).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
     let sessions = state
         .store
         .list_sessions(&principal)
         .await
         .map_err(ApiError::internal)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
+        "session.list",
+        TraceResult::Completed,
+        serde_json::json!({ "count": sessions.len() }),
+    )
+    .await?;
     Ok(Json(SessionsResponse { sessions }))
 }
 
@@ -603,6 +642,7 @@ where
 )]
 async fn get_session<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionResponse>, ApiError>
@@ -610,12 +650,23 @@ where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
-    authorize(&state, &principal, EnterpriseAction::ReadThreads).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
     let session = state
         .store
         .get_session(&principal, &session_id)
         .await
         .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(session.workspace_id.clone())
+            .session(session.session_id.clone()),
+        "session.get",
+        TraceResult::Completed,
+        serde_json::json!({ "session_id": session.session_id.clone() }),
+    )
+    .await?;
     Ok(Json(SessionResponse { session }))
 }
 
@@ -631,6 +682,7 @@ where
 )]
 async fn start_worker<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     headers: HeaderMap,
     Json(request): Json<StartWorkerRequest>,
 ) -> Result<(StatusCode, Json<WorkerResponse>), ApiError>
@@ -638,7 +690,7 @@ where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
-    authorize(&state, &principal, EnterpriseAction::StartWorker).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::StartWorker).await?;
     let starting_worker = state
         .store
         .start_worker(&principal, request.workspace_path, request.session_id)
@@ -660,6 +712,38 @@ where
                     None,
                 )
                 .await;
+            record_audit(
+                &state,
+                EvidenceRecordContext::new(&trace)
+                    .actor(principal.user_id.clone())
+                    .workspace(starting_worker.workspace_id.clone())
+                    .session(starting_worker.session_id.clone())
+                    .worker(starting_worker.worker_id.clone()),
+                "worker.start",
+                TraceResult::Failed,
+                serde_json::json!({
+                    "worker_id": starting_worker.worker_id.clone(),
+                    "workspace_id": starting_worker.workspace_id.clone(),
+                    "session_id": starting_worker.session_id.clone(),
+                }),
+            )
+            .await?;
+            record_execution_receipt(
+                &state,
+                EvidenceRecordContext::new(&trace)
+                    .actor(principal.user_id.clone())
+                    .workspace(starting_worker.workspace_id.clone())
+                    .session(starting_worker.session_id.clone())
+                    .worker(starting_worker.worker_id.clone()),
+                "worker.start",
+                TraceResult::Failed,
+                serde_json::json!({
+                    "worker_id": starting_worker.worker_id.clone(),
+                    "workspace_id": starting_worker.workspace_id.clone(),
+                    "session_id": starting_worker.session_id.clone(),
+                }),
+            )
+            .await?;
             return Err(ApiError::internal(error));
         }
     };
@@ -675,8 +759,30 @@ where
         .map_err(ApiError::internal)?;
     record_audit(
         &state,
-        Some(&principal.user_id),
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(worker.workspace_id.clone())
+            .session(worker.session_id.clone())
+            .worker(worker.worker_id.clone()),
         "worker.start",
+        TraceResult::Completed,
+        serde_json::json!({
+            "worker_id": worker.worker_id.clone(),
+            "workspace_id": worker.workspace_id.clone(),
+            "session_id": worker.session_id.clone(),
+            "state": worker.state,
+        }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(worker.workspace_id.clone())
+            .session(worker.session_id.clone())
+            .worker(worker.worker_id.clone()),
+        "worker.start",
+        TraceResult::Completed,
         serde_json::json!({
             "worker_id": worker.worker_id.clone(),
             "workspace_id": worker.workspace_id.clone(),
@@ -702,6 +808,7 @@ where
 )]
 async fn clone_workspace<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     headers: HeaderMap,
     Json(request): Json<CloneWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<CloneWorkspaceResponse>), ApiError>
@@ -709,7 +816,7 @@ where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
-    authorize(&state, &principal, EnterpriseAction::StartWorker).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::StartWorker).await?;
     let roots = state
         .store
         .list_workspace_roots(&principal)
@@ -732,16 +839,76 @@ where
         &requested_root,
         &request.destination_name,
     )
-    .map_err(ApiError::storage)?;
-    repo_clone::clone_repo(&plan)
-        .await
-        .map_err(ApiError::internal)?;
+    .map_err(|error| {
+        ApiError::storage(anyhow::anyhow!(
+            "repo clone planning failed for {}: {error}",
+            redacted_repo_url(&request.repo_url)
+        ))
+    });
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            record_audit(
+                &state,
+                EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
+                "workspace.clone",
+                TraceResult::Denied,
+                serde_json::json!({
+                    "repo_url": redacted_repo_url(&request.repo_url),
+                    "workspace_root": requested_root,
+                    "destination_name": request.destination_name,
+                }),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = repo_clone::clone_repo(&plan).await {
+        record_audit(
+            &state,
+            EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
+            "workspace.clone",
+            TraceResult::Failed,
+            serde_json::json!({
+                "repo_url": redacted_repo_url(&plan.repo_url),
+                "workspace_root": plan.workspace_root.clone(),
+                "workspace_path": plan.destination_path.clone(),
+            }),
+        )
+        .await?;
+        record_execution_receipt(
+            &state,
+            EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
+            "workspace.clone",
+            TraceResult::Failed,
+            serde_json::json!({
+                "repo_url": redacted_repo_url(&plan.repo_url),
+                "workspace_root": plan.workspace_root.clone(),
+                "workspace_path": plan.destination_path.clone(),
+            }),
+        )
+        .await?;
+        return Err(ApiError::internal(error));
+    }
     record_audit(
         &state,
-        Some(&principal.user_id),
+        EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
         "workspace.clone",
+        TraceResult::Completed,
         serde_json::json!({
-            "repo_url": plan.repo_url.clone(),
+            "repo_url": redacted_repo_url(&plan.repo_url),
+            "workspace_root": plan.workspace_root.clone(),
+            "workspace_path": plan.destination_path.clone(),
+        }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
+        "workspace.clone",
+        TraceResult::Completed,
+        serde_json::json!({
+            "repo_url": redacted_repo_url(&plan.repo_url),
             "workspace_root": plan.workspace_root.clone(),
             "workspace_path": plan.destination_path.clone(),
         }),
@@ -769,6 +936,7 @@ where
 )]
 async fn stop_worker<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     headers: HeaderMap,
     Path(worker_id): Path<String>,
 ) -> Result<Json<WorkerResponse>, ApiError>
@@ -776,7 +944,7 @@ where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
-    authorize(&state, &principal, EnterpriseAction::StartWorker).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::StartWorker).await?;
     state
         .worker_runtime
         .stop(&worker_id)
@@ -789,8 +957,29 @@ where
         .map_err(ApiError::internal)?;
     record_audit(
         &state,
-        Some(&principal.user_id),
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(worker.workspace_id.clone())
+            .session(worker.session_id.clone())
+            .worker(worker.worker_id.clone()),
         "worker.stop",
+        TraceResult::Completed,
+        serde_json::json!({
+            "worker_id": worker.worker_id.clone(),
+            "workspace_id": worker.workspace_id.clone(),
+            "session_id": worker.session_id.clone(),
+        }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(worker.workspace_id.clone())
+            .session(worker.session_id.clone())
+            .worker(worker.worker_id.clone()),
+        "worker.stop",
+        TraceResult::Completed,
         serde_json::json!({
             "worker_id": worker.worker_id.clone(),
             "workspace_id": worker.workspace_id.clone(),
@@ -814,6 +1003,7 @@ where
 )]
 async fn issue_worker_handoff<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     headers: HeaderMap,
     Path(worker_id): Path<String>,
 ) -> Result<(StatusCode, Json<WorkerHandoffResponse>), ApiError>
@@ -821,7 +1011,7 @@ where
     S: EnterpriseStore,
 {
     let principal = authenticate(&state, &headers).await?;
-    authorize(&state, &principal, EnterpriseAction::StartWorker).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::StartWorker).await?;
     let worker = state
         .store
         .get_worker(&principal, &worker_id)
@@ -848,13 +1038,33 @@ where
         .map_err(ApiError::storage)?;
     record_audit(
         &state,
-        Some(&principal.user_id),
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(handoff.workspace_id.clone())
+            .session(handoff.session_id.clone())
+            .worker(handoff.worker_id.clone()),
         "worker.handoff.issue",
+        TraceResult::Completed,
         serde_json::json!({
             "jti": handoff.jti.clone(),
             "worker_id": handoff.worker_id.clone(),
             "workspace_id": handoff.workspace_id.clone(),
             "session_id": handoff.session_id.clone(),
+            "expires_at": handoff.expires_at,
+        }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(handoff.workspace_id.clone())
+            .session(handoff.session_id.clone())
+            .worker(handoff.worker_id.clone()),
+        "worker.handoff.issue",
+        TraceResult::Completed,
+        serde_json::json!({
+            "jti": handoff.jti.clone(),
             "expires_at": handoff.expires_at,
         }),
     )
@@ -887,6 +1097,7 @@ where
 )]
 async fn consume_worker_handoff<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     Path(jti): Path<String>,
     Json(request): Json<ConsumeWorkerHandoffRequest>,
 ) -> Result<Json<ConsumeWorkerHandoffResponse>, ApiError>
@@ -911,14 +1122,31 @@ where
         .map_err(ApiError::storage)?;
     record_audit(
         &state,
-        Some(&handoff.owner_user_id),
+        EvidenceRecordContext::new(&trace)
+            .actor(handoff.owner_user_id.clone())
+            .workspace(handoff.workspace_id.clone())
+            .session(handoff.session_id.clone())
+            .worker(handoff.worker_id.clone()),
         "worker.handoff.consume",
+        TraceResult::Completed,
         serde_json::json!({
             "jti": handoff.jti.clone(),
             "worker_id": handoff.worker_id.clone(),
             "workspace_id": handoff.workspace_id.clone(),
             "session_id": handoff.session_id.clone(),
         }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(handoff.owner_user_id.clone())
+            .workspace(handoff.workspace_id.clone())
+            .session(handoff.session_id.clone())
+            .worker(handoff.worker_id.clone()),
+        "worker.handoff.consume",
+        TraceResult::Completed,
+        serde_json::json!({ "jti": handoff.jti.clone() }),
     )
     .await?;
     let consumed_at = handoff.consumed_at.ok_or_else(|| {
@@ -949,6 +1177,7 @@ where
 )]
 async fn worker_rpc<S>(
     State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
     Path(worker_id): Path<String>,
     Query(query): Query<WorkerRpcQuery>,
     ws: WebSocketUpgrade,
@@ -972,14 +1201,31 @@ where
         .map_err(ApiError::storage)?;
     record_audit(
         &state,
-        Some(&handoff.owner_user_id),
+        EvidenceRecordContext::new(&trace)
+            .actor(handoff.owner_user_id.clone())
+            .workspace(handoff.workspace_id.clone())
+            .session(handoff.session_id.clone())
+            .worker(handoff.worker_id.clone()),
         "worker.rpc.connect",
+        TraceResult::Completed,
         serde_json::json!({
             "jti": handoff.jti.clone(),
             "worker_id": handoff.worker_id.clone(),
             "workspace_id": handoff.workspace_id.clone(),
             "session_id": handoff.session_id.clone(),
         }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(handoff.owner_user_id.clone())
+            .workspace(handoff.workspace_id.clone())
+            .session(handoff.session_id.clone())
+            .worker(handoff.worker_id.clone()),
+        "worker.rpc.connect",
+        TraceResult::Completed,
+        serde_json::json!({ "jti": handoff.jti.clone() }),
     )
     .await?;
     let socket_path = handoff.socket_path;
@@ -1009,16 +1255,44 @@ where
 
 async fn record_audit<S>(
     state: &AppState<S>,
-    actor_user_id: Option<&str>,
+    context: EvidenceRecordContext,
     event_type: &str,
-    event_json: serde_json::Value,
+    result: TraceResult,
+    metadata_json: serde_json::Value,
 ) -> Result<(), ApiError>
 where
     S: EnterpriseStore,
 {
     state
         .store
-        .record_audit_event(actor_user_id, event_type, event_json)
+        .record_audit_event(EvidenceRecordInput {
+            context,
+            event_type: event_type.to_string(),
+            result,
+            metadata_json,
+        })
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn record_execution_receipt<S>(
+    state: &AppState<S>,
+    context: EvidenceRecordContext,
+    event_type: &str,
+    result: TraceResult,
+    metadata_json: serde_json::Value,
+) -> Result<(), ApiError>
+where
+    S: EnterpriseStore,
+{
+    state
+        .store
+        .record_execution_receipt(EvidenceRecordInput {
+            context,
+            event_type: event_type.to_string(),
+            result,
+            metadata_json,
+        })
         .await
         .map_err(ApiError::internal)
 }
@@ -1081,6 +1355,7 @@ fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<AxumWsMessage> {
 
 async fn authorize<S>(
     state: &AppState<S>,
+    trace: &TraceContext,
     principal: &crate::storage::AuthPrincipal,
     action: EnterpriseAction,
 ) -> Result<(), ApiError>
@@ -1093,8 +1368,9 @@ where
     if !allowed {
         record_audit(
             state,
-            Some(&principal.user_id),
+            EvidenceRecordContext::new(trace).actor(principal.user_id.clone()),
             "rbac.deny",
+            TraceResult::Denied,
             serde_json::json!({
                 "role": principal.role.as_str(),
                 "action": format!("{action:?}"),
@@ -1107,6 +1383,18 @@ where
         ));
     }
     Ok(())
+}
+
+fn redacted_repo_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "<invalid-repo-url>".to_string();
+    };
+    if url.scheme() != "https" {
+        return format!("<{}-repo-url>", url.scheme());
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {

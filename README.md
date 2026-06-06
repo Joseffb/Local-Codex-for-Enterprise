@@ -10,8 +10,8 @@ This repository starts from the Local Codex for Docker codebase and will add sel
 - Large-prompt handling has been smoke-tested with a Docker Model context-size variant.
 - Container packaging is present. The optimized `release` image path and Compose release override have been validated against a responsive local Docker daemon; Compose still defaults to the faster `dev` build profile for iteration.
 - Enterprise server scaffold is now runnable as `codex-enterprise-server`.
-- Enterprise server currently supports health/config endpoints, first-run owner setup, password login with opaque API-token issuance, token-authenticated session create/list/get, token-authenticated worker start/list/stop, role-enforced session and worker routes, HTTPS-only repo clone onboarding into allowlisted roots, short-lived single-use worker handoff tokens, an initial websocket tunnel to supervised worker Unix sockets, Postgres migrations, workspace allowlist enforcement for session and worker launch, supervised worker process launch, initial audit events for auth/RBAC/workspace/session/worker/handoff decisions, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
-- Enterprise server persists a workspace-bound coding session ledger, but does not yet persist full chat transcripts, provide admin user/role management APIs, reconcile workers after server restart, or provide audit query/export APIs.
+- Enterprise server currently supports health/config endpoints, first-run owner setup, password login with opaque API-token issuance, token-authenticated session create/list/get, token-authenticated worker start/list/stop, role-enforced session and worker routes, HTTPS-only repo clone onboarding into allowlisted roots, short-lived single-use worker handoff tokens, an initial websocket tunnel to supervised worker Unix sockets, Postgres migrations, workspace allowlist enforcement for session and worker launch, supervised worker process launch, trace-aware audit events, execution receipts, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
+- Enterprise server persists a workspace-bound coding session ledger and structured evidence records, but does not yet persist full chat transcripts, provide admin user/role management APIs, reconcile workers after server restart, or provide audit query/export APIs.
 
 ## Enterprise Server Smoke
 
@@ -145,6 +145,20 @@ GET /v1/workers/$WORKER_ID/rpc?handoff_token=$HANDOFF_TOKEN
 The tunnel relays websocket frames to the worker's private
 `codex-app-server --listen unix://...` socket. It keeps the app-server JSON-RPC
 protocol opaque to the enterprise control plane.
+
+## Trace Spine
+
+Enterprise routes emit an `x-trace-id` response header. Callers may provide a
+valid UUID `x-trace-id`; invalid or missing values are replaced with a server
+generated UUID. Audit events and execution receipts use that trace to connect
+setup, auth, sessions, workspace access, workers, handoffs, and websocket
+tunnel actions.
+
+The trace spine is evidence instrumentation, not governance runtime. It records
+who acted, which workspace/session/worker was involved, whether the action was
+allowed, denied, failed, or completed, and redacted metadata. It does not decide
+authority, run policy reasoning, or implement Fernain orchestration. Receipts
+are evidence, not reasoning.
 
 ## Local-Only Contract
 

@@ -81,8 +81,111 @@ CREATE INDEX IF NOT EXISTS enterprise_worker_handoffs_owner_idx
 
 CREATE TABLE IF NOT EXISTS enterprise_audit_events (
     event_id UUID PRIMARY KEY,
+    trace_id UUID NOT NULL,
     actor_user_id UUID REFERENCES enterprise_users(user_id),
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
     event_type TEXT NOT NULL,
-    event_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result TEXT NOT NULL CHECK (result IN ('allowed', 'denied', 'failed', 'completed')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS enterprise_audit_events_trace_idx
+    ON enterprise_audit_events(trace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS enterprise_execution_receipts (
+    receipt_id UUID PRIMARY KEY,
+    execution_id UUID NOT NULL,
+    trace_id UUID NOT NULL,
+    actor_user_id UUID REFERENCES enterprise_users(user_id),
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('allowed', 'denied', 'failed', 'completed')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS enterprise_execution_receipts_trace_idx
+    ON enterprise_execution_receipts(trace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS enterprise_policy_decision_logs (
+    decision_id UUID PRIMARY KEY,
+    trace_id UUID NOT NULL,
+    actor_user_id UUID REFERENCES enterprise_users(user_id),
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('allowed', 'denied', 'failed', 'completed')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_workspace_access_logs (
+    access_id UUID PRIMARY KEY,
+    trace_id UUID NOT NULL,
+    actor_user_id UUID REFERENCES enterprise_users(user_id),
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('allowed', 'denied', 'failed', 'completed')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_security_events (
+    security_event_id UUID PRIMARY KEY,
+    trace_id UUID NOT NULL,
+    actor_user_id UUID REFERENCES enterprise_users(user_id),
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('allowed', 'denied', 'failed', 'completed')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_tool_invocation_logs (
+    tool_invocation_id UUID PRIMARY KEY,
+    trace_id UUID NOT NULL,
+    actor_user_id UUID REFERENCES enterprise_users(user_id),
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('allowed', 'denied', 'failed', 'completed')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_model_invocation_logs (
+    model_invocation_id UUID PRIMARY KEY,
+    trace_id UUID NOT NULL,
+    actor_user_id UUID REFERENCES enterprise_users(user_id),
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('allowed', 'denied', 'failed', 'completed')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_approval_records (
+    approval_id UUID PRIMARY KEY,
+    trace_id UUID NOT NULL,
+    actor_user_id UUID REFERENCES enterprise_users(user_id),
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('allowed', 'denied', 'failed', 'completed')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
