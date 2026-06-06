@@ -30,6 +30,12 @@ struct Args {
 
     #[arg(long, env = "LOCAL_CODEX_ENTERPRISE_WORKER_LOG_DIR")]
     worker_log_dir: Option<String>,
+
+    #[arg(long, env = "LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET")]
+    handoff_token_secret: Option<String>,
+
+    #[arg(long, env = "LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_TTL_SECONDS")]
+    handoff_token_ttl_seconds: Option<u64>,
 }
 
 #[tokio::main]
@@ -49,6 +55,12 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(worker_log_dir) = args.worker_log_dir {
         config.worker_log_dir = worker_log_dir;
+    }
+    if let Some(handoff_token_secret) = args.handoff_token_secret {
+        config.handoff_token_secret = handoff_token_secret;
+    }
+    if let Some(handoff_token_ttl_seconds) = args.handoff_token_ttl_seconds {
+        config.handoff_token_ttl_seconds = handoff_token_ttl_seconds;
     }
     let database_url = config
         .database_url

@@ -47,6 +47,24 @@ CREATE TABLE IF NOT EXISTS enterprise_workers (
 CREATE INDEX IF NOT EXISTS enterprise_workers_owner_idx
     ON enterprise_workers(owner_user_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS enterprise_worker_handoffs (
+    jti TEXT PRIMARY KEY,
+    worker_id UUID NOT NULL REFERENCES enterprise_workers(worker_id) ON DELETE CASCADE,
+    owner_user_id UUID NOT NULL REFERENCES enterprise_users(user_id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    socket_path TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS enterprise_worker_handoffs_worker_idx
+    ON enterprise_worker_handoffs(worker_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS enterprise_worker_handoffs_owner_idx
+    ON enterprise_worker_handoffs(owner_user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS enterprise_audit_events (
     event_id UUID PRIMARY KEY,
     actor_user_id UUID REFERENCES enterprise_users(user_id),

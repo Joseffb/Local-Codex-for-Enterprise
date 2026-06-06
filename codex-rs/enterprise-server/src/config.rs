@@ -18,6 +18,8 @@ pub struct EnterpriseConfig {
     pub worker_args: Vec<String>,
     pub worker_socket_dir: String,
     pub worker_log_dir: String,
+    pub handoff_token_secret: String,
+    pub handoff_token_ttl_seconds: u64,
 }
 
 impl Default for EnterpriseConfig {
@@ -32,6 +34,8 @@ impl Default for EnterpriseConfig {
             worker_args: vec!["--listen".to_string(), "unix://{socket_path}".to_string()],
             worker_socket_dir: "/tmp/local-codex-enterprise/workers".to_string(),
             worker_log_dir: "/tmp/local-codex-enterprise/logs".to_string(),
+            handoff_token_secret: "local-codex-enterprise-dev-handoff-secret".to_string(),
+            handoff_token_ttl_seconds: 120,
         }
     }
 }

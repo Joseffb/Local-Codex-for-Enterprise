@@ -9,6 +9,7 @@ use codex_enterprise_server::config::ServerMode;
 use codex_enterprise_server::rbac;
 use codex_enterprise_server::rbac::EnterpriseAction;
 use codex_enterprise_server::rbac::EnterpriseRole;
+use codex_enterprise_server::repo_clone;
 use codex_enterprise_server::setup::BootstrapReceipt;
 use codex_enterprise_server::setup::SetupMode;
 use codex_enterprise_server::storage::InMemoryEnterpriseStore;
@@ -128,6 +129,61 @@ async fn setup_endpoint_bootstraps_once_and_returns_owner_api_token() {
 
     let response = router.oneshot(second).await.expect("second response");
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn login_endpoint_issues_token_for_bootstrapped_owner() {
+    let router = api::build_test_router();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": [workspace_root]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.clone().oneshot(setup).await.expect("setup response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let login = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "email": "owner@example.com",
+                "password": "correct horse battery staple"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.clone().oneshot(login).await.expect("login response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(json["email"], "owner@example.com");
+    assert_eq!(json["role"], "owner");
+    let token = json["api_token"].as_str().expect("api token");
+    assert!(token.starts_with("lce_login_"));
+
+    let list_workers = Request::builder()
+        .method("GET")
+        .uri("/v1/workers")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = router.oneshot(list_workers).await.expect("list response");
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -253,6 +309,254 @@ async fn workers_api_requires_token_then_tracks_started_worker() {
 }
 
 #[tokio::test]
+async fn viewer_token_can_read_but_cannot_start_worker() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("project workspace");
+
+    let issued = auth::issue_api_token("viewer").expect("viewer token");
+    let store = InMemoryEnterpriseStore::default();
+    store
+        .insert_user_for_test(
+            "viewer@example.com",
+            EnterpriseRole::Viewer,
+            issued.token_hash.clone(),
+        )
+        .await;
+    let router = api::build_router_with_store(store, EnterpriseConfig::default());
+
+    let list_workers = Request::builder()
+        .method("GET")
+        .uri("/v1/workers")
+        .header("authorization", format!("Bearer {}", issued.plaintext))
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(list_workers)
+        .await
+        .expect("list response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let start_worker = Request::builder()
+        .method("POST")
+        .uri("/v1/workers")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", issued.plaintext))
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_path": project,
+                "session_id": "session-1"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.oneshot(start_worker).await.expect("start response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn auth_and_rbac_decisions_are_audited_without_plaintext_secrets() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("project workspace");
+
+    let store = InMemoryEnterpriseStore::default();
+    let viewer_token = auth::issue_api_token("viewer").expect("viewer token");
+    store
+        .insert_user_for_test(
+            "viewer@example.com",
+            EnterpriseRole::Viewer,
+            viewer_token.token_hash.clone(),
+        )
+        .await;
+    let router = api::build_router_with_store(store.clone(), EnterpriseConfig::default());
+
+    let login = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "email": "viewer@example.com",
+                "password": "wrong password"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.clone().oneshot(login).await.expect("login response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let start_worker = Request::builder()
+        .method("POST")
+        .uri("/v1/workers")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", viewer_token.plaintext),
+        )
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_path": project,
+                "session_id": "session-1"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.oneshot(start_worker).await.expect("start response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let audit = store.audit_events_for_test().await;
+    assert!(
+        audit
+            .iter()
+            .any(|event| event.event_type == "auth.login.failure")
+    );
+    assert!(audit.iter().any(|event| event.event_type == "rbac.deny"));
+    let audit_json = serde_json::to_string(&audit).expect("audit json");
+    assert!(!audit_json.contains("wrong password"));
+    assert!(!audit_json.contains(&viewer_token.plaintext));
+}
+
+#[tokio::test]
+async fn worker_handoff_tokens_are_scoped_and_single_use() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    let project = workspace_root.join("project");
+    let socket_dir = temp.path().join("sockets");
+    let log_dir = temp.path().join("logs");
+    std::fs::create_dir_all(&project).expect("project workspace");
+
+    let mut config = EnterpriseConfig::default();
+    config.worker_command = "/bin/sh".to_string();
+    config.worker_args = vec!["-c".to_string(), "sleep 30".to_string()];
+    config.worker_socket_dir = socket_dir.to_string_lossy().to_string();
+    config.worker_log_dir = log_dir.to_string_lossy().to_string();
+    config.handoff_token_secret = "test-handoff-secret".to_string();
+    config.handoff_token_ttl_seconds = 120;
+    let router = api::build_router_with_store(InMemoryEnterpriseStore::default(), config);
+
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": [workspace_root]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let setup_response = router.clone().oneshot(setup).await.expect("setup response");
+    let body = to_bytes(setup_response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let token = json["api_token"].as_str().expect("api token");
+    let owner_user_id = json["owner_user_id"].as_str().expect("owner user id");
+
+    let start_worker = Request::builder()
+        .method("POST")
+        .uri("/v1/workers")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_path": project,
+                "session_id": "session-1"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(start_worker)
+        .await
+        .expect("start worker response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("start worker body");
+    let started: serde_json::Value = serde_json::from_slice(&body).expect("start json body");
+    let worker_id = started["worker"]["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
+
+    let issue_handoff = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/workers/{worker_id}/handoff"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(issue_handoff)
+        .await
+        .expect("handoff response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("handoff body");
+    let handoff: serde_json::Value = serde_json::from_slice(&body).expect("handoff json body");
+    let handoff_token = handoff["handoff_token"]
+        .as_str()
+        .expect("handoff token")
+        .to_string();
+    let jti = handoff["jti"].as_str().expect("jti").to_string();
+    assert_eq!(handoff["worker_id"], worker_id);
+    assert_eq!(handoff["session_id"], "session-1");
+    assert_eq!(handoff["owner_user_id"], owner_user_id);
+    assert!(
+        handoff["socket_path"]
+            .as_str()
+            .expect("socket path")
+            .starts_with(socket_dir.to_str().expect("socket dir"))
+    );
+
+    let claims = auth::decode_worker_handoff_token(&handoff_token, "test-handoff-secret")
+        .expect("decode handoff token");
+    assert_eq!(claims.sub, owner_user_id);
+    assert_eq!(claims.worker_id, worker_id);
+    assert_eq!(claims.session_id, "session-1");
+    assert_eq!(claims.jti, jti);
+
+    let consume_handoff = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/worker-handoffs/{jti}/consume"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "handoff_token": handoff_token
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(consume_handoff)
+        .await
+        .expect("consume response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let replay = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/worker-handoffs/{jti}/consume"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "handoff_token": handoff_token
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.oneshot(replay).await.expect("replay response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn workers_api_rejects_workspace_escape_before_launching_worker() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace_root = temp.path().join("workspaces");
@@ -306,6 +610,100 @@ async fn workers_api_rejects_workspace_escape_before_launching_worker() {
         .await
         .expect("start worker response");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn repo_clone_plan_rejects_unsafe_urls_and_destinations() {
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    let valid = repo_clone::plan_clone("https://example.com/org/repo.git", temp.path(), "repo")
+        .expect("https repo plan");
+    assert_eq!(valid.destination_name, "repo");
+
+    let file_url = repo_clone::plan_clone("file:///tmp/repo.git", temp.path(), "repo");
+    assert!(
+        file_url
+            .expect_err("file url rejected")
+            .to_string()
+            .contains("https")
+    );
+
+    let credentials = repo_clone::plan_clone(
+        "https://token@example.com/org/repo.git",
+        temp.path(),
+        "repo",
+    );
+    assert!(
+        credentials
+            .expect_err("credentials rejected")
+            .to_string()
+            .contains("credentials")
+    );
+
+    let metadata = repo_clone::plan_clone(
+        "https://169.254.169.254/latest/meta-data/repo.git",
+        temp.path(),
+        "repo",
+    );
+    assert!(
+        metadata
+            .expect_err("metadata host rejected")
+            .to_string()
+            .contains("not allowed")
+    );
+
+    let traversal =
+        repo_clone::plan_clone("https://example.com/org/repo.git", temp.path(), "../repo");
+    assert!(
+        traversal
+            .expect_err("path destination rejected")
+            .to_string()
+            .contains("destination")
+    );
+}
+
+#[tokio::test]
+async fn clone_workspace_rejects_unsafe_repo_before_git_runs() {
+    let router = api::build_test_router();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": [workspace_root]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let setup_response = router.clone().oneshot(setup).await.expect("setup response");
+    let body = to_bytes(setup_response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let token = json["api_token"].as_str().expect("api token");
+
+    let clone = Request::builder()
+        .method("POST")
+        .uri("/v1/workspaces/clone")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "repo_url": "file:///tmp/repo.git",
+                "workspace_root": workspace_root,
+                "destination_name": "repo"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router.oneshot(clone).await.expect("clone response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]

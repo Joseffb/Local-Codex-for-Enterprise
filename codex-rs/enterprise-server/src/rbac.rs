@@ -26,12 +26,22 @@ pub enum EnterpriseAction {
 }
 
 impl EnterpriseRole {
-    fn as_policy_subject(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
             Self::Admin => "admin",
             Self::Developer => "developer",
             Self::Viewer => "viewer",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "owner" => Some(Self::Owner),
+            "admin" => Some(Self::Admin),
+            "developer" => Some(Self::Developer),
+            "viewer" => Some(Self::Viewer),
+            _ => None,
         }
     }
 }
@@ -62,11 +72,7 @@ pub fn role_allows(role: EnterpriseRole, action: EnterpriseAction) -> bool {
 pub async fn casbin_role_allows(role: EnterpriseRole, action: EnterpriseAction) -> Result<bool> {
     let enforcer = enterprise_enforcer().await?;
     enforcer
-        .enforce((
-            role.as_policy_subject(),
-            "enterprise",
-            action.as_policy_action(),
-        ))
+        .enforce((role.as_str(), "enterprise", action.as_policy_action()))
         .context("evaluate enterprise rbac policy")
 }
 

@@ -10,8 +10,8 @@ This repository starts from the Local Codex for Docker codebase and will add sel
 - Large-prompt handling has been smoke-tested with a Docker Model context-size variant.
 - Container packaging is present. The optimized `release` image path and Compose release override have been validated against a responsive local Docker daemon; Compose still defaults to the faster `dev` build profile for iteration.
 - Enterprise server scaffold is now runnable as `codex-enterprise-server`.
-- Enterprise server currently supports health/config endpoints, first-run owner setup, opaque owner API token issuance, token-authenticated worker start/list/stop, Postgres migrations, workspace allowlist enforcement for worker launch, supervised worker process launch, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
-- Enterprise server does not yet broker remote TUI sessions, persist chat/thread history, expose worker websocket handoff, or provide full audit coverage for every route.
+- Enterprise server currently supports health/config endpoints, first-run owner setup, password login with opaque API-token issuance, token-authenticated worker start/list/stop, role-enforced worker routes, HTTPS-only repo clone onboarding into allowlisted roots, short-lived single-use worker handoff tokens, an initial websocket tunnel to supervised worker Unix sockets, Postgres migrations, workspace allowlist enforcement for worker launch, supervised worker process launch, initial audit events for auth/RBAC/workspace/worker/handoff decisions, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
+- Enterprise server does not yet persist chat/thread history, provide admin user/role management APIs, reconcile workers after server restart, or provide audit query/export APIs.
 
 ## Enterprise Server Smoke
 
@@ -58,6 +58,34 @@ curl http://127.0.0.1:8787/v1/workers \
   -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
 ```
 
+After bootstrap, sign in with the owner password to issue a fresh API token:
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/auth/login \
+  -H 'content-type: application/json' \
+  -d '{
+    "email": "owner@example.com",
+    "password": "change-me"
+  }'
+```
+
+Clone a repository into an allowlisted workspace root:
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/workspaces/clone \
+  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "repo_url": "https://example.com/org/repo.git",
+    "workspace_root": "/srv/workspaces",
+    "destination_name": "repo"
+  }'
+```
+
+Clone intake is intentionally narrow in v1: HTTPS only, no embedded
+credentials, no localhost/private/link-local targets, and a destination name
+directly under a registered workspace root.
+
 Start and stop a worker:
 
 ```sh
@@ -72,6 +100,32 @@ curl -X POST http://127.0.0.1:8787/v1/workers \
 curl -X DELETE http://127.0.0.1:8787/v1/workers/$WORKER_ID \
   -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
 ```
+
+Issue and consume a worker handoff token:
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/workers/$WORKER_ID/handoff \
+  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
+
+curl -X POST http://127.0.0.1:8787/v1/worker-handoffs/$JTI/consume \
+  -H 'content-type: application/json' \
+  -d "{\"handoff_token\":\"$HANDOFF_TOKEN\"}"
+```
+
+Handoff tokens are purpose-bound to a worker, owner user, workspace, and
+session. They are short-lived and single-use. This is the control-plane contract
+that the remote TUI/websocket broker consumes before tunneling frames to the
+worker socket.
+
+Connect to a worker websocket tunnel:
+
+```text
+GET /v1/workers/$WORKER_ID/rpc?handoff_token=$HANDOFF_TOKEN
+```
+
+The tunnel relays websocket frames to the worker's private
+`codex-app-server --listen unix://...` socket. It keeps the app-server JSON-RPC
+protocol opaque to the enterprise control plane.
 
 ## Local-Only Contract
 

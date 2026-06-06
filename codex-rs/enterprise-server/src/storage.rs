@@ -1,4 +1,5 @@
 use crate::auth;
+use crate::rbac::EnterpriseRole;
 use crate::setup::BootstrapReceipt;
 use crate::setup::SetupMode;
 use crate::worker::WorkerRecord;
@@ -8,6 +9,7 @@ use crate::workspace::WorkspacePolicy;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::DateTime;
 use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
@@ -23,6 +25,7 @@ use uuid::Uuid;
 pub struct AuthPrincipal {
     pub user_id: String,
     pub email: String,
+    pub role: EnterpriseRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,11 +43,42 @@ pub struct BootstrapOutcome {
     pub receipt: BootstrapReceipt,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerHandoffRecord {
+    pub jti: String,
+    pub worker_id: String,
+    pub owner_user_id: String,
+    pub workspace_id: String,
+    pub session_id: String,
+    pub socket_path: String,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEventRecord {
+    pub actor_user_id: Option<String>,
+    pub event_type: String,
+    pub event_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
 #[async_trait]
 pub trait EnterpriseStore: Clone + Send + Sync + 'static {
     async fn is_bootstrapped(&self) -> Result<bool>;
     async fn bootstrap_enterprise(&self, input: BootstrapInput) -> Result<BootstrapOutcome>;
     async fn authenticate_api_token(&self, plaintext_token: &str) -> Result<Option<AuthPrincipal>>;
+    async fn authenticate_password(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<Option<AuthPrincipal>>;
+    async fn create_api_token(
+        &self,
+        principal: &AuthPrincipal,
+        label: &str,
+        token_hash: String,
+    ) -> Result<()>;
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -61,6 +95,25 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
     async fn stop_worker(&self, principal: &AuthPrincipal, worker_id: &str)
     -> Result<WorkerRecord>;
     async fn list_workers(&self, principal: &AuthPrincipal) -> Result<Vec<WorkerRecord>>;
+    async fn list_workspace_roots(&self, principal: &AuthPrincipal) -> Result<Vec<String>>;
+    async fn get_worker(&self, principal: &AuthPrincipal, worker_id: &str) -> Result<WorkerRecord>;
+    async fn create_worker_handoff(
+        &self,
+        principal: &AuthPrincipal,
+        worker_id: &str,
+        jti: String,
+        expires_at: DateTime<Utc>,
+    ) -> Result<WorkerHandoffRecord>;
+    async fn consume_worker_handoff(
+        &self,
+        claims: &auth::WorkerHandoffClaims,
+    ) -> Result<WorkerHandoffRecord>;
+    async fn record_audit_event(
+        &self,
+        actor_user_id: Option<&str>,
+        event_type: &str,
+        event_json: serde_json::Value,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -69,12 +122,39 @@ struct MemoryState {
     users: HashMap<String, AuthPrincipal>,
     workspace_roots: Vec<String>,
     token_hashes: HashMap<String, String>,
+    password_hashes: HashMap<String, String>,
     workers: Vec<WorkerRecord>,
+    handoffs: HashMap<String, WorkerHandoffRecord>,
+    audit_events: Vec<AuditEventRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryEnterpriseStore {
     state: Arc<Mutex<MemoryState>>,
+}
+
+impl InMemoryEnterpriseStore {
+    pub async fn insert_user_for_test(
+        &self,
+        email: impl Into<String>,
+        role: EnterpriseRole,
+        token_hash: String,
+    ) -> AuthPrincipal {
+        let mut state = self.state.lock().await;
+        let user_id = Uuid::new_v4().to_string();
+        let principal = AuthPrincipal {
+            user_id: user_id.clone(),
+            email: email.into(),
+            role,
+        };
+        state.token_hashes.insert(token_hash, user_id.clone());
+        state.users.insert(user_id, principal.clone());
+        principal
+    }
+
+    pub async fn audit_events_for_test(&self) -> Vec<AuditEventRecord> {
+        self.state.lock().await.audit_events.clone()
+    }
 }
 
 #[async_trait]
@@ -93,10 +173,14 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         let principal = AuthPrincipal {
             user_id: owner_user_id.clone(),
             email: input.owner_email.clone(),
+            role: EnterpriseRole::Owner,
         };
         state
             .token_hashes
             .insert(input.issued_token_hash, owner_user_id.clone());
+        state
+            .password_hashes
+            .insert(owner_user_id.clone(), input.owner_password_hash);
         state.users.insert(owner_user_id.clone(), principal);
 
         let workspace_roots = canonicalize_workspace_roots(input.workspace_roots)?;
@@ -122,6 +206,40 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         };
 
         Ok(state.users.get(user_id).cloned())
+    }
+
+    async fn authenticate_password(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<Option<AuthPrincipal>> {
+        let state = self.state.lock().await;
+        let Some(principal) = state.users.values().find(|user| user.email == email) else {
+            return Ok(None);
+        };
+        let Some(password_hash) = state.password_hashes.get(&principal.user_id) else {
+            return Ok(None);
+        };
+        if auth::verify_password(password, password_hash)? {
+            return Ok(Some(principal.clone()));
+        }
+        Ok(None)
+    }
+
+    async fn create_api_token(
+        &self,
+        principal: &AuthPrincipal,
+        _label: &str,
+        token_hash: String,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if !state.users.contains_key(&principal.user_id) {
+            anyhow::bail!("principal not found");
+        }
+        state
+            .token_hashes
+            .insert(token_hash, principal.user_id.clone());
+        Ok(())
     }
 
     async fn start_worker(
@@ -190,6 +308,88 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             .filter(|worker| worker.owner_user_id == principal.user_id)
             .cloned()
             .collect())
+    }
+
+    async fn list_workspace_roots(&self, _principal: &AuthPrincipal) -> Result<Vec<String>> {
+        let state = self.state.lock().await;
+        Ok(state.workspace_roots.clone())
+    }
+
+    async fn get_worker(&self, principal: &AuthPrincipal, worker_id: &str) -> Result<WorkerRecord> {
+        let state = self.state.lock().await;
+        state
+            .workers
+            .iter()
+            .find(|worker| {
+                worker.worker_id == worker_id && worker.owner_user_id == principal.user_id
+            })
+            .cloned()
+            .context("worker not found")
+    }
+
+    async fn create_worker_handoff(
+        &self,
+        principal: &AuthPrincipal,
+        worker_id: &str,
+        jti: String,
+        expires_at: DateTime<Utc>,
+    ) -> Result<WorkerHandoffRecord> {
+        let mut state = self.state.lock().await;
+        let worker = state
+            .workers
+            .iter()
+            .find(|worker| {
+                worker.worker_id == worker_id && worker.owner_user_id == principal.user_id
+            })
+            .context("worker not found")?;
+        if worker.state != WorkerState::Running {
+            anyhow::bail!("worker is not running");
+        }
+        let socket_path = worker
+            .socket_path
+            .clone()
+            .context("worker socket is not available")?;
+        let handoff = WorkerHandoffRecord {
+            jti: jti.clone(),
+            worker_id: worker.worker_id.clone(),
+            owner_user_id: worker.owner_user_id.clone(),
+            workspace_id: worker.workspace_id.clone(),
+            session_id: worker.session_id.clone(),
+            socket_path,
+            expires_at,
+            consumed_at: None,
+        };
+        state.handoffs.insert(jti, handoff.clone());
+        Ok(handoff)
+    }
+
+    async fn consume_worker_handoff(
+        &self,
+        claims: &auth::WorkerHandoffClaims,
+    ) -> Result<WorkerHandoffRecord> {
+        let mut state = self.state.lock().await;
+        let handoff = state
+            .handoffs
+            .get_mut(&claims.jti)
+            .context("worker handoff not found")?;
+        validate_handoff_record(handoff, claims)?;
+        handoff.consumed_at = Some(Utc::now());
+        Ok(handoff.clone())
+    }
+
+    async fn record_audit_event(
+        &self,
+        actor_user_id: Option<&str>,
+        event_type: &str,
+        event_json: serde_json::Value,
+    ) -> Result<()> {
+        self.state.lock().await.audit_events.push(AuditEventRecord {
+            actor_user_id: actor_user_id.map(ToString::to_string),
+            event_type: event_type.to_string(),
+            event_json,
+            created_at: Utc::now(),
+        });
+        Ok(())
     }
 }
 
@@ -272,17 +472,6 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .await
         .context("insert bootstrap receipt")?;
 
-        sqlx::query(
-            "INSERT INTO enterprise_audit_events (event_id, actor_user_id, event_type, event_json)
-             VALUES ($1, $2, 'enterprise.bootstrap', $3)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(owner_user_id)
-        .bind(serde_json::json!({ "owner_email": input.owner_email }))
-        .execute(&mut *tx)
-        .await
-        .context("insert bootstrap audit event")?;
-
         tx.commit().await.context("commit bootstrap tx")?;
 
         Ok(BootstrapOutcome {
@@ -299,7 +488,7 @@ impl EnterpriseStore for PostgresEnterpriseStore {
     async fn authenticate_api_token(&self, plaintext_token: &str) -> Result<Option<AuthPrincipal>> {
         let token_hash = auth::api_token_hash(plaintext_token);
         let row = sqlx::query(
-            "SELECT u.user_id::text AS user_id, u.email AS email
+            "SELECT u.user_id::text AS user_id, u.email AS email, u.role AS role
              FROM enterprise_api_tokens t
              JOIN enterprise_users u ON u.user_id = t.user_id
              WHERE t.token_hash = $1 AND t.revoked_at IS NULL",
@@ -310,12 +499,63 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .context("authenticate api token")?;
 
         row.map(|row| {
+            let role: String = row.try_get("role")?;
             Ok(AuthPrincipal {
                 user_id: row.try_get("user_id")?,
                 email: row.try_get("email")?,
+                role: EnterpriseRole::from_storage(&role).context("unknown stored role")?,
             })
         })
         .transpose()
+    }
+
+    async fn authenticate_password(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<Option<AuthPrincipal>> {
+        let row = sqlx::query(
+            "SELECT user_id::text, email, password_hash, role
+             FROM enterprise_users
+             WHERE email = $1",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load user for password auth")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let password_hash: String = row.try_get("password_hash")?;
+        if !auth::verify_password(password, &password_hash)? {
+            return Ok(None);
+        }
+        let role: String = row.try_get("role")?;
+        Ok(Some(AuthPrincipal {
+            user_id: row.try_get("user_id")?,
+            email: row.try_get("email")?,
+            role: EnterpriseRole::from_storage(&role).context("unknown stored role")?,
+        }))
+    }
+
+    async fn create_api_token(
+        &self,
+        principal: &AuthPrincipal,
+        label: &str,
+        token_hash: String,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO enterprise_api_tokens (token_id, user_id, label, token_hash)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .bind(label)
+        .bind(token_hash)
+        .execute(&self.pool)
+        .await
+        .context("insert api token")?;
+        Ok(())
     }
 
     async fn start_worker(
@@ -414,6 +654,128 @@ impl EnterpriseStore for PostgresEnterpriseStore {
 
         rows.into_iter().map(worker_from_row).collect()
     }
+
+    async fn list_workspace_roots(&self, _principal: &AuthPrincipal) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT root_path FROM enterprise_workspaces ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
+            .context("list workspace roots")?;
+        rows.into_iter()
+            .map(|row| row.try_get("root_path"))
+            .collect::<Result<Vec<String>, sqlx::Error>>()
+            .context("read workspace roots")
+    }
+
+    async fn get_worker(&self, principal: &AuthPrincipal, worker_id: &str) -> Result<WorkerRecord> {
+        let row = sqlx::query(
+            "SELECT worker_id::text, owner_user_id::text, workspace_id, workspace_path, session_id, state, pid, socket_path, log_path, last_heartbeat_at
+             FROM enterprise_workers
+             WHERE worker_id = $1 AND owner_user_id = $2",
+        )
+        .bind(Uuid::parse_str(worker_id).context("parse worker id")?)
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("get worker record")?
+        .context("worker not found")?;
+
+        worker_from_row(row)
+    }
+
+    async fn create_worker_handoff(
+        &self,
+        principal: &AuthPrincipal,
+        worker_id: &str,
+        jti: String,
+        expires_at: DateTime<Utc>,
+    ) -> Result<WorkerHandoffRecord> {
+        let worker = self.get_worker(principal, worker_id).await?;
+        if worker.state != WorkerState::Running {
+            anyhow::bail!("worker is not running");
+        }
+        let socket_path = worker
+            .socket_path
+            .clone()
+            .context("worker socket is not available")?;
+
+        let row = sqlx::query(
+            "INSERT INTO enterprise_worker_handoffs
+             (jti, worker_id, owner_user_id, workspace_id, session_id, socket_path, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING jti, worker_id::text, owner_user_id::text, workspace_id, session_id, socket_path, expires_at, consumed_at",
+        )
+        .bind(&jti)
+        .bind(Uuid::parse_str(&worker.worker_id).context("parse worker id")?)
+        .bind(Uuid::parse_str(&worker.owner_user_id).context("parse owner user id")?)
+        .bind(&worker.workspace_id)
+        .bind(&worker.session_id)
+        .bind(socket_path)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await
+        .context("insert worker handoff")?;
+
+        handoff_from_row(row)
+    }
+
+    async fn consume_worker_handoff(
+        &self,
+        claims: &auth::WorkerHandoffClaims,
+    ) -> Result<WorkerHandoffRecord> {
+        let mut tx = self.pool.begin().await.context("begin handoff tx")?;
+        let row = sqlx::query(
+            "SELECT jti, worker_id::text, owner_user_id::text, workspace_id, session_id, socket_path, expires_at, consumed_at
+             FROM enterprise_worker_handoffs
+             WHERE jti = $1
+             FOR UPDATE",
+        )
+        .bind(&claims.jti)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("load worker handoff")?
+        .context("worker handoff not found")?;
+
+        let mut handoff = handoff_from_row(row)?;
+        validate_handoff_record(&handoff, claims)?;
+
+        let row = sqlx::query(
+            "UPDATE enterprise_worker_handoffs
+             SET consumed_at = now()
+             WHERE jti = $1
+             RETURNING jti, worker_id::text, owner_user_id::text, workspace_id, session_id, socket_path, expires_at, consumed_at",
+        )
+        .bind(&claims.jti)
+        .fetch_one(&mut *tx)
+        .await
+        .context("consume worker handoff")?;
+        tx.commit().await.context("commit handoff tx")?;
+
+        handoff = handoff_from_row(row)?;
+        Ok(handoff)
+    }
+
+    async fn record_audit_event(
+        &self,
+        actor_user_id: Option<&str>,
+        event_type: &str,
+        event_json: serde_json::Value,
+    ) -> Result<()> {
+        let actor_user_id = actor_user_id
+            .map(|value| Uuid::parse_str(value).context("parse audit actor user id"))
+            .transpose()?;
+        sqlx::query(
+            "INSERT INTO enterprise_audit_events (event_id, actor_user_id, event_type, event_json)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(actor_user_id)
+        .bind(event_type)
+        .bind(event_json)
+        .execute(&self.pool)
+        .await
+        .context("insert audit event")?;
+        Ok(())
+    }
 }
 
 impl PostgresEnterpriseStore {
@@ -467,4 +829,37 @@ fn worker_from_row(row: sqlx::postgres::PgRow) -> Result<WorkerRecord> {
         log_path: row.try_get("log_path")?,
         last_heartbeat_at: row.try_get("last_heartbeat_at")?,
     })
+}
+
+fn handoff_from_row(row: sqlx::postgres::PgRow) -> Result<WorkerHandoffRecord> {
+    Ok(WorkerHandoffRecord {
+        jti: row.try_get("jti")?,
+        worker_id: row.try_get("worker_id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        workspace_id: row.try_get("workspace_id")?,
+        session_id: row.try_get("session_id")?,
+        socket_path: row.try_get("socket_path")?,
+        expires_at: row.try_get("expires_at")?,
+        consumed_at: row.try_get("consumed_at")?,
+    })
+}
+
+fn validate_handoff_record(
+    handoff: &WorkerHandoffRecord,
+    claims: &auth::WorkerHandoffClaims,
+) -> Result<()> {
+    if handoff.consumed_at.is_some() {
+        anyhow::bail!("worker handoff already consumed");
+    }
+    if handoff.expires_at <= Utc::now() {
+        anyhow::bail!("worker handoff expired");
+    }
+    if handoff.owner_user_id != claims.sub
+        || handoff.worker_id != claims.worker_id
+        || handoff.workspace_id != claims.workspace_id
+        || handoff.session_id != claims.session_id
+    {
+        anyhow::bail!("worker handoff claims do not match record");
+    }
+    Ok(())
 }
