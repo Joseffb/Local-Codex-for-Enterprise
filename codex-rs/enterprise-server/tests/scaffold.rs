@@ -290,6 +290,26 @@ async fn workers_api_requires_token_then_tracks_started_worker() {
     assert_eq!(json["workers"][0]["state"], "Running");
     assert_eq!(json["workers"][0]["session_id"], "session-1");
 
+    let list_sessions = Request::builder()
+        .method("GET")
+        .uri("/v1/sessions")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(list_sessions)
+        .await
+        .expect("list session response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("sessions body");
+    let sessions: serde_json::Value = serde_json::from_slice(&body).expect("sessions json body");
+    assert_eq!(sessions["sessions"].as_array().expect("sessions").len(), 1);
+    assert_eq!(sessions["sessions"][0]["session_id"], "session-1");
+    assert_eq!(sessions["sessions"][0]["last_worker_id"], worker_id);
+
     let stop_worker = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/workers/{worker_id}"))
@@ -306,6 +326,187 @@ async fn workers_api_requires_token_then_tracks_started_worker() {
         .expect("stop body");
     let stopped: serde_json::Value = serde_json::from_slice(&body).expect("stop json body");
     assert_eq!(stopped["worker"]["state"], "Stopped");
+}
+
+#[tokio::test]
+async fn sessions_api_persists_workspace_bound_thread_history() {
+    let router = api::build_test_router();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    let project = workspace_root.join("project");
+    std::fs::create_dir_all(&project).expect("project workspace");
+
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": [workspace_root]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let setup_response = router.clone().oneshot(setup).await.expect("setup response");
+    let body = to_bytes(setup_response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let token = json["api_token"].as_str().expect("api token");
+    let owner_user_id = json["owner_user_id"].as_str().expect("owner user id");
+
+    let create_session = Request::builder()
+        .method("POST")
+        .uri("/v1/sessions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_path": project,
+                "title": "Governance sprint"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(create_session)
+        .await
+        .expect("create session response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("create session body");
+    let created: serde_json::Value = serde_json::from_slice(&body).expect("create session json");
+    let session_id = created["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    assert_eq!(created["session"]["owner_user_id"], owner_user_id);
+    assert_eq!(created["session"]["title"], "Governance sprint");
+    assert_eq!(
+        created["session"]["workspace_path"],
+        project
+            .canonicalize()
+            .expect("canonical project")
+            .to_str()
+            .expect("canonical project str")
+    );
+
+    let list_sessions = Request::builder()
+        .method("GET")
+        .uri("/v1/sessions")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(list_sessions)
+        .await
+        .expect("list session response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("list session body");
+    let listed: serde_json::Value = serde_json::from_slice(&body).expect("list session json");
+    assert_eq!(listed["sessions"].as_array().expect("sessions").len(), 1);
+    assert_eq!(listed["sessions"][0]["session_id"], session_id);
+
+    let get_session = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/sessions/{session_id}"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .oneshot(get_session)
+        .await
+        .expect("get session response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("get session body");
+    let fetched: serde_json::Value = serde_json::from_slice(&body).expect("get session json");
+    assert_eq!(fetched["session"]["session_id"], session_id);
+}
+
+#[tokio::test]
+async fn workers_api_rejects_session_workspace_mismatch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    let project_a = workspace_root.join("project-a");
+    let project_b = workspace_root.join("project-b");
+    std::fs::create_dir_all(&project_a).expect("project a workspace");
+    std::fs::create_dir_all(&project_b).expect("project b workspace");
+
+    let mut config = EnterpriseConfig::default();
+    config.worker_command = "/bin/sh".to_string();
+    config.worker_args = vec!["-c".to_string(), "sleep 30".to_string()];
+    config.worker_socket_dir = temp.path().join("sockets").to_string_lossy().to_string();
+    config.worker_log_dir = temp.path().join("logs").to_string_lossy().to_string();
+    let router = api::build_router_with_store(InMemoryEnterpriseStore::default(), config);
+
+    let setup = Request::builder()
+        .method("POST")
+        .uri("/v1/setup/enterprise")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_email": "owner@example.com",
+                "owner_password": "correct horse battery staple",
+                "workspace_roots": [workspace_root]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let setup_response = router.clone().oneshot(setup).await.expect("setup response");
+    let body = to_bytes(setup_response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let token = json["api_token"].as_str().expect("api token");
+
+    let create_session = Request::builder()
+        .method("POST")
+        .uri("/v1/sessions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "session_id": "session-1",
+                "workspace_path": project_a,
+                "title": "Project A"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(create_session)
+        .await
+        .expect("create session response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let start_worker = Request::builder()
+        .method("POST")
+        .uri("/v1/workers")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_path": project_b,
+                "session_id": "session-1"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = router
+        .oneshot(start_worker)
+        .await
+        .expect("start worker response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

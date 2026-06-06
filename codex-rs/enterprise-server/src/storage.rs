@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +56,20 @@ pub struct WorkerHandoffRecord {
     pub consumed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub owner_user_id: String,
+    pub workspace_id: String,
+    pub workspace_path: String,
+    pub title: Option<String>,
+    pub last_worker_id: Option<String>,
+    #[schema(value_type = String)]
+    pub created_at: DateTime<Utc>,
+    #[schema(value_type = String)]
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEventRecord {
     pub actor_user_id: Option<String>,
@@ -79,6 +94,19 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
         label: &str,
         token_hash: String,
     ) -> Result<()>;
+    async fn create_session(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: Option<String>,
+        workspace_path: String,
+        title: Option<String>,
+    ) -> Result<SessionRecord>;
+    async fn list_sessions(&self, principal: &AuthPrincipal) -> Result<Vec<SessionRecord>>;
+    async fn get_session(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+    ) -> Result<SessionRecord>;
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -125,6 +153,7 @@ struct MemoryState {
     password_hashes: HashMap<String, String>,
     workers: Vec<WorkerRecord>,
     handoffs: HashMap<String, WorkerHandoffRecord>,
+    sessions: HashMap<String, SessionRecord>,
     audit_events: Vec<AuditEventRecord>,
 }
 
@@ -242,6 +271,56 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         Ok(())
     }
 
+    async fn create_session(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: Option<String>,
+        workspace_path: String,
+        title: Option<String>,
+    ) -> Result<SessionRecord> {
+        let mut state = self.state.lock().await;
+        let session = create_session_record(
+            &state.workspace_roots,
+            principal,
+            session_id,
+            workspace_path,
+            title,
+        )?;
+        if state.sessions.contains_key(&session.session_id) {
+            anyhow::bail!("session already exists");
+        }
+        state
+            .sessions
+            .insert(session.session_id.clone(), session.clone());
+        Ok(session)
+    }
+
+    async fn list_sessions(&self, principal: &AuthPrincipal) -> Result<Vec<SessionRecord>> {
+        let state = self.state.lock().await;
+        let mut sessions = state
+            .sessions
+            .values()
+            .filter(|session| session.owner_user_id == principal.user_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(sessions)
+    }
+
+    async fn get_session(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+    ) -> Result<SessionRecord> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .get(session_id)
+            .filter(|session| session.owner_user_id == principal.user_id)
+            .cloned()
+            .context("session not found")
+    }
+
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -250,6 +329,8 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
     ) -> Result<WorkerRecord> {
         let mut state = self.state.lock().await;
         let resolved_workspace_path = authorize_workspace(&state.workspace_roots, workspace_path)?;
+        let workspace_roots = state.workspace_roots.clone();
+        let now = Utc::now();
         let worker = WorkerRecord {
             worker_id: Uuid::new_v4().to_string(),
             owner_user_id: principal.user_id.clone(),
@@ -260,8 +341,9 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             pid: None,
             socket_path: None,
             log_path: None,
-            last_heartbeat_at: Utc::now(),
+            last_heartbeat_at: now,
         };
+        attach_worker_to_session(&mut state.sessions, &workspace_roots, principal, &worker)?;
         state.workers.push(worker.clone());
         Ok(worker)
     }
@@ -558,6 +640,68 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         Ok(())
     }
 
+    async fn create_session(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: Option<String>,
+        workspace_path: String,
+        title: Option<String>,
+    ) -> Result<SessionRecord> {
+        let session_id = session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let resolved_workspace_path = self.authorize_workspace_path(workspace_path).await?;
+        let row = sqlx::query(
+            "INSERT INTO enterprise_sessions
+             (session_id, owner_user_id, workspace_id, workspace_path, title)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, title, last_worker_id::text, created_at, updated_at",
+        )
+        .bind(&session_id)
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .bind(&resolved_workspace_path)
+        .bind(&resolved_workspace_path)
+        .bind(title)
+        .fetch_one(&self.pool)
+        .await
+        .context("insert session record")?;
+
+        session_from_row(row)
+    }
+
+    async fn list_sessions(&self, principal: &AuthPrincipal) -> Result<Vec<SessionRecord>> {
+        let rows = sqlx::query(
+            "SELECT session_id, owner_user_id::text, workspace_id, workspace_path, title, last_worker_id::text, created_at, updated_at
+             FROM enterprise_sessions
+             WHERE owner_user_id = $1
+             ORDER BY updated_at DESC",
+        )
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("list session records")?;
+
+        rows.into_iter().map(session_from_row).collect()
+    }
+
+    async fn get_session(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+    ) -> Result<SessionRecord> {
+        let row = sqlx::query(
+            "SELECT session_id, owner_user_id::text, workspace_id, workspace_path, title, last_worker_id::text, created_at, updated_at
+             FROM enterprise_sessions
+             WHERE session_id = $1 AND owner_user_id = $2",
+        )
+        .bind(session_id)
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("get session record")?
+        .context("session not found")?;
+
+        session_from_row(row)
+    }
+
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -593,6 +737,8 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .execute(&self.pool)
         .await
         .context("insert worker record")?;
+
+        self.attach_worker_to_session(principal, &worker).await?;
 
         Ok(worker)
     }
@@ -791,6 +937,35 @@ impl PostgresEnterpriseStore {
             .context("read workspace allowlist")?;
         authorize_workspace(&roots, requested_path)
     }
+
+    async fn attach_worker_to_session(
+        &self,
+        principal: &AuthPrincipal,
+        worker: &WorkerRecord,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "INSERT INTO enterprise_sessions
+             (session_id, owner_user_id, workspace_id, workspace_path, title, last_worker_id)
+             VALUES ($1, $2, $3, $4, NULL, $5)
+             ON CONFLICT (session_id) DO UPDATE
+             SET last_worker_id = EXCLUDED.last_worker_id,
+                 updated_at = now()
+             WHERE enterprise_sessions.owner_user_id = EXCLUDED.owner_user_id
+               AND enterprise_sessions.workspace_path = EXCLUDED.workspace_path",
+        )
+        .bind(&worker.session_id)
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .bind(&worker.workspace_id)
+        .bind(&worker.workspace_path)
+        .bind(Uuid::parse_str(&worker.worker_id).context("parse worker id")?)
+        .execute(&self.pool)
+        .await
+        .context("attach worker to session")?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("session workspace does not match worker workspace");
+        }
+        Ok(())
+    }
 }
 
 fn canonicalize_workspace_roots(roots: Vec<String>) -> Result<Vec<String>> {
@@ -814,6 +989,57 @@ fn authorize_workspace(roots: &[String], requested_path: String) -> Result<Strin
     Ok(decision.resolved_path.to_string_lossy().to_string())
 }
 
+fn create_session_record(
+    roots: &[String],
+    principal: &AuthPrincipal,
+    session_id: Option<String>,
+    workspace_path: String,
+    title: Option<String>,
+) -> Result<SessionRecord> {
+    let resolved_workspace_path = authorize_workspace(roots, workspace_path)?;
+    let now = Utc::now();
+    Ok(SessionRecord {
+        session_id: session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        owner_user_id: principal.user_id.clone(),
+        workspace_id: resolved_workspace_path.clone(),
+        workspace_path: resolved_workspace_path,
+        title,
+        last_worker_id: None,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn attach_worker_to_session(
+    sessions: &mut HashMap<String, SessionRecord>,
+    roots: &[String],
+    principal: &AuthPrincipal,
+    worker: &WorkerRecord,
+) -> Result<()> {
+    if let Some(session) = sessions.get_mut(&worker.session_id) {
+        if session.owner_user_id != principal.user_id
+            || session.workspace_path != worker.workspace_path
+            || session.workspace_id != worker.workspace_id
+        {
+            anyhow::bail!("session workspace does not match worker workspace");
+        }
+        session.last_worker_id = Some(worker.worker_id.clone());
+        session.updated_at = Utc::now();
+        return Ok(());
+    }
+
+    let mut session = create_session_record(
+        roots,
+        principal,
+        Some(worker.session_id.clone()),
+        worker.workspace_path.clone(),
+        None,
+    )?;
+    session.last_worker_id = Some(worker.worker_id.clone());
+    sessions.insert(session.session_id.clone(), session);
+    Ok(())
+}
+
 fn worker_from_row(row: sqlx::postgres::PgRow) -> Result<WorkerRecord> {
     let state: String = row.try_get("state")?;
     let pid: Option<i64> = row.try_get("pid")?;
@@ -828,6 +1054,19 @@ fn worker_from_row(row: sqlx::postgres::PgRow) -> Result<WorkerRecord> {
         socket_path: row.try_get("socket_path")?,
         log_path: row.try_get("log_path")?,
         last_heartbeat_at: row.try_get("last_heartbeat_at")?,
+    })
+}
+
+fn session_from_row(row: sqlx::postgres::PgRow) -> Result<SessionRecord> {
+    Ok(SessionRecord {
+        session_id: row.try_get("session_id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        workspace_id: row.try_get("workspace_id")?,
+        workspace_path: row.try_get("workspace_path")?,
+        title: row.try_get("title")?,
+        last_worker_id: row.try_get("last_worker_id")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 

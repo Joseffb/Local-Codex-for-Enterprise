@@ -10,8 +10,8 @@ This repository starts from the Local Codex for Docker codebase and will add sel
 - Large-prompt handling has been smoke-tested with a Docker Model context-size variant.
 - Container packaging is present. The optimized `release` image path and Compose release override have been validated against a responsive local Docker daemon; Compose still defaults to the faster `dev` build profile for iteration.
 - Enterprise server scaffold is now runnable as `codex-enterprise-server`.
-- Enterprise server currently supports health/config endpoints, first-run owner setup, password login with opaque API-token issuance, token-authenticated worker start/list/stop, role-enforced worker routes, HTTPS-only repo clone onboarding into allowlisted roots, short-lived single-use worker handoff tokens, an initial websocket tunnel to supervised worker Unix sockets, Postgres migrations, workspace allowlist enforcement for worker launch, supervised worker process launch, initial audit events for auth/RBAC/workspace/worker/handoff decisions, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
-- Enterprise server does not yet persist chat/thread history, provide admin user/role management APIs, reconcile workers after server restart, or provide audit query/export APIs.
+- Enterprise server currently supports health/config endpoints, first-run owner setup, password login with opaque API-token issuance, token-authenticated session create/list/get, token-authenticated worker start/list/stop, role-enforced session and worker routes, HTTPS-only repo clone onboarding into allowlisted roots, short-lived single-use worker handoff tokens, an initial websocket tunnel to supervised worker Unix sockets, Postgres migrations, workspace allowlist enforcement for session and worker launch, supervised worker process launch, initial audit events for auth/RBAC/workspace/session/worker/handoff decisions, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
+- Enterprise server persists a workspace-bound coding session ledger, but does not yet persist full chat transcripts, provide admin user/role management APIs, reconcile workers after server restart, or provide audit query/export APIs.
 
 ## Enterprise Server Smoke
 
@@ -85,6 +85,25 @@ curl -X POST http://127.0.0.1:8787/v1/workspaces/clone \
 Clone intake is intentionally narrow in v1: HTTPS only, no embedded
 credentials, no localhost/private/link-local targets, and a destination name
 directly under a registered workspace root.
+
+Create and list workspace-bound coding sessions:
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/sessions \
+  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "workspace_path": "/srv/workspaces/project-a",
+    "title": "Project A iteration"
+  }'
+
+curl http://127.0.0.1:8787/v1/sessions \
+  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
+```
+
+Sessions are bound to the authenticated user and a canonicalized allowlisted
+workspace path. Starting a worker with a `session_id` creates or updates the
+session ledger and records the latest worker attached to that coding thread.
 
 Start and stop a worker:
 

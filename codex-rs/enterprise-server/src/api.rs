@@ -6,6 +6,7 @@ use crate::repo_clone;
 use crate::storage::BootstrapInput;
 use crate::storage::EnterpriseStore;
 use crate::storage::InMemoryEnterpriseStore;
+use crate::storage::SessionRecord;
 use crate::worker::WorkerRecord;
 use crate::worker::WorkerRuntimeSupervisor;
 use crate::worker::WorkerState;
@@ -103,6 +104,23 @@ pub struct LoginResponse {
 pub struct StartWorkerRequest {
     pub workspace_path: String,
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CreateSessionRequest {
+    pub session_id: Option<String>,
+    pub workspace_path: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionResponse {
+    pub session: SessionRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionsResponse {
+    pub sessions: Vec<SessionRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -210,6 +228,14 @@ impl ApiError {
         if message.contains("worker not found") {
             return Self::new(StatusCode::NOT_FOUND, message);
         }
+        if message.contains("session not found") {
+            return Self::new(StatusCode::NOT_FOUND, message);
+        }
+        if message.contains("session already exists")
+            || message.contains("session workspace does not match worker workspace")
+        {
+            return Self::new(StatusCode::CONFLICT, message);
+        }
         if message.contains("worker is not running")
             || message.contains("worker socket is not available")
             || message.contains("worker handoff already consumed")
@@ -256,19 +282,22 @@ async fn healthz() -> Json<HealthResponse> {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(healthz, get_config, setup_enterprise::<InMemoryEnterpriseStore>, login::<InMemoryEnterpriseStore>, clone_workspace::<InMemoryEnterpriseStore>, list_workers::<InMemoryEnterpriseStore>, start_worker::<InMemoryEnterpriseStore>, stop_worker::<InMemoryEnterpriseStore>, issue_worker_handoff::<InMemoryEnterpriseStore>, consume_worker_handoff::<InMemoryEnterpriseStore>, worker_rpc::<InMemoryEnterpriseStore>),
+    paths(healthz, get_config, setup_enterprise::<InMemoryEnterpriseStore>, login::<InMemoryEnterpriseStore>, clone_workspace::<InMemoryEnterpriseStore>, create_session::<InMemoryEnterpriseStore>, list_sessions::<InMemoryEnterpriseStore>, get_session::<InMemoryEnterpriseStore>, list_workers::<InMemoryEnterpriseStore>, start_worker::<InMemoryEnterpriseStore>, stop_worker::<InMemoryEnterpriseStore>, issue_worker_handoff::<InMemoryEnterpriseStore>, consume_worker_handoff::<InMemoryEnterpriseStore>, worker_rpc::<InMemoryEnterpriseStore>),
     components(schemas(
         CloneWorkspaceRequest,
         CloneWorkspaceResponse,
         ConsumeWorkerHandoffRequest,
         ConsumeWorkerHandoffResponse,
         ConfigResponse,
+        CreateSessionRequest,
         EnterpriseSetupRequest,
         EnterpriseSetupResponse,
         ErrorResponse,
         HealthResponse,
         LoginRequest,
         LoginResponse,
+        SessionResponse,
+        SessionsResponse,
         StartWorkerRequest,
         WorkerHandoffResponse,
         WorkerResponse,
@@ -302,6 +331,11 @@ where
         .route("/v1/setup/enterprise", post(setup_enterprise::<S>))
         .route("/v1/auth/login", post(login::<S>))
         .route("/v1/workspaces/clone", post(clone_workspace::<S>))
+        .route(
+            "/v1/sessions",
+            get(list_sessions::<S>).post(create_session::<S>),
+        )
+        .route("/v1/sessions/{session_id}", get(get_session::<S>))
         .route(
             "/v1/workers",
             get(list_workers::<S>).post(start_worker::<S>),
@@ -482,6 +516,107 @@ where
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(WorkersResponse { workers }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/sessions",
+    request_body = CreateSessionRequest,
+    responses(
+        (status = 201, description = "Coding session created for an allowlisted workspace", body = SessionResponse),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse),
+        (status = 403, description = "Workspace path is not allowlisted", body = ErrorResponse),
+        (status = 409, description = "Session already exists", body = ErrorResponse)
+    ),
+    security(("bearer" = []))
+)]
+async fn create_session<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSessionRequest>,
+) -> Result<(StatusCode, Json<SessionResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &principal, EnterpriseAction::StartWorker).await?;
+    let session = state
+        .store
+        .create_session(
+            &principal,
+            request.session_id,
+            request.workspace_path,
+            request.title,
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        Some(&principal.user_id),
+        "session.create",
+        serde_json::json!({
+            "session_id": session.session_id.clone(),
+            "workspace_id": session.workspace_id.clone(),
+            "title": session.title.clone(),
+        }),
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(SessionResponse { session })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/sessions",
+    responses(
+        (status = 200, description = "Sessions visible to the authenticated user", body = SessionsResponse),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse)
+    ),
+    security(("bearer" = []))
+)]
+async fn list_sessions<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Result<Json<SessionsResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &principal, EnterpriseAction::ReadThreads).await?;
+    let sessions = state
+        .store
+        .list_sessions(&principal)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(SessionsResponse { sessions }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{session_id}",
+    responses(
+        (status = 200, description = "Session visible to the authenticated user", body = SessionResponse),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    ),
+    security(("bearer" = []))
+)]
+async fn get_session<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<SessionResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &principal, EnterpriseAction::ReadThreads).await?;
+    let session = state
+        .store
+        .get_session(&principal, &session_id)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(SessionResponse { session }))
 }
 
 #[utoipa::path(

@@ -6,6 +6,7 @@ This document tracks the security boundaries and known risks for the enterprise 
 
 - The enterprise server is trusted to authenticate users, enforce authorization, launch workers, and audit decisions.
 - Codex workers are scoped to a user, workspace, and session.
+- Coding sessions are persisted as a server-side ledger bound to a user and canonical workspace path.
 - The websocket tunnel is trusted only to authenticate/authorize connection setup and relay frames to the correct worker socket; app-server JSON-RPC remains opaque.
 - Docker Model Runner, Docker Model Gateway, and MCP gateways are external local services and must be explicitly configured.
 - The terminal client is not trusted to choose arbitrary server paths or worker targets.
@@ -38,17 +39,17 @@ This document tracks the security boundaries and known risks for the enterprise 
 
 ## Audit Requirements
 
-- Audit authentication events, authorization decisions, workspace access, token lifecycle events, worker lifecycle events, setup/bootstrap actions, and administrative changes.
+- Audit authentication events, authorization decisions, workspace access, session lifecycle events, token lifecycle events, worker lifecycle events, setup/bootstrap actions, and administrative changes.
 - Audit records must avoid storing plaintext secrets.
-- Initial audit coverage records bootstrap, login success/failure, RBAC denial, workspace clone, worker start/stop, handoff issue/consume, and websocket tunnel connection events.
+- Initial audit coverage records bootstrap, login success/failure, RBAC denial, workspace clone, session create, worker start/stop, handoff issue/consume, and websocket tunnel connection events.
 
 ## Known Unsafe/Incomplete Areas
 
 - Enterprise mode is private MVP work and not yet ready for public use.
 - OIDC is not implemented in v1.
 - Cedar/ABAC policy packs are reserved for future work.
-- Password login, worker process launch, HTTPS-only repo clone intake, handoff token issue/consume, and the initial remote TUI websocket tunnel are implemented.
-- Persisted chat/thread history, worker restart reconciliation, audit query/export APIs, and admin user/role management are still incomplete.
+- Password login, session ledger persistence, worker process launch, HTTPS-only repo clone intake, handoff token issue/consume, and the initial remote TUI websocket tunnel are implemented.
+- Full chat transcript persistence, worker restart reconciliation, audit query/export APIs, and admin user/role management are still incomplete.
 - Argon2, Casbin, and Utoipa are wired at scaffold level for password hashing,
   RBAC policy evaluation, and OpenAPI generation; production database adapters,
   persistent policy loading, and full route coverage are still incomplete.

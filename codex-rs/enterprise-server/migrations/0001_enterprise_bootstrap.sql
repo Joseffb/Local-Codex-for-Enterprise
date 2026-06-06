@@ -30,6 +30,20 @@ CREATE TABLE IF NOT EXISTS enterprise_bootstrap (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS enterprise_sessions (
+    session_id TEXT PRIMARY KEY,
+    owner_user_id UUID NOT NULL REFERENCES enterprise_users(user_id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
+    title TEXT,
+    last_worker_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS enterprise_sessions_owner_idx
+    ON enterprise_sessions(owner_user_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS enterprise_workers (
     worker_id UUID PRIMARY KEY,
     owner_user_id UUID NOT NULL REFERENCES enterprise_users(user_id),
