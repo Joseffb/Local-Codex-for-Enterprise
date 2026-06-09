@@ -927,6 +927,322 @@ async fn sessions_api_persists_workspace_bound_thread_history() {
 }
 
 #[tokio::test]
+async fn assistant_response_feedback_updates_user_preferences_without_leaking_text() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let router = api::build_router_with_store(
+        InMemoryEnterpriseStore::default(),
+        EnterpriseConfig::default(),
+    );
+    let workspace_root = temp_dir.path().join("workspace-root");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        None,
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED);
+    let token = bootstrap.json["api_token"].as_str().expect("token");
+
+    let thread = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(token),
+        None,
+        serde_json::json!({
+            "workspace_path": workspace_root,
+            "title": "Feedback thread"
+        }),
+    )
+    .await;
+    assert_eq!(thread.status, StatusCode::CREATED, "{}", thread.text);
+    let thread_id = thread.json["session"]["session_id"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    let user_message = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{thread_id}/messages"),
+        Some(token),
+        None,
+        serde_json::json!({
+            "kind": "user",
+            "label": "You",
+            "text": "Please plan the portal"
+        }),
+    )
+    .await;
+    assert_eq!(user_message.status, StatusCode::CREATED);
+    let user_message_id = user_message.json["message"]["message_id"]
+        .as_str()
+        .expect("user message id")
+        .to_string();
+
+    let assistant_message = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{thread_id}/messages"),
+        Some(token),
+        None,
+        serde_json::json!({
+            "kind": "assistant",
+            "label": "Codex",
+            "text": "RAW ASSISTANT TEXT THAT MUST NOT BE COPIED INTO PREFERENCES"
+        }),
+    )
+    .await;
+    assert_eq!(assistant_message.status, StatusCode::CREATED);
+    let assistant_message_id = assistant_message.json["message"]["message_id"]
+        .as_str()
+        .expect("assistant message id")
+        .to_string();
+
+    let cannot_feedback_user_message = json_request(
+        router.clone(),
+        "PUT",
+        &format!("/v1/threads/{thread_id}/messages/{user_message_id}/feedback"),
+        Some(token),
+        None,
+        serde_json::json!({
+            "rating": "bad",
+            "reason_tags": ["too_verbose"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        cannot_feedback_user_message.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        cannot_feedback_user_message.text
+    );
+
+    let feedback = json_request(
+        router.clone(),
+        "PUT",
+        &format!("/v1/threads/{thread_id}/messages/{assistant_message_id}/feedback"),
+        Some(token),
+        None,
+        serde_json::json!({
+            "rating": "bad",
+            "reason_tags": ["too_verbose", "used_repo_when_not_needed", "raw_tool_output"],
+            "comment": "do not inject this private freeform comment"
+        }),
+    )
+    .await;
+    assert_eq!(feedback.status, StatusCode::OK, "{}", feedback.text);
+    assert_eq!(feedback.json["feedback"]["rating"], "bad");
+    assert_eq!(feedback.json["preferences"]["sample_count"], 1);
+    let summary = feedback.json["preferences"]["profile_summary"]
+        .as_str()
+        .expect("profile summary");
+    assert!(summary.contains("Prefer concise answers."));
+    assert!(summary.contains("Do not inspect repositories unless explicitly requested"));
+    assert!(summary.contains("Collapse or summarize tool output"));
+    assert!(!feedback.text.contains("RAW ASSISTANT TEXT"));
+    assert!(!feedback.text.contains("private freeform comment"));
+
+    let updated_feedback = json_request(
+        router.clone(),
+        "PUT",
+        &format!("/v1/threads/{thread_id}/messages/{assistant_message_id}/feedback"),
+        Some(token),
+        None,
+        serde_json::json!({
+            "rating": "good",
+            "reason_tags": ["poor_formatting"]
+        }),
+    )
+    .await;
+    assert_eq!(updated_feedback.status, StatusCode::OK);
+    assert_eq!(updated_feedback.json["feedback"]["rating"], "good");
+    assert_eq!(updated_feedback.json["preferences"]["sample_count"], 1);
+
+    let messages_with_feedback = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/threads/{thread_id}/messages"),
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(messages_with_feedback.status, StatusCode::OK);
+    let assistant_after_feedback = messages_with_feedback.json["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == assistant_message_id)
+        .expect("assistant message");
+    assert_eq!(assistant_after_feedback["feedback_rating"], "good");
+
+    let preferences = empty_request(
+        router.clone(),
+        "GET",
+        "/v1/me/response-preferences",
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(preferences.status, StatusCode::OK);
+    assert_eq!(preferences.json["preferences"]["sample_count"], 1);
+
+    let reset = empty_request(
+        router.clone(),
+        "DELETE",
+        "/v1/me/response-preferences",
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(reset.status, StatusCode::NO_CONTENT);
+
+    let preferences_after_reset = empty_request(
+        router,
+        "GET",
+        "/v1/me/response-preferences",
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(preferences_after_reset.status, StatusCode::OK);
+    assert_eq!(
+        preferences_after_reset.json["preferences"]["profile_summary"],
+        ""
+    );
+    assert_eq!(
+        preferences_after_reset.json["preferences"]["sample_count"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn response_feedback_is_user_scoped_and_chat_ui_loads_preferences() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let router = api::build_router_with_store(
+        InMemoryEnterpriseStore::default(),
+        EnterpriseConfig::default(),
+    );
+    let workspace_root = temp_dir.path().join("workspace-root");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        None,
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED);
+    let admin_token = bootstrap.json["api_token"].as_str().expect("admin token");
+
+    let user = json_request(
+        router.clone(),
+        "POST",
+        "/v1/users",
+        Some(admin_token),
+        None,
+        serde_json::json!({
+            "email": "developer@example.com",
+            "password": "developer-password",
+            "role": "developer",
+        }),
+    )
+    .await;
+    assert_eq!(user.status, StatusCode::CREATED);
+    let developer_login = json_request(
+        router.clone(),
+        "POST",
+        "/v1/auth/login",
+        None,
+        None,
+        serde_json::json!({
+            "email": "developer@example.com",
+            "password": "developer-password",
+        }),
+    )
+    .await;
+    assert_eq!(developer_login.status, StatusCode::OK);
+    let developer_token = developer_login.json["api_token"]
+        .as_str()
+        .expect("developer token");
+
+    let thread = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(admin_token),
+        None,
+        serde_json::json!({
+            "workspace_path": workspace_root,
+            "title": "Admin feedback thread"
+        }),
+    )
+    .await;
+    assert_eq!(thread.status, StatusCode::CREATED);
+    let thread_id = thread.json["session"]["session_id"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+    let assistant_message = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{thread_id}/messages"),
+        Some(admin_token),
+        None,
+        serde_json::json!({
+            "kind": "assistant",
+            "label": "Codex",
+            "text": "Admin-only answer"
+        }),
+    )
+    .await;
+    assert_eq!(assistant_message.status, StatusCode::CREATED);
+    let assistant_message_id = assistant_message.json["message"]["message_id"]
+        .as_str()
+        .expect("message id")
+        .to_string();
+
+    let cross_user_feedback = json_request(
+        router.clone(),
+        "PUT",
+        &format!("/v1/threads/{thread_id}/messages/{assistant_message_id}/feedback"),
+        Some(developer_token),
+        None,
+        serde_json::json!({
+            "rating": "bad",
+            "reason_tags": ["wrong_context"]
+        }),
+    )
+    .await;
+    assert_eq!(cross_user_feedback.status, StatusCode::NOT_FOUND);
+
+    let chat = empty_request(router, "GET", "/chat", Some(admin_token), None).await;
+    assert_eq!(chat.status, StatusCode::OK);
+    assert!(chat.text.contains("/v1/me/response-preferences"));
+    assert!(chat.text.contains("/feedback"));
+    assert!(chat.text.contains("data-feedback-rating=\"good\""));
+    assert!(chat.text.contains("data-feedback-rating=\"bad\""));
+    assert!(chat.text.contains("feedback-selected"));
+    assert!(chat.text.contains("response-preferences-modal"));
+    assert!(chat.text.contains("Reset preferences"));
+    assert!(chat.text.contains("User response preferences"));
+}
+
+#[tokio::test]
 async fn workers_api_rejects_session_workspace_mismatch() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace_root = temp.path().join("workspaces");
@@ -3098,13 +3414,13 @@ async fn login_page_redirects_home_and_nav_says_home_when_authenticated() {
     assert!(
         chat_with_auth
             .text
-            .contains("Local Codex for Enterprise v0.0.1-beta.3")
+            .contains("Local Codex for Enterprise v0.0.1-beta.4")
     );
     assert!(chat_with_auth.text.contains("Made with Codex"));
     assert!(
         chat_with_auth
             .text
-            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.3</span></div></div>"#)
+            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.4</span></div></div>"#)
     );
     let footer_index = chat_with_auth
         .text

@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sqlx::PgPool;
 use sqlx::Row;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -362,8 +363,36 @@ pub struct SessionMessageRecord {
     pub label: String,
     pub text: String,
     pub sequence: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_rating: Option<String>,
     #[schema(value_type = String)]
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ResponseFeedbackRecord {
+    pub feedback_id: String,
+    pub owner_user_id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub rating: String,
+    pub reason_tags: Vec<String>,
+    pub comment: Option<String>,
+    #[schema(value_type = String)]
+    pub created_at: DateTime<Utc>,
+    #[schema(value_type = String)]
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UserResponsePreferencesRecord {
+    pub owner_user_id: String,
+    pub profile_summary: String,
+    pub positive_tags: Vec<String>,
+    pub negative_tags: Vec<String>,
+    pub sample_count: i64,
+    #[schema(value_type = String)]
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +400,13 @@ pub struct CreateSessionMessageInput {
     pub kind: String,
     pub label: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertResponseFeedbackInput {
+    pub rating: String,
+    pub reason_tags: Vec<String>,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,6 +517,18 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
         principal: &AuthPrincipal,
         session_id: &str,
     ) -> Result<Vec<SessionMessageRecord>>;
+    async fn upsert_response_feedback(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+        message_id: &str,
+        input: UpsertResponseFeedbackInput,
+    ) -> Result<(ResponseFeedbackRecord, UserResponsePreferencesRecord)>;
+    async fn get_response_preferences(
+        &self,
+        principal: &AuthPrincipal,
+    ) -> Result<UserResponsePreferencesRecord>;
+    async fn reset_response_preferences(&self, principal: &AuthPrincipal) -> Result<()>;
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -608,6 +656,8 @@ struct MemoryState {
     handoffs: HashMap<String, WorkerHandoffRecord>,
     sessions: HashMap<String, SessionRecord>,
     session_messages: HashMap<String, Vec<SessionMessageRecord>>,
+    response_feedback: HashMap<String, ResponseFeedbackRecord>,
+    response_preferences: HashMap<String, UserResponsePreferencesRecord>,
     audit_events: Vec<AuditEventRecord>,
     execution_receipts: Vec<ExecutionReceiptRecord>,
     context_packs: HashMap<String, ContextPackRecord>,
@@ -658,6 +708,103 @@ impl InMemoryEnterpriseStore {
     pub async fn execution_receipts_for_test(&self) -> Vec<ExecutionReceiptRecord> {
         self.state.lock().await.execution_receipts.clone()
     }
+}
+
+fn empty_response_preferences(owner_user_id: &str) -> UserResponsePreferencesRecord {
+    UserResponsePreferencesRecord {
+        owner_user_id: owner_user_id.to_string(),
+        profile_summary: String::new(),
+        positive_tags: Vec::new(),
+        negative_tags: Vec::new(),
+        sample_count: 0,
+        updated_at: Utc::now(),
+    }
+}
+
+fn build_response_preferences_from_feedback<'a>(
+    owner_user_id: &str,
+    feedback: impl Iterator<Item = &'a ResponseFeedbackRecord>,
+) -> UserResponsePreferencesRecord {
+    let mut positive_tags = BTreeSet::new();
+    let mut negative_tags = BTreeSet::new();
+    let mut sample_count = 0_i64;
+    for record in feedback {
+        if record.owner_user_id != owner_user_id {
+            continue;
+        }
+        sample_count += 1;
+        let target = if record.rating == "good" {
+            &mut positive_tags
+        } else {
+            &mut negative_tags
+        };
+        for tag in &record.reason_tags {
+            target.insert(tag.clone());
+        }
+    }
+    let negative_tags_vec = negative_tags.into_iter().collect::<Vec<_>>();
+    let positive_tags_vec = positive_tags.into_iter().collect::<Vec<_>>();
+    let profile_summary =
+        response_preference_summary(&positive_tags_vec, &negative_tags_vec).join("\n");
+    UserResponsePreferencesRecord {
+        owner_user_id: owner_user_id.to_string(),
+        profile_summary,
+        positive_tags: positive_tags_vec,
+        negative_tags: negative_tags_vec,
+        sample_count,
+        updated_at: Utc::now(),
+    }
+}
+
+fn response_preference_summary(positive_tags: &[String], negative_tags: &[String]) -> Vec<String> {
+    let mut lines = BTreeSet::new();
+    if negative_tags.iter().any(|tag| tag == "too_verbose") {
+        lines.insert("Prefer concise answers.".to_string());
+    }
+    if negative_tags.iter().any(|tag| tag == "too_generic") {
+        lines.insert("Make answers specific to the user's stated goal.".to_string());
+    }
+    if negative_tags.iter().any(|tag| tag == "wrong_context") {
+        lines.insert("Check whether the request is conceptual, product, or codebase-specific before choosing tools.".to_string());
+    }
+    if negative_tags
+        .iter()
+        .any(|tag| tag == "used_repo_when_not_needed")
+    {
+        lines.insert(
+            "Do not inspect repositories unless explicitly requested or clearly required."
+                .to_string(),
+        );
+    }
+    if negative_tags.iter().any(|tag| tag == "poor_formatting") {
+        lines.insert("Format longer answers as readable Markdown.".to_string());
+    }
+    if negative_tags
+        .iter()
+        .any(|tag| tag == "missed_business_goal")
+    {
+        lines.insert(
+            "Start business-planning answers with goals, users, decisions, and data sources."
+                .to_string(),
+        );
+    }
+    if negative_tags.iter().any(|tag| tag == "raw_tool_output") {
+        lines.insert(
+            "Collapse or summarize tool output; never show raw HTML unless requested.".to_string(),
+        );
+    }
+    if positive_tags.iter().any(|tag| tag == "concise") {
+        lines.insert("Keep answers concise when the request is simple.".to_string());
+    }
+    lines.into_iter().collect()
+}
+
+fn feedback_key(owner_user_id: &str, message_id: &str) -> String {
+    format!("{owner_user_id}:{message_id}")
+}
+
+fn feedback_reason_tags_from_json(value: serde_json::Value) -> Result<Vec<String>> {
+    serde_json::from_value::<Vec<String>>(value).context("parse feedback reason tags")
 }
 
 #[async_trait]
@@ -1005,6 +1152,7 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             label: input.label,
             text: input.text,
             sequence: messages.len() as i64 + 1,
+            feedback_rating: None,
             created_at: Utc::now(),
         };
         messages.push(message.clone());
@@ -1027,11 +1175,102 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
                 session.owner_user_id == principal.user_id && session.deleted_at.is_none()
             })
             .context("session not found")?;
+        let feedback_by_message = state
+            .response_feedback
+            .values()
+            .filter(|feedback| feedback.owner_user_id == principal.user_id)
+            .map(|feedback| (feedback.message_id.clone(), feedback.rating.clone()))
+            .collect::<HashMap<_, _>>();
         Ok(state
             .session_messages
             .get(session_id)
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut message| {
+                message.feedback_rating = feedback_by_message.get(&message.message_id).cloned();
+                message
+            })
+            .collect())
+    }
+
+    async fn upsert_response_feedback(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+        message_id: &str,
+        input: UpsertResponseFeedbackInput,
+    ) -> Result<(ResponseFeedbackRecord, UserResponsePreferencesRecord)> {
+        let mut state = self.state.lock().await;
+        state
+            .sessions
+            .get(session_id)
+            .filter(|session| {
+                session.owner_user_id == principal.user_id && session.deleted_at.is_none()
+            })
+            .context("feedback message not found")?;
+        let message = state
+            .session_messages
+            .get(session_id)
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.message_id == message_id)
+            })
+            .filter(|message| message.owner_user_id == principal.user_id)
+            .context("feedback message not found")?;
+        if message.kind != "assistant" {
+            anyhow::bail!("feedback target must be an assistant message");
+        }
+        let now = Utc::now();
+        let key = feedback_key(&principal.user_id, message_id);
+        let feedback = if let Some(existing) = state.response_feedback.get_mut(&key) {
+            existing.rating = input.rating;
+            existing.reason_tags = input.reason_tags;
+            existing.comment = input.comment;
+            existing.updated_at = now;
+            existing.clone()
+        } else {
+            let record = ResponseFeedbackRecord {
+                feedback_id: Uuid::new_v4().to_string(),
+                owner_user_id: principal.user_id.clone(),
+                session_id: session_id.to_string(),
+                message_id: message_id.to_string(),
+                rating: input.rating,
+                reason_tags: input.reason_tags,
+                comment: input.comment,
+                created_at: now,
+                updated_at: now,
+            };
+            state.response_feedback.insert(key, record.clone());
+            record
+        };
+        let preferences = build_response_preferences_from_feedback(
+            &principal.user_id,
+            state.response_feedback.values(),
+        );
+        state
+            .response_preferences
+            .insert(principal.user_id.clone(), preferences.clone());
+        Ok((feedback, preferences))
+    }
+
+    async fn get_response_preferences(
+        &self,
+        principal: &AuthPrincipal,
+    ) -> Result<UserResponsePreferencesRecord> {
+        let state = self.state.lock().await;
+        Ok(state
+            .response_preferences
+            .get(&principal.user_id)
+            .cloned()
+            .unwrap_or_else(|| empty_response_preferences(&principal.user_id)))
+    }
+
+    async fn reset_response_preferences(&self, principal: &AuthPrincipal) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.response_preferences.remove(&principal.user_id);
+        Ok(())
     }
 
     async fn start_worker(
@@ -2208,10 +2447,21 @@ impl EnterpriseStore for PostgresEnterpriseStore {
     ) -> Result<Vec<SessionMessageRecord>> {
         self.get_session(principal, session_id).await?;
         let rows = sqlx::query(
-            "SELECT message_id::text, session_id, owner_user_id::text, kind, label, text, sequence, created_at
-             FROM enterprise_session_messages
-             WHERE session_id = $1 AND owner_user_id = $2
-             ORDER BY sequence ASC",
+            "SELECT messages.message_id::text,
+                    messages.session_id,
+                    messages.owner_user_id::text,
+                    messages.kind,
+                    messages.label,
+                    messages.text,
+                    messages.sequence,
+                    feedback.rating AS feedback_rating,
+                    messages.created_at
+             FROM enterprise_session_messages messages
+             LEFT JOIN enterprise_response_feedback feedback
+               ON feedback.owner_user_id = messages.owner_user_id
+              AND feedback.message_id = messages.message_id
+             WHERE messages.session_id = $1 AND messages.owner_user_id = $2
+             ORDER BY messages.sequence ASC",
         )
         .bind(session_id)
         .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
@@ -2220,6 +2470,136 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .context("list session messages")?;
 
         rows.into_iter().map(session_message_from_row).collect()
+    }
+
+    async fn upsert_response_feedback(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+        message_id: &str,
+        input: UpsertResponseFeedbackInput,
+    ) -> Result<(ResponseFeedbackRecord, UserResponsePreferencesRecord)> {
+        let principal_user_id =
+            Uuid::parse_str(&principal.user_id).context("parse feedback owner user id")?;
+        let message_uuid = Uuid::parse_str(message_id).context("parse feedback message id")?;
+        let message_row = sqlx::query(
+            "SELECT kind
+             FROM enterprise_session_messages
+             WHERE session_id = $1 AND message_id = $2 AND owner_user_id = $3
+               AND EXISTS (
+                   SELECT 1
+                   FROM enterprise_sessions
+                   WHERE session_id = $1 AND owner_user_id = $3 AND deleted_at IS NULL
+               )",
+        )
+        .bind(session_id)
+        .bind(message_uuid)
+        .bind(principal_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("find feedback message")?
+        .context("feedback message not found")?;
+        let kind: String = message_row.try_get("kind")?;
+        if kind != "assistant" {
+            anyhow::bail!("feedback target must be an assistant message");
+        }
+
+        let reason_tags_json =
+            serde_json::to_value(&input.reason_tags).context("serialize feedback reason tags")?;
+        let feedback_row = sqlx::query(
+            "INSERT INTO enterprise_response_feedback
+             (feedback_id, owner_user_id, session_id, message_id, rating, reason_tags, comment)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (owner_user_id, message_id)
+             DO UPDATE SET
+                rating = EXCLUDED.rating,
+                reason_tags = EXCLUDED.reason_tags,
+                comment = EXCLUDED.comment,
+                updated_at = now()
+             RETURNING feedback_id::text, owner_user_id::text, session_id, message_id::text, rating, reason_tags, comment, created_at, updated_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_user_id)
+        .bind(session_id)
+        .bind(message_uuid)
+        .bind(input.rating)
+        .bind(reason_tags_json)
+        .bind(input.comment)
+        .fetch_one(&self.pool)
+        .await
+        .context("upsert response feedback")?;
+        let feedback = response_feedback_from_row(feedback_row)?;
+
+        let rows = sqlx::query(
+            "SELECT feedback_id::text, owner_user_id::text, session_id, message_id::text, rating, reason_tags, comment, created_at, updated_at
+             FROM enterprise_response_feedback
+             WHERE owner_user_id = $1",
+        )
+        .bind(principal_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("list response feedback for preferences")?;
+        let feedback_records = rows
+            .into_iter()
+            .map(response_feedback_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        let preferences =
+            build_response_preferences_from_feedback(&principal.user_id, feedback_records.iter());
+        let positive_tags_json =
+            serde_json::to_value(&preferences.positive_tags).context("serialize positive tags")?;
+        let negative_tags_json =
+            serde_json::to_value(&preferences.negative_tags).context("serialize negative tags")?;
+        let preference_row = sqlx::query(
+            "INSERT INTO enterprise_user_response_preferences
+             (owner_user_id, profile_summary, positive_tags, negative_tags, sample_count)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (owner_user_id)
+             DO UPDATE SET
+                profile_summary = EXCLUDED.profile_summary,
+                positive_tags = EXCLUDED.positive_tags,
+                negative_tags = EXCLUDED.negative_tags,
+                sample_count = EXCLUDED.sample_count,
+                updated_at = now()
+             RETURNING owner_user_id::text, profile_summary, positive_tags, negative_tags, sample_count, updated_at",
+        )
+        .bind(principal_user_id)
+        .bind(&preferences.profile_summary)
+        .bind(positive_tags_json)
+        .bind(negative_tags_json)
+        .bind(preferences.sample_count)
+        .fetch_one(&self.pool)
+        .await
+        .context("upsert response preferences")?;
+        Ok((feedback, response_preferences_from_row(preference_row)?))
+    }
+
+    async fn get_response_preferences(
+        &self,
+        principal: &AuthPrincipal,
+    ) -> Result<UserResponsePreferencesRecord> {
+        let row = sqlx::query(
+            "SELECT owner_user_id::text, profile_summary, positive_tags, negative_tags, sample_count, updated_at
+             FROM enterprise_user_response_preferences
+             WHERE owner_user_id = $1",
+        )
+        .bind(Uuid::parse_str(&principal.user_id).context("parse response preference user id")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("get response preferences")?;
+        row.map(response_preferences_from_row)
+            .transpose()
+            .map(|preferences| {
+                preferences.unwrap_or_else(|| empty_response_preferences(&principal.user_id))
+            })
+    }
+
+    async fn reset_response_preferences(&self, principal: &AuthPrincipal) -> Result<()> {
+        sqlx::query("DELETE FROM enterprise_user_response_preferences WHERE owner_user_id = $1")
+            .bind(Uuid::parse_str(&principal.user_id).context("parse response preference user id")?)
+            .execute(&self.pool)
+            .await
+            .context("reset response preferences")?;
+        Ok(())
     }
 
     async fn start_worker(
@@ -3769,7 +4149,35 @@ fn session_message_from_row(row: sqlx::postgres::PgRow) -> Result<SessionMessage
         label: row.try_get("label")?,
         text: row.try_get("text")?,
         sequence: row.try_get("sequence")?,
+        feedback_rating: row.try_get("feedback_rating").ok(),
         created_at: row.try_get("created_at")?,
+    })
+}
+
+fn response_feedback_from_row(row: sqlx::postgres::PgRow) -> Result<ResponseFeedbackRecord> {
+    Ok(ResponseFeedbackRecord {
+        feedback_id: row.try_get("feedback_id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        session_id: row.try_get("session_id")?,
+        message_id: row.try_get("message_id")?,
+        rating: row.try_get("rating")?,
+        reason_tags: feedback_reason_tags_from_json(row.try_get("reason_tags")?)?,
+        comment: row.try_get("comment")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn response_preferences_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<UserResponsePreferencesRecord> {
+    Ok(UserResponsePreferencesRecord {
+        owner_user_id: row.try_get("owner_user_id")?,
+        profile_summary: row.try_get("profile_summary")?,
+        positive_tags: feedback_reason_tags_from_json(row.try_get("positive_tags")?)?,
+        negative_tags: feedback_reason_tags_from_json(row.try_get("negative_tags")?)?,
+        sample_count: row.try_get("sample_count")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 

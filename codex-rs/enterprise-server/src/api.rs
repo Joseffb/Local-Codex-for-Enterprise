@@ -27,11 +27,14 @@ use crate::storage::OutputCategory;
 use crate::storage::OutputRecord;
 use crate::storage::ProjectRecord;
 use crate::storage::RepositoryRecord;
+use crate::storage::ResponseFeedbackRecord;
 use crate::storage::SessionMessageRecord;
 use crate::storage::SessionRecord;
 use crate::storage::UpdateProjectInput;
 use crate::storage::UpdateSessionTitleInput;
+use crate::storage::UpsertResponseFeedbackInput;
 use crate::storage::UserRecord;
+use crate::storage::UserResponsePreferencesRecord;
 use crate::storage::UserStatus;
 use crate::storage::UserWorkspaceRecord;
 use crate::storage::WorkspaceAssignmentRecord;
@@ -404,6 +407,25 @@ pub struct SessionMessagesResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ResponseFeedbackRequest {
+    pub rating: String,
+    #[serde(default)]
+    pub reason_tags: Vec<String>,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ResponseFeedbackResponse {
+    pub feedback: ResponseFeedbackRecord,
+    pub preferences: UserResponsePreferencesRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ResponsePreferencesResponse {
+    pub preferences: UserResponsePreferencesRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct WorkerResponse {
     pub worker: WorkerRecord,
 }
@@ -527,6 +549,12 @@ impl ApiError {
         if message.contains("session not found") {
             return Self::new(StatusCode::NOT_FOUND, message);
         }
+        if message.contains("feedback message not found") {
+            return Self::new(StatusCode::NOT_FOUND, message);
+        }
+        if message.contains("feedback target must be an assistant message") {
+            return Self::new(StatusCode::BAD_REQUEST, message);
+        }
         if message.contains("context pack assignment not found") {
             return Self::new(StatusCode::NOT_FOUND, message);
         }
@@ -626,6 +654,9 @@ async fn healthz() -> Json<HealthResponse> {
         HealthResponse,
         LoginRequest,
         LoginResponse,
+        ResponseFeedbackRequest,
+        ResponseFeedbackResponse,
+        ResponsePreferencesResponse,
         SessionResponse,
         SessionMessageResponse,
         SessionMessagesResponse,
@@ -722,6 +753,14 @@ where
         .route(
             "/v1/threads/{thread_id}/messages",
             get(list_session_messages::<S>).post(create_session_message::<S>),
+        )
+        .route(
+            "/v1/threads/{thread_id}/messages/{message_id}/feedback",
+            put(upsert_response_feedback::<S>),
+        )
+        .route(
+            "/v1/me/response-preferences",
+            get(get_response_preferences::<S>).delete(reset_response_preferences::<S>),
         )
         .route(
             "/v1/projects/{project_id}/repositories/clone",
@@ -2606,6 +2645,66 @@ where
     Ok(Json(SessionMessagesResponse { messages }))
 }
 
+async fn upsert_response_feedback<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path((thread_id, message_id)): Path<(String, String)>,
+    Json(request): Json<ResponseFeedbackRequest>,
+) -> Result<Json<ResponseFeedbackResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    let input = validate_response_feedback_request(request)?;
+    let (feedback, preferences) = state
+        .store
+        .upsert_response_feedback(&principal, &thread_id, &message_id, input)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(ResponseFeedbackResponse {
+        feedback,
+        preferences,
+    }))
+}
+
+async fn get_response_preferences<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+) -> Result<Json<ResponsePreferencesResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    let preferences = state
+        .store
+        .get_response_preferences(&principal)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(ResponsePreferencesResponse { preferences }))
+}
+
+async fn reset_response_preferences<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    state
+        .store
+        .reset_response_preferences(&principal)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn validate_session_message_request(request: &CreateSessionMessageRequest) -> Result<(), ApiError> {
     if !matches!(request.kind.as_str(), "system" | "user" | "assistant") {
         return Err(ApiError::new(
@@ -2620,6 +2719,48 @@ fn validate_session_message_request(request: &CreateSessionMessageRequest) -> Re
         ));
     }
     Ok(())
+}
+
+fn validate_response_feedback_request(
+    request: ResponseFeedbackRequest,
+) -> Result<UpsertResponseFeedbackInput, ApiError> {
+    if !matches!(request.rating.as_str(), "good" | "bad") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "feedback rating must be good or bad",
+        ));
+    }
+    let mut reason_tags = Vec::new();
+    for tag in request.reason_tags {
+        let normalized = tag.trim().to_ascii_lowercase();
+        if normalized.is_empty() || reason_tags.contains(&normalized) {
+            continue;
+        }
+        if !matches!(
+            normalized.as_str(),
+            "too_verbose"
+                | "too_generic"
+                | "wrong_context"
+                | "used_repo_when_not_needed"
+                | "poor_formatting"
+                | "missed_business_goal"
+                | "raw_tool_output"
+                | "other"
+        ) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "unknown feedback reason tag",
+            ));
+        }
+        reason_tags.push(normalized);
+    }
+    Ok(UpsertResponseFeedbackInput {
+        rating: request.rating,
+        reason_tags,
+        comment: request.comment.and_then(|comment| {
+            (!comment.trim().is_empty()).then(|| "<redacted-comment>".to_string())
+        }),
+    })
 }
 
 #[utoipa::path(
@@ -3965,6 +4106,18 @@ __CONTENT__
       if (result) result.textContent = JSON.stringify(json, null, 2);
       return json;
     }
+    async function putJsonPayload(url, body) {
+      const response = await fetch(url, {method:'PUT', headers:{'content-type':'application/json'}, credentials:'same-origin', body:JSON.stringify(body)});
+      const text = await response.text();
+      let json = {};
+      try { json = text ? JSON.parse(text) : {}; } catch (_) { json = {body:text}; }
+      if (!response.ok) {
+        throw new Error(json.error || text || response.statusText);
+      }
+      const result = document.getElementById('result');
+      if (result) result.textContent = JSON.stringify(json, null, 2);
+      return json;
+    }
     async function deleteJsonPayload(url) {
       const response = await fetch(url, {method:'DELETE', credentials:'same-origin'});
       const text = await response.text();
@@ -3989,7 +4142,7 @@ __CONTENT__
         this.attachShadow({mode:'open'});
       }
       connectedCallback() {
-        this.shadowRoot.innerHTML = '<style>:host{display:block;height:100%;overflow:hidden;min-height:0;}#scroll{height:100%;overflow-y:auto;overflow-x:hidden;padding:28px max(22px,5vw) 24px;box-sizing:border-box;scrollbar-gutter:stable;}#top-spacer,#bottom-spacer{height:0;}#messages{display:flex;flex-direction:column;gap:22px;min-height:100%;}.message{max-width:min(var(--chat-content-width,980px),100%);border:0;border-radius:18px;padding:14px 16px;line-height:1.55;font-size:15px;box-sizing:border-box;position:relative;}.message.system,.message.assistant{background:transparent;color:#d7dce7;}.message.user{align-self:flex-end;background:#1f2027;color:#f5f6fa;}.message.pending div{color:#858b98;}.message small{display:block;color:#858b98;font-size:11px;font-weight:800;text-transform:uppercase;margin-bottom:6px;}.message-body{white-space:normal;}.message-body p{margin:0 0 10px;}.message-body p:last-child{margin-bottom:0;}.message-body h1,.message-body h2,.message-body h3{margin:16px 0 8px;color:#f4f6fb;line-height:1.25;}.message-body h1{font-size:22px;}.message-body h2{font-size:19px;}.message-body h3{font-size:16px;}.message-body ul,.message-body ol{margin:8px 0 12px;padding-left:22px;}.message-body li{margin:4px 0;}.message-body code{background:#151820;border:1px solid #2a2d37;border-radius:5px;padding:1px 5px;}.message-body pre{background:#0d0f14;border:1px solid #2a2d37;border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;}.message-actions{display:flex;align-items:center;justify-content:flex-start;margin-top:12px;opacity:0;transition:opacity .14s ease;}.message:hover .message-actions,.message:focus-within .message-actions,.message.last-completed-assistant .message-actions{opacity:1;}.message-actions-left{display:inline-flex;align-items:center;gap:8px;color:#9aa3b2;}.message-timestamp{font-size:12px;color:#9aa3b2;}.copyable-message{appearance:none;border:0;background:transparent;color:#9aa3b2;padding:4px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;opacity:.84;cursor:pointer;}.copyable-message:hover,.copyable-message:focus{background:rgba(154,163,178,.12);color:#c9d1dd;opacity:1;outline:none;}.copyable-message.copied{color:#d7dce7;}.copyable-message svg{width:16px;height:16px;}.inline-turn-editor{display:grid;gap:10px;min-width:min(520px,70vw);}.inline-turn-editor textarea{width:100%;min-height:96px;box-sizing:border-box;background:#0d0f14;color:#f5f6fa;border:1px solid #3a4151;border-radius:10px;padding:10px;font:inherit;resize:vertical;}.inline-turn-editor-actions{display:flex;gap:8px;justify-content:flex-end;}.inline-turn-editor-actions button{border:0;border-radius:9px;padding:8px 12px;font-weight:800;cursor:pointer;}.inline-turn-editor-actions .submit-edit{background:var(--lc-accent,#8bf5a2);color:var(--lc-accent-text,#061008);}.inline-turn-editor-actions .cancel-edit{background:#253044;color:#dce4f2;}.thinking-dots{display:inline-flex;align-items:center;gap:2px;color:#a3aab8;}.thinking-dots::after{content:\'...\';display:inline-block;min-width:22px;animation:thinkingPulse 1.1s steps(4,end) infinite;}@keyframes thinkingPulse{0%{content:\'\';}25%{content:\'.\';}50%{content:\'..\';}75%,100%{content:\'...\';}}@media (max-width:480px){#scroll{padding:18px 14px 18px;}.message{font-size:14px;padding:12px 13px;}}</style><div id="scroll"><div id="top-spacer"></div><div id="messages"></div><div id="bottom-spacer"></div></div>';
+        this.shadowRoot.innerHTML = '<style>:host{display:block;height:100%;overflow:hidden;min-height:0;}#scroll{height:100%;overflow-y:auto;overflow-x:hidden;padding:28px max(22px,5vw) 24px;box-sizing:border-box;scrollbar-gutter:stable;}#top-spacer,#bottom-spacer{height:0;}#messages{display:flex;flex-direction:column;gap:22px;min-height:100%;}.message{max-width:min(var(--chat-content-width,980px),100%);border:0;border-radius:18px;padding:14px 16px;line-height:1.55;font-size:15px;box-sizing:border-box;position:relative;}.message.system,.message.assistant{background:transparent;color:#d7dce7;}.message.user{align-self:flex-end;background:#1f2027;color:#f5f6fa;}.message.pending div{color:#858b98;}.message small{display:block;color:#858b98;font-size:11px;font-weight:800;text-transform:uppercase;margin-bottom:6px;}.message-body{white-space:normal;}.message-body p{margin:0 0 10px;}.message-body p:last-child{margin-bottom:0;}.message-body h1,.message-body h2,.message-body h3{margin:16px 0 8px;color:#f4f6fb;line-height:1.25;}.message-body h1{font-size:22px;}.message-body h2{font-size:19px;}.message-body h3{font-size:16px;}.message-body ul,.message-body ol{margin:8px 0 12px;padding-left:22px;}.message-body li{margin:4px 0;}.message-body code{background:#151820;border:1px solid #2a2d37;border-radius:5px;padding:1px 5px;}.message-body pre{background:#0d0f14;border:1px solid #2a2d37;border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;}.message-actions{display:flex;align-items:center;justify-content:flex-start;margin-top:12px;opacity:0;transition:opacity .14s ease;}.message:hover .message-actions,.message:focus-within .message-actions,.message.last-completed-assistant .message-actions{opacity:1;}.message-actions-left{display:inline-flex;align-items:center;gap:8px;color:#9aa3b2;}.message-timestamp{font-size:12px;color:#9aa3b2;}.copyable-message{appearance:none;border:0;background:transparent;color:#9aa3b2;padding:4px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;opacity:.84;cursor:pointer;}.copyable-message:hover,.copyable-message:focus{background:rgba(154,163,178,.12);color:#c9d1dd;opacity:1;outline:none;}.copyable-message.copied,.copyable-message.feedback-selected{color:#f5f6fa;opacity:1;}.copyable-message.feedback-selected{background:rgba(245,246,250,.10);}.copyable-message svg{width:16px;height:16px;}.inline-turn-editor{display:grid;gap:10px;min-width:min(520px,70vw);}.inline-turn-editor textarea{width:100%;min-height:96px;box-sizing:border-box;background:#0d0f14;color:#f5f6fa;border:1px solid #3a4151;border-radius:10px;padding:10px;font:inherit;resize:vertical;}.inline-turn-editor-actions{display:flex;gap:8px;justify-content:flex-end;}.inline-turn-editor-actions button{border:0;border-radius:9px;padding:8px 12px;font-weight:800;cursor:pointer;}.inline-turn-editor-actions .submit-edit{background:var(--lc-accent,#8bf5a2);color:var(--lc-accent-text,#061008);}.inline-turn-editor-actions .cancel-edit{background:#253044;color:#dce4f2;}.thinking-dots{display:inline-flex;align-items:center;gap:2px;color:#a3aab8;}.thinking-dots::after{content:\'...\';display:inline-block;min-width:22px;animation:thinkingPulse 1.1s steps(4,end) infinite;}@keyframes thinkingPulse{0%{content:\'\';}25%{content:\'.\';}50%{content:\'..\';}75%,100%{content:\'...\';}}@media (max-width:480px){#scroll{padding:18px 14px 18px;}.message{font-size:14px;padding:12px 13px;}}</style><div id="scroll"><div id="top-spacer"></div><div id="messages"></div><div id="bottom-spacer"></div></div>';
         this.scrollElement = this.shadowRoot.getElementById('scroll');
         this.messageElement = this.shadowRoot.getElementById('messages');
         this.topSpacerElement = this.shadowRoot.getElementById('top-spacer');
@@ -4014,6 +4167,11 @@ __CONTENT__
           if (cancelEditButton) {
             this.editingIndex = null;
             this.renderAfterMessageChange();
+            return;
+          }
+          const feedbackButton = event.target.closest('[data-feedback-index]');
+          if (feedbackButton) {
+            this.handleWorkbenchFeedback(Number(feedbackButton.dataset.feedbackIndex), feedbackButton.dataset.feedbackRating);
             return;
           }
           const button = event.target.closest('[data-copy-index]');
@@ -4078,6 +4236,18 @@ __CONTENT__
           this.renderAfterMessageChange();
         }
       }
+      attachLastPersistedMessage(kind, label, persisted) {
+        if (!persisted) return;
+        const last = [...this.messages].reverse().find((message) => message.kind === kind && message.label === label && !message.pending && !message.streaming && !message.ephemeral);
+        if (!last) return;
+        Object.assign(last, {
+          message_id: persisted.message_id,
+          session_id: persisted.session_id,
+          feedbackRating: persisted.feedback_rating || persisted.feedbackRating || last.feedbackRating,
+          createdAt: persisted.created_at || last.createdAt
+        });
+        this.renderAfterMessageChange();
+      }
       setMessages(messages) {
         this.messages = Array.isArray(messages) ? messages.map((message) => Object.assign({}, message, {createdAt:message.created_at || message.createdAt || new Date().toISOString()})) : [];
         this.renderWindow(Math.max(0, this.messages.length - this.maxRenderedMessages));
@@ -4124,7 +4294,10 @@ __CONTENT__
         const copyButton = copyable ? '<button class="copyable-message" title="Copy turn" data-copy-index="'+String(index)+'">'+workbenchIcon('copy')+'</button>' : '';
         const resubmitButton = copyable && message.kind === 'user' ? '<button class="copyable-message" title="Resubmit turn" data-resubmit-index="'+String(index)+'">'+workbenchIcon('rotate-ccw')+'</button>' : '';
         const editResubmitButton = copyable && message.kind === 'user' ? '<button class="copyable-message" title="Edit turn" data-begin-edit-index="'+String(index)+'">'+workbenchIcon('pencil')+'</button>' : '';
-        const actions = copyable ? '<div class="message-actions"><div class="message-actions-left">'+copyButton+resubmitButton+editResubmitButton+'<span class="message-timestamp">'+workbenchEscape(formatWorkbenchTurnTime(message.createdAt))+'</span></div></div>' : '';
+        const feedbackButtons = copyable && message.kind === 'assistant'
+          ? '<button class="copyable-message'+(message.feedbackRating === 'good' ? ' feedback-selected' : '')+'" title="Good response" data-feedback-rating="good" data-feedback-index="'+String(index)+'">'+workbenchIcon('thumbs-up')+'</button><button class="copyable-message'+(message.feedbackRating === 'bad' ? ' feedback-selected' : '')+'" title="Bad response" data-feedback-rating="bad" data-feedback-index="'+String(index)+'">'+workbenchIcon('thumbs-down')+'</button>'
+          : '';
+        const actions = copyable ? '<div class="message-actions"><div class="message-actions-left">'+copyButton+feedbackButtons+resubmitButton+editResubmitButton+'<span class="message-timestamp">'+workbenchEscape(formatWorkbenchTurnTime(message.createdAt))+'</span></div></div>' : '';
         const body = index === this.editingIndex && message.kind === 'user'
           ? '<div class="inline-turn-editor"><textarea data-edit-value-index="'+String(index)+'">'+workbenchEscape(message.text || '')+'</textarea><div class="inline-turn-editor-actions"><button class="cancel-edit" data-cancel-edit-index="'+String(index)+'">Cancel</button><button class="submit-edit" data-submit-edit-index="'+String(index)+'">Submit</button></div></div>'
           : message.pending && message.kind === 'assistant' ? '<span class="thinking-dots">Thinking</span>' : formatAssistantMessage(message);
@@ -4146,6 +4319,22 @@ __CONTENT__
           }
         } catch (_) {
           window.prompt('Copy this turn', text);
+        }
+      }
+      async handleWorkbenchFeedback(index, rating) {
+        const message = this.messages[index];
+        if (!message || message.kind !== 'assistant' || !message.message_id || !workbench.sessionId) {
+          workbenchMessage('system', 'Feedback', 'Save completed assistant turns before rating them.');
+          return;
+        }
+        if (rating === 'bad') {
+          openResponseFeedbackModal(index);
+          return;
+        }
+        try {
+          await submitWorkbenchFeedback(index, 'good', []);
+        } catch (error) {
+          workbenchMessage('system', 'Feedback failed', error.message || 'Could not save response feedback.');
         }
       }
       async resubmitWorkbenchMessage(index) {
@@ -4202,7 +4391,7 @@ __CONTENT__
     if (!customElements.get('workbench-transcript')) {
       customElements.define('workbench-transcript', WorkbenchTranscript);
     }
-    const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], contextThreadId:null, pendingAssistantText:'', commandOutputChars:0 };
+    const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], contextThreadId:null, pendingAssistantText:'', commandOutputChars:0, responsePreferences:null, feedbackMessageIndex:null };
     function workbenchEscape(value) {
       return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     }
@@ -4307,7 +4496,9 @@ __CONTENT__
         'pencil': '<path d="M21.2 6.8a2.8 2.8 0 0 0-4-4L4 16v4h4Z"/><path d="m14 5 5 5"/>',
         'plus': '<path d="M5 12h14"/><path d="M12 5v14"/>',
         'rotate-ccw': '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>',
-        'send': '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'
+        'send': '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+        'thumbs-up': '<path d="M7 10v12"/><path d="M15 5.9 14 10h5.8a2 2 0 0 1 2 2.3l-1.4 7a2 2 0 0 1-2 1.7H7"/><path d="M7 10H2v12h5"/><path d="M14 10V5a3 3 0 0 0-3-3l-4 8"/>',
+        'thumbs-down': '<path d="M17 14V2"/><path d="M9 18.1 10 14H4.2a2 2 0 0 1-2-2.3l1.4-7a2 2 0 0 1 2-1.7H17"/><path d="M17 14h5V2h-5"/><path d="M10 14v5a3 3 0 0 0 3 3l4-8"/>'
       };
       const body = icons[name] || icons['more-horizontal'];
       return '<svg class="lucide-icon" data-icon="'+workbenchEscape(name)+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+body+'</svg>';
@@ -4340,6 +4531,9 @@ __CONTENT__
         kind: message.kind || 'assistant',
         label: message.label || (message.kind === 'user' ? 'You' : 'Codex'),
         text: message.text || '',
+        message_id: message.message_id,
+        session_id: message.session_id,
+        feedbackRating:message.feedback_rating || message.feedbackRating,
         createdAt:message.created_at || message.createdAt
       })));
       workbench.pendingAssistantText = '';
@@ -4356,6 +4550,54 @@ __CONTENT__
     async function recordWorkbenchThreadMessage(kind, label, text) {
       if (!workbench.sessionId || !text || !String(text).trim()) return;
       return await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages', {kind, label, text});
+    }
+    function openResponseFeedbackModal(index) {
+      workbench.feedbackMessageIndex = index;
+      const modal = document.getElementById('response-feedback-modal');
+      if (!modal) return;
+      modal.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+        input.checked = false;
+      });
+      modal.showModal();
+    }
+    async function submitResponseFeedbackFromModal() {
+      const modal = document.getElementById('response-feedback-modal');
+      const tags = [...modal.querySelectorAll('input[type="checkbox"]:checked')].map((input) => input.value);
+      try {
+        await submitWorkbenchFeedback(workbench.feedbackMessageIndex, 'bad', tags.length ? tags : ['other']);
+        modal.close();
+      } catch (error) {
+        workbenchMessage('system', 'Feedback failed', error.message || 'Could not save response feedback.');
+      }
+    }
+    async function submitWorkbenchFeedback(index, rating, reasonTags) {
+      const chat = document.getElementById('workbench-chat');
+      const message = chat?.messages?.[index];
+      if (!message || !message.message_id || !workbench.sessionId) {
+        throw new Error('This response is not ready for feedback yet.');
+      }
+      const payload = await putJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages/'+encodeURIComponent(message.message_id)+'/feedback', {
+        rating,
+        reason_tags: reasonTags || []
+      });
+      workbench.responsePreferences = payload.preferences || workbench.responsePreferences;
+      message.feedbackRating = rating;
+      chat.renderAfterMessageChange?.();
+      return payload;
+    }
+    function openResponsePreferencesModal() {
+      const modal = document.getElementById('response-preferences-modal');
+      const body = document.getElementById('response-preferences-body');
+      const summary = String(workbench.responsePreferences?.profile_summary || '').trim();
+      if (body) {
+        body.textContent = summary || 'No response preferences have been learned yet.';
+      }
+      modal?.showModal();
+    }
+    async function resetResponsePreferences() {
+      await deleteJsonPayload('/v1/me/response-preferences');
+      workbench.responsePreferences = {profile_summary:'', sample_count:0};
+      openResponsePreferencesModal();
     }
     function appendWorkbenchAssistantDelta(delta) {
       if (!delta) return;
@@ -4624,13 +4866,15 @@ __CONTENT__
     async function loadWorkbench() {
       if (!document.getElementById('workbench-chat')) return;
       try {
-        const [me, userWorkspaces, projects] = await Promise.all([
+        const [me, userWorkspaces, projects, preferences] = await Promise.all([
           fetchJson('/v1/auth/me'),
           fetchJson('/v1/user-workspaces').catch(() => ({user_workspaces: []})),
-          fetchJson('/v1/projects').catch(() => ({projects: []}))
+          fetchJson('/v1/projects').catch(() => ({projects: []})),
+          fetchJson('/v1/me/response-preferences').catch(() => ({preferences: null}))
         ]);
         workbench.userWorkspaces = userWorkspaces.user_workspaces || [];
         workbench.projects = projects.projects || [];
+        workbench.responsePreferences = preferences.preferences || null;
         const user = document.getElementById('workbench-user');
         if (user) {
           user.textContent = me.email + ' (' + me.role + ')';
@@ -4990,7 +5234,7 @@ __CONTENT__
         clientInfo: {
           name: 'local-codex-enterprise-browser',
           title: 'Local Codex Enterprise Browser Chat',
-          version: '0.0.1-beta.3'
+          version: '0.0.1-beta.4'
         },
         capabilities: {
           experimentalApi: true,
@@ -5053,7 +5297,8 @@ __CONTENT__
             workbench.pendingAssistantText = '';
             completeWorkbenchAssistantTurn();
             (async () => {
-              await recordWorkbenchThreadMessage('assistant', 'Codex', assistantText);
+              const saved = await recordWorkbenchThreadMessage('assistant', 'Codex', assistantText);
+              document.getElementById('workbench-chat')?.attachLastPersistedMessage?.('assistant', 'Codex', saved?.message);
               await autoLabelWorkbenchThreadAfterFirstAiTurn();
             })().catch((error) => {
               workbenchMessage('system', 'History', 'Could not save Codex reply: '+error.message);
@@ -5087,18 +5332,24 @@ __CONTENT__
       });
     }
     function buildWorkbenchUserPrompt(text) {
-      if (workbench.repositoryId) return text;
+      const responsePreferences = workbenchResponsePreferenceGuidance();
+      if (workbench.repositoryId) return responsePreferences ? responsePreferences+'User request:\n'+text : text;
       if (isSocialWorkbenchMessage(text)) {
-        return 'Conversational acknowledgement. Reply briefly and naturally. Do not start planning, inspect the repository, mention AGENTS.md, or ask what planning is needed. Do not mention unavailable tools or internal tool names.\\n\\nUser message:\\n'+text;
+        return responsePreferences+'Conversational acknowledgement. Reply briefly and naturally. Do not start planning, inspect the repository, mention AGENTS.md, or ask what planning is needed. Do not mention unavailable tools or internal tool names.\\n\\nUser message:\\n'+text;
       }
       const guidance = workbenchTurnGuidance();
       if (!isPlanningWorkbenchMessage(text)) {
-        return 'General chat request. Answer directly and concisely. Do not inspect the repository unless the user explicitly asks about the current codebase. Do not mention unavailable tools or internal tool names. '+(guidance.repository_tool_rule || '')+' '+(guidance.tool_output_rule || '')+'\\n\\nUser request:\\n'+text;
+        return responsePreferences+'General chat request. Answer directly and concisely. Do not inspect the repository unless the user explicitly asks about the current codebase. Do not mention unavailable tools or internal tool names. '+(guidance.repository_tool_rule || '')+' '+(guidance.tool_output_rule || '')+'\\n\\nUser request:\\n'+text;
       }
       const planning = Array.isArray(guidance.planning_sequence)
         ? guidance.planning_sequence.map((item, index) => String(index + 1)+'. '+item).join(' ')
         : '1. business goal 2. users/stakeholders 3. decisions the system must support 4. data sources 5. architecture 6. implementation path';
-      return 'Conceptual planning request. This Local Codex project does not currently have a selected repository. '+(guidance.repository_tool_rule || '')+' '+(guidance.tool_output_rule || '')+' Start planning tasks with: '+planning+'.\\n\\nUser request:\\n'+text;
+      return responsePreferences+'Conceptual planning request. This Local Codex project does not currently have a selected repository. '+(guidance.repository_tool_rule || '')+' '+(guidance.tool_output_rule || '')+' Start planning tasks with: '+planning+'.\\n\\nUser request:\\n'+text;
+    }
+    function workbenchResponsePreferenceGuidance() {
+      const summary = String(workbench.responsePreferences?.profile_summary || '').trim();
+      if (!summary) return '';
+      return 'User response preferences:\\n'+summary+'\\nThese preferences affect style and routing behavior only, not factual truth.\\n\\n';
     }
     function isSocialWorkbenchMessage(text) {
       const normalized = String(text || '').trim().toLowerCase().replace(/[.!?]+$/g, '');
@@ -5729,6 +5980,7 @@ fn chat_page(
               <summary id="workbench-user">Loading signed-in user...</summary>
               <div class="account-menu-panel">
                 <a href="/app/terminal">Terminal instructions</a>
+                <button onclick="openResponsePreferencesModal()">Response preferences</button>
                 {admin_menu_item}
               </div>
             </details>
@@ -5789,6 +6041,31 @@ fn chat_page(
       <p class="hint">Read-only assets assigned to your user. End outputs are stakeholder-facing deliverables; operational outputs are work records.</p>
       <div id="workbench-output-list" class="output-list"><p class="hint">Loading outputs...</p></div>
       <button onclick="document.getElementById('workbench-output-modal').close()">Close</button>
+    </dialog>
+    <dialog id="response-feedback-modal" class="chat-modal">
+      <strong>Bad response</strong>
+      <p class="hint">Choose why this response missed. These tags update user-scoped response preferences; comments and message text are not injected into future prompts.</p>
+      <label><input type="checkbox" value="too_verbose"> Too verbose</label>
+      <label><input type="checkbox" value="too_generic"> Too generic</label>
+      <label><input type="checkbox" value="wrong_context"> Wrong context</label>
+      <label><input type="checkbox" value="used_repo_when_not_needed"> Used repository when not needed</label>
+      <label><input type="checkbox" value="poor_formatting"> Poor formatting</label>
+      <label><input type="checkbox" value="missed_business_goal"> Missed business goal</label>
+      <label><input type="checkbox" value="raw_tool_output"> Raw tool output</label>
+      <label><input type="checkbox" value="other"> Other</label>
+      <div class="actions">
+        <button onclick="submitResponseFeedbackFromModal()">Save feedback</button>
+        <button class="secondary" onclick="document.getElementById('response-feedback-modal').close()">Close</button>
+      </div>
+    </dialog>
+    <dialog id="response-preferences-modal" class="chat-modal">
+      <strong>User response preferences</strong>
+      <p class="hint">Inspectable per-user harness guidance. These preferences affect style and routing behavior only, not factual truth.</p>
+      <pre id="response-preferences-body">Loading...</pre>
+      <div class="actions">
+        <button class="secondary" onclick="resetResponsePreferences()">Reset preferences</button>
+        <button onclick="document.getElementById('response-preferences-modal').close()">Close</button>
+      </div>
     </dialog>
     <dialog id="workbench-utility-modal" class="chat-modal">
       <strong>Projects utility menu</strong>
