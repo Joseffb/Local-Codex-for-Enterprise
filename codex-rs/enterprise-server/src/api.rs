@@ -3925,6 +3925,18 @@ __CONTENT__
       if (result) result.textContent = JSON.stringify(json, null, 2);
       return json;
     }
+    async function patchJsonPayload(url, body) {
+      const response = await fetch(url, {method:'PATCH', headers:{'content-type':'application/json'}, credentials:'same-origin', body:JSON.stringify(body)});
+      const text = await response.text();
+      let json = {};
+      try { json = text ? JSON.parse(text) : {}; } catch (_) { json = {body:text}; }
+      if (!response.ok) {
+        throw new Error(json.error || text || response.statusText);
+      }
+      const result = document.getElementById('result');
+      if (result) result.textContent = JSON.stringify(json, null, 2);
+      return json;
+    }
     async function deleteJsonPayload(url) {
       const response = await fetch(url, {method:'DELETE', credentials:'same-origin'});
       const text = await response.text();
@@ -3944,20 +3956,33 @@ __CONTENT__
         this.maxRenderedMessages = 80;
         this.rowEstimate = 92;
         this.windowStart = 0;
+        this.stickToBottom = true;
         this.attachShadow({mode:'open'});
       }
       connectedCallback() {
-        this.shadowRoot.innerHTML = '<style>:host{display:block;overflow:auto;min-height:0;}#scroll{height:100%;overflow:auto;padding:28px max(22px,5vw) 24px;box-sizing:border-box;}#top-spacer,#bottom-spacer{height:0;}#messages{display:flex;flex-direction:column;gap:22px;min-height:100%;}.message{max-width:min(var(--chat-content-width,980px),100%);border:0;border-radius:18px;padding:14px 16px;line-height:1.55;font-size:15px;box-sizing:border-box;}.message.system,.message.assistant{background:transparent;color:#d7dce7;}.message.user{align-self:flex-end;background:#1f2027;color:#f5f6fa;}.message.pending div{color:#858b98;}.message small{display:block;color:#858b98;font-size:11px;font-weight:800;text-transform:uppercase;margin-bottom:6px;}@media (max-width:480px){#scroll{padding:18px 14px 18px;}.message{font-size:14px;padding:12px 13px;}}</style><div id="scroll"><div id="top-spacer"></div><div id="messages"></div><div id="bottom-spacer"></div></div>';
+        this.shadowRoot.innerHTML = '<style>:host{display:block;height:100%;overflow:hidden;min-height:0;}#scroll{height:100%;overflow-y:auto;overflow-x:hidden;padding:28px max(22px,5vw) 24px;box-sizing:border-box;scrollbar-gutter:stable;}#top-spacer,#bottom-spacer{height:0;}#messages{display:flex;flex-direction:column;gap:22px;min-height:100%;}.message{max-width:min(var(--chat-content-width,980px),100%);border:0;border-radius:18px;padding:14px 16px;line-height:1.55;font-size:15px;box-sizing:border-box;}.message.system,.message.assistant{background:transparent;color:#d7dce7;}.message.user{align-self:flex-end;background:#1f2027;color:#f5f6fa;}.message.pending div{color:#858b98;}.message small{display:block;color:#858b98;font-size:11px;font-weight:800;text-transform:uppercase;margin-bottom:6px;}.message-body{white-space:normal;}.message-body p{margin:0 0 10px;}.message-body p:last-child{margin-bottom:0;}.message-body h1,.message-body h2,.message-body h3{margin:16px 0 8px;color:#f4f6fb;line-height:1.25;}.message-body h1{font-size:22px;}.message-body h2{font-size:19px;}.message-body h3{font-size:16px;}.message-body ul,.message-body ol{margin:8px 0 12px;padding-left:22px;}.message-body li{margin:4px 0;}.message-body code{background:#151820;border:1px solid #2a2d37;border-radius:5px;padding:1px 5px;}.message-body pre{background:#0d0f14;border:1px solid #2a2d37;border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;}@media (max-width:480px){#scroll{padding:18px 14px 18px;}.message{font-size:14px;padding:12px 13px;}}</style><div id="scroll"><div id="top-spacer"></div><div id="messages"></div><div id="bottom-spacer"></div></div>';
         this.scrollElement = this.shadowRoot.getElementById('scroll');
         this.messageElement = this.shadowRoot.getElementById('messages');
         this.topSpacerElement = this.shadowRoot.getElementById('top-spacer');
         this.bottomSpacerElement = this.shadowRoot.getElementById('bottom-spacer');
-        this.scrollElement.addEventListener('scroll', () => this.renderForScroll());
+        this.scrollElement.addEventListener('scroll', () => {
+          this.stickToBottom = this.isAtBottom();
+          this.renderForScroll();
+        });
         this.renderWindow(Math.max(0, this.messages.length - this.maxRenderedMessages));
+      }
+      isAtBottom() {
+        return !this.scrollElement || this.scrollElement.scrollTop + this.scrollElement.clientHeight >= this.scrollElement.scrollHeight - 80;
+      }
+      scrollToBottom() {
+        if (!this.scrollElement) return;
+        this.scrollElement.scrollTop = this.scrollElement.scrollHeight;
+        this.stickToBottom = true;
       }
       appendMessage(kind, label, text) {
         this.clearEphemeralMessages();
         this.messages.push({kind, label, text});
+        if (kind === 'user') this.stickToBottom = true;
         this.renderAfterMessageChange();
       }
       appendToLastMessage(kind, label, delta) {
@@ -3992,9 +4017,7 @@ __CONTENT__
       setMessages(messages) {
         this.messages = Array.isArray(messages) ? messages : [];
         this.renderWindow(Math.max(0, this.messages.length - this.maxRenderedMessages));
-        requestAnimationFrame(() => {
-          if (this.scrollElement) this.scrollElement.scrollTop = this.scrollElement.scrollHeight;
-        });
+        requestAnimationFrame(() => this.scrollToBottom());
       }
       setEmptyMessage(kind, label, text) {
         this.setMessages([{kind, label, text, ephemeral:true}]);
@@ -4007,10 +4030,10 @@ __CONTENT__
         this.messages = this.messages.filter((message) => !message.ephemeral);
       }
       renderAfterMessageChange() {
-        const atBottom = !this.scrollElement || this.scrollElement.scrollTop + this.scrollElement.clientHeight >= this.scrollElement.scrollHeight - 120;
+        const atBottom = this.stickToBottom || this.isAtBottom();
         if (atBottom) {
           this.renderWindow(Math.max(0, this.messages.length - this.maxRenderedMessages));
-          requestAnimationFrame(() => { this.scrollElement.scrollTop = this.scrollElement.scrollHeight; });
+          requestAnimationFrame(() => this.scrollToBottom());
         } else {
           this.renderForScroll();
         }
@@ -4029,7 +4052,7 @@ __CONTENT__
         const visible = this.messages.slice(start, start + this.maxRenderedMessages);
         this.topSpacerElement.style.height = String(start * this.rowEstimate) + 'px';
         this.bottomSpacerElement.style.height = String(Math.max(0, this.messages.length - start - visible.length) * this.rowEstimate) + 'px';
-        this.messageElement.innerHTML = visible.map((message) => '<div class="message '+workbenchEscape(message.kind)+(message.pending ? ' pending' : '')+'"><small>'+workbenchEscape(message.label)+'</small><div>'+workbenchEscape(message.text)+'</div></div>').join('');
+        this.messageElement.innerHTML = visible.map((message) => '<div class="message '+workbenchEscape(message.kind)+(message.pending ? ' pending' : '')+'"><small>'+workbenchEscape(message.label)+'</small><div class="message-body">'+formatAssistantMessage(message)+'</div></div>').join('');
       }
     }
     if (!customElements.get('workbench-transcript')) {
@@ -4038,6 +4061,87 @@ __CONTENT__
     const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], contextThreadId:null, pendingAssistantText:'' };
     function workbenchEscape(value) {
       return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    }
+    function renderWorkbenchInlineMarkdown(value) {
+      return workbenchEscape(value)
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    }
+    function renderWorkbenchMarkdown(value) {
+      const lines = String(value ?? '').replace(/\r\n/g, '\n').split('\n');
+      const html = [];
+      let paragraph = [];
+      let listType = null;
+      let inCode = false;
+      const flushParagraph = () => {
+        if (!paragraph.length) return;
+        html.push('<p>'+renderWorkbenchInlineMarkdown(paragraph.join(' '))+'</p>');
+        paragraph = [];
+      };
+      const closeList = () => {
+        if (!listType) return;
+        html.push('</'+listType+'>');
+        listType = null;
+      };
+      for (const rawLine of lines) {
+        const line = rawLine.trimEnd();
+        if (line.trim().startsWith('```')) {
+          flushParagraph();
+          closeList();
+          if (inCode) {
+            html.push('</code></pre>');
+          } else {
+            html.push('<pre><code>');
+          }
+          inCode = !inCode;
+          continue;
+        }
+        if (inCode) {
+          html.push(workbenchEscape(rawLine)+'\n');
+          continue;
+        }
+        const trimmed = line.trim();
+        if (!trimmed) {
+          flushParagraph();
+          closeList();
+          continue;
+        }
+        const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+        if (heading) {
+          flushParagraph();
+          closeList();
+          const level = String(heading[1]).length;
+          html.push('<h'+level+'>'+renderWorkbenchInlineMarkdown(heading[2])+'</h'+level+'>');
+          continue;
+        }
+        const unordered = trimmed.match(/^[-*]\s+(.+)$/);
+        const ordered = trimmed.match(/^\d+\.\s+(.+)$/);
+        if (unordered || ordered) {
+          flushParagraph();
+          const nextType = unordered ? 'ul' : 'ol';
+          if (listType !== nextType) {
+            closeList();
+            listType = nextType;
+            html.push('<'+listType+'>');
+          }
+          html.push('<li>'+renderWorkbenchInlineMarkdown((unordered || ordered)[1])+'</li>');
+          continue;
+        }
+        closeList();
+        paragraph.push(trimmed);
+      }
+      flushParagraph();
+      closeList();
+      if (inCode) html.push('</code></pre>');
+      return html.join('');
+    }
+    function formatAssistantMessage(message) {
+      const text = message?.text || '';
+      if (message?.kind === 'assistant' || message?.kind === 'system') {
+        return renderWorkbenchMarkdown(text);
+      }
+      return '<p>'+workbenchEscape(text).replace(/\n/g, '<br>')+'</p>';
     }
     function workbenchIcon(name) {
       const icons = {
@@ -4657,7 +4761,7 @@ __CONTENT__
         clientInfo: {
           name: 'local-codex-enterprise-browser',
           title: 'Local Codex Enterprise Browser Chat',
-          version: '0.0.1-beta.0'
+          version: '0.0.1-beta.1'
         },
         capabilities: {
           experimentalApi: true,
@@ -4737,14 +4841,19 @@ __CONTENT__
       if (!workbench.appThreadId) {
         await startWorkbenchRpcThread();
       }
+      const modelText = buildWorkbenchUserPrompt(text);
       workbenchMessage('user', 'You', text);
       await recordWorkbenchThreadMessage('user', 'You', text);
       appendWorkbenchAssistantPending();
       await sendWorkbenchRpcRequest('turn/start', {
         threadId: workbench.appThreadId,
         clientUserMessageId: null,
-        input: [{type:'text', text, textElements: []}]
+        input: [{type:'text', text:modelText, textElements: []}]
       });
+    }
+    function buildWorkbenchUserPrompt(text) {
+      if (workbench.repositoryId) return text;
+      return 'Conceptual planning request. This Local Codex project does not currently have a selected repository. Do not inspect repository files unless the user asks to inspect code, modify files, run tests, or analyze a repository. If the user is asking for a concept, plan, architecture, or strategy, answer from the concept described by the user.\\n\\nUser request:\\n'+text;
     }
     async function retryWorkbenchMessageOnce(text, firstError) {
       workbenchMessage('system', 'Reconnecting', firstError.message || 'Worker websocket disconnected. Starting a fresh handoff.');
@@ -5233,7 +5342,7 @@ fn chat_page(
       header, #page-intro, #result-panel, footer {{ display: none; }}
       body {{ background: #050507; color: #d7dce7; overflow: hidden; }}
       main {{ max-width: none; margin: 0; padding: 0; height: 100vh; }}
-      .chat-shell-fullscreen {{ --lc-accent: AccentColor; --lc-accent-text: AccentColorText; --chat-content-width: 980px; height: 100vh; display: grid; grid-template-columns: 320px minmax(0, 1fr); background: #050507; color: #d7dce7; }}
+      .chat-shell-fullscreen {{ --lc-accent: AccentColor; --lc-accent-text: AccentColorText; --chat-content-width: 980px; position: fixed; inset: 0; overflow: hidden; height: 100vh; min-height: 0; display: grid; grid-template-columns: 320px minmax(0, 1fr); background: #050507; color: #d7dce7; }}
       @supports not (color: AccentColor) {{ .chat-shell-fullscreen {{ --lc-accent: #9df2b4; --lc-accent-text: #061009; }} }}
       .chat-shell-fullscreen.chat-rail-collapsed {{ grid-template-columns: 44px minmax(0, 1fr); }}
       .chat-shell-fullscreen.chat-rail-collapsed .chat-rail {{ padding-inline: 6px; }}
@@ -5290,13 +5399,13 @@ fn chat_page(
       .project-empty {{ margin: 7px 8px 12px; color: #575d6a; }}
       .thread-row {{ width: 100%; margin: 1px 0; text-align: left; background: transparent; border: 0; color: #b9becb; padding: 7px 8px; border-radius: 8px; font-weight: 500; display: block; overflow-wrap: anywhere; }}
       .thread-row.active {{ background: #24262f; color: #fff; }}
-      .chat-main {{ min-width: 0; display: grid; grid-template-rows: 48px minmax(0, 1fr) auto; background: #050507; position: relative; }}
+      .chat-main {{ min-width: 0; min-height: 0; height: 100%; overflow: hidden; display: grid; grid-template-rows: 48px minmax(0, 1fr) auto; background: #050507; position: relative; }}
       .chat-topbar {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #22242b; padding: 0 16px; }}
       .chat-title {{ min-width: 0; font-size: 14px; font-weight: 750; color: #f4f6fb; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
       .workbench-status {{ display: inline-flex; align-items: center; gap: 8px; color: #8f96a3; font-size: 13px; }}
       .workbench-dot {{ width: 8px; height: 8px; border-radius: 999px; background: #d89b36; }}
       .workbench-dot.connected {{ background: #2ec27e; }}
-      workbench-transcript {{ overflow: hidden; min-height: 0; }}
+      workbench-transcript {{ display: block; height: 100%; overflow: hidden; min-height: 0; }}
       .chat-composer-wrap {{ padding: 18px max(22px, 5vw) 76px; display: grid; justify-items: center; }}
       .chat-composer {{ width: min(var(--chat-content-width), 100%); border: 1px solid #2a2d37; border-radius: 18px; background: #0d0f14; padding: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.35); }}
       .chat-composer textarea {{ background: transparent; color: #f5f6fa; border: 0; min-height: 72px; resize: vertical; padding: 10px 6px; }}
@@ -5327,8 +5436,8 @@ fn chat_page(
       .output-row {{ border: 1px solid #2a2d37; border-radius: 10px; background: #0d0f14; padding: 12px; }}
       .output-row strong {{ display: block; color: #f5f6fa; margin-bottom: 4px; }}
       .output-row code {{ color: #aab2c3; overflow-wrap: anywhere; }}
-      @media (max-width: 480px) {{ body {{ overflow: auto; }} main {{ height: auto; }} .chat-shell-fullscreen {{ --chat-content-width: 100%; height: auto; min-height: 100vh; grid-template-columns: 1fr; }} .chat-rail {{ min-height: 44vh; border-right: 0; border-bottom: 1px solid #22242b; }} .chat-topbar {{ padding: 0 10px; }} .chat-title-wrap {{ max-width: 58vw; }} .workbench-status {{ font-size: 12px; }} .chat-composer-wrap {{ padding: 12px 14px 70px; }} .chat-composer {{ border-radius: 14px; }} .thread-title-input {{ width: 58vw; }} }}
-      @media (min-width: 481px) and (max-width: 820px) {{ body {{ overflow: auto; }} main {{ height: auto; }} .chat-shell-fullscreen {{ --chat-content-width: 100%; height: auto; min-height: 100vh; grid-template-columns: 1fr; }} .chat-rail {{ min-height: 38vh; border-right: 0; border-bottom: 1px solid #22242b; }} .chat-composer-wrap {{ padding: 16px 20px 74px; }} .chat-title-wrap {{ max-width: 64vw; }} }}
+      @media (max-width: 480px) {{ body {{ overflow: auto; }} main {{ height: auto; }} .chat-shell-fullscreen {{ --chat-content-width: 100%; position: static; height: auto; min-height: 100vh; overflow: visible; grid-template-columns: 1fr; }} .chat-rail {{ min-height: 44vh; border-right: 0; border-bottom: 1px solid #22242b; }} .chat-topbar {{ padding: 0 10px; }} .chat-title-wrap {{ max-width: 58vw; }} .workbench-status {{ font-size: 12px; }} .chat-composer-wrap {{ padding: 12px 14px 70px; }} .chat-composer {{ border-radius: 14px; }} .thread-title-input {{ width: 58vw; }} }}
+      @media (min-width: 481px) and (max-width: 820px) {{ body {{ overflow: auto; }} main {{ height: auto; }} .chat-shell-fullscreen {{ --chat-content-width: 100%; position: static; height: auto; min-height: 100vh; overflow: visible; grid-template-columns: 1fr; }} .chat-rail {{ min-height: 38vh; border-right: 0; border-bottom: 1px solid #22242b; }} .chat-composer-wrap {{ padding: 16px 20px 74px; }} .chat-title-wrap {{ max-width: 64vw; }} }}
       @media (min-width: 821px) and (max-width: 1439px) {{ .chat-shell-fullscreen {{ --chat-content-width: 980px; grid-template-columns: 320px minmax(0, 1fr); }} }}
       @media (min-width: 1440px) {{ .chat-shell-fullscreen {{ --chat-content-width: 1120px; grid-template-columns: 360px minmax(0, 1fr); }} .chat-composer-wrap {{ padding-inline: max(28px, 6vw); }} }}
     </style>

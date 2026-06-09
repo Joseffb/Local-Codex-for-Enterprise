@@ -13,6 +13,7 @@ This roadmap tracks public product direction for Local Codex for Enterprise. It 
 ## Near-Term Work
 
 - Polish the browser chat workbench so thread switching clears and reloads the selected thread history cleanly.
+- Add a copy icon to each chat turn so users can copy any user or Codex message directly from the transcript.
 - Improve project administration under user profiles:
   - create projects for a selected user workspace
   - rename projects

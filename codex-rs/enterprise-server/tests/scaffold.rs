@@ -3068,13 +3068,13 @@ async fn login_page_redirects_home_and_nav_says_home_when_authenticated() {
     assert!(
         chat_with_auth
             .text
-            .contains("Local Codex for Enterprise v0.0.1-beta.0")
+            .contains("Local Codex for Enterprise v0.0.1-beta.1")
     );
     assert!(chat_with_auth.text.contains("Made with Codex"));
     assert!(
         chat_with_auth
             .text
-            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.0</span></div></div>"#)
+            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.1</span></div></div>"#)
     );
     let footer_index = chat_with_auth
         .text
@@ -3329,6 +3329,7 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("openThreadContextMenu"));
     assert!(chat.text.contains("renameThreadFromContextMenu"));
     assert!(chat.text.contains("thread-rename-modal"));
+    assert!(chat.text.contains("async function patchJsonPayload"));
     assert!(chat.text.contains("removeWorkbenchThread"));
     assert!(chat.text.contains("Remove thread"));
     assert!(chat.text.contains("Rename thread"));
@@ -3362,7 +3363,14 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("sendWorkbenchRpcMessage"));
     assert!(chat.text.contains("initializeWorkbenchRpc"));
     assert!(chat.text.contains("retryWorkbenchMessageOnce"));
+    assert!(!chat.text.contains("await retryWorkbenchMessageOnce(text, firstError);\n          await retryWorkbenchMessageOnce(text, firstError);"));
     assert!(chat.text.contains("thread/start"));
+    assert!(chat.text.contains("buildWorkbenchUserPrompt"));
+    assert!(chat.text.contains("Conceptual planning request"));
+    assert!(
+        chat.text
+            .contains("Do not inspect repository files unless the user asks")
+    );
     assert!(chat.text.contains("turn/start"));
     assert!(chat.text.contains("item/agentMessage/delta"));
     assert!(!chat.text.contains("Codex app-server connection is ready."));
@@ -3430,6 +3438,16 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("appendWorkbenchAssistantPending"));
     assert!(chat.text.contains("replacePendingAssistantDelta"));
     assert!(chat.text.contains("appendWorkbenchAssistantDelta"));
+    assert!(chat.text.contains("renderWorkbenchMarkdown"));
+    assert!(chat.text.contains("formatAssistantMessage"));
+    assert!(chat.text.contains("scrollToBottom()"));
+    assert!(chat.text.contains("this.stickToBottom"));
+    assert!(chat.text.contains("overflow-y:auto"));
+    assert!(
+        chat.text
+            .contains("position: fixed; inset: 0; overflow: hidden")
+    );
+    assert!(chat.text.contains("height: 100%; overflow: hidden"));
     assert!(
         chat.text
             .contains("/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages")

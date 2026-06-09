@@ -6,6 +6,15 @@ This project is a community fork and is not affiliated with, endorsed by, or sup
 
 ## [Unreleased]
 
+## [0.0.1-beta.1] - 2026-06-09
+
+### Fixed
+
+- Fixed browser chat thread rename failures caused by a missing PATCH JSON helper.
+- Fixed long chat replies so the transcript scrolls inside the browser workbench instead of expanding the page.
+- Rendered Codex replies as readable Markdown for headings, lists, inline code, bold text, and code blocks.
+- Added a no-repository conceptual planning guardrail so concept prompts do not default to repository inspection unless requested.
+
 ## [0.0.1-beta.0] - 2026-06-09
 
 ### Added
