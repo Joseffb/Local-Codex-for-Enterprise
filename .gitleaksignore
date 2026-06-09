@@ -1,0 +1,8 @@
+# Known upstream test fixtures and one dependency-name false positive.
+codex-rs/agent-identity/src/lib.rs:private-key:660
+codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs:generic-api-key:200
+codex-rs/Cargo.lock:generic-api-key:4812
+codex-rs/cli/src/login.rs:generic-api-key:458
+codex-rs/cli/src/login.rs:generic-api-key:464
+codex-rs/core-plugins/src/remote/catalog_cache.rs:generic-api-key:103
+codex-rs/login/src/auth/auth_tests.rs:private-key:1094

@@ -45,6 +45,11 @@ pub fn plan_clone(
     })
 }
 
+pub fn validate_clone_request(repo_url: &str, destination_name: &str) -> Result<()> {
+    let _ = validate_repo_url(repo_url)?;
+    validate_destination_name(destination_name)
+}
+
 pub async fn clone_repo(plan: &CloneRepoPlan) -> Result<()> {
     let status = Command::new("git")
         .arg("-c")
@@ -87,10 +92,10 @@ fn validate_repo_url(repo_url: &str) -> Result<Url> {
     ) {
         anyhow::bail!("repo URL host is not allowed");
     }
-    if let Ok(ip) = host_lower.parse::<IpAddr>() {
-        if is_disallowed_ip(ip) {
-            anyhow::bail!("repo URL host is not allowed");
-        }
+    if let Ok(ip) = host_lower.parse::<IpAddr>()
+        && is_disallowed_ip(ip)
+    {
+        anyhow::bail!("repo URL host is not allowed");
     }
     Ok(url)
 }
@@ -137,4 +142,15 @@ fn validate_destination_name(name: &str) -> Result<()> {
 
 pub fn destination_path_from_plan(plan: &CloneRepoPlan) -> PathBuf {
     PathBuf::from(&plan.destination_path)
+}
+
+pub fn redact_repo_url_for_storage(repo_url: &str) -> String {
+    match Url::parse(repo_url) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        Err(_) => "<invalid-repo-url>".to_string(),
+    }
 }

@@ -4,7 +4,9 @@ CREATE TABLE IF NOT EXISTS enterprise_users (
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS enterprise_api_tokens (
@@ -21,6 +23,16 @@ CREATE TABLE IF NOT EXISTS enterprise_workspaces (
     root_path TEXT NOT NULL UNIQUE,
     created_by UUID NOT NULL REFERENCES enterprise_users(user_id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_workspace_assignments (
+    assignment_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES enterprise_users(user_id) ON DELETE CASCADE,
+    workspace_id UUID REFERENCES enterprise_workspaces(workspace_id) ON DELETE CASCADE,
+    workspace_root TEXT NOT NULL,
+    assigned_by UUID NOT NULL REFERENCES enterprise_users(user_id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, workspace_root)
 );
 
 CREATE TABLE IF NOT EXISTS enterprise_bootstrap (
@@ -189,3 +201,74 @@ CREATE TABLE IF NOT EXISTS enterprise_approval_records (
     metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS enterprise_context_packs (
+    pack_id UUID PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_context_documents (
+    document_id UUID PRIMARY KEY,
+    pack_id UUID NOT NULL REFERENCES enterprise_context_packs(pack_id) ON DELETE CASCADE,
+    filename TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    load_order INTEGER NOT NULL,
+    required BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS enterprise_context_documents_pack_idx
+    ON enterprise_context_documents(pack_id, load_order);
+
+CREATE TABLE IF NOT EXISTS enterprise_context_assignments (
+    assignment_id UUID PRIMARY KEY,
+    pack_id UUID NOT NULL REFERENCES enterprise_context_packs(pack_id) ON DELETE CASCADE,
+    user_id UUID REFERENCES enterprise_users(user_id) ON DELETE CASCADE,
+    workspace_id TEXT,
+    assignment_source TEXT NOT NULL,
+    assignment_order INTEGER NOT NULL,
+    required_session BOOLEAN NOT NULL DEFAULT true,
+    required_worker BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, workspace_id, assignment_order)
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_context_receipts (
+    receipt_id UUID PRIMARY KEY,
+    trace_id UUID NOT NULL,
+    pack_id UUID NOT NULL REFERENCES enterprise_context_packs(pack_id) ON DELETE CASCADE,
+    document_id UUID NOT NULL REFERENCES enterprise_context_documents(document_id) ON DELETE CASCADE,
+    content_hash TEXT NOT NULL,
+    load_order INTEGER NOT NULL,
+    assignment_source TEXT NOT NULL,
+    actor_user_id UUID NOT NULL REFERENCES enterprise_users(user_id),
+    workspace_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    phase TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS enterprise_context_receipts_trace_idx
+    ON enterprise_context_receipts(trace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS enterprise_outputs (
+    output_id UUID PRIMARY KEY,
+    owner_user_id UUID NOT NULL REFERENCES enterprise_users(user_id) ON DELETE CASCADE,
+    workspace_id TEXT,
+    session_id TEXT,
+    worker_id UUID REFERENCES enterprise_workers(worker_id) ON DELETE SET NULL,
+    category TEXT NOT NULL CHECK (category IN ('operational', 'deliverable')),
+    output_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    artifact_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('draft', 'active', 'completed', 'archived')),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS enterprise_outputs_owner_idx
+    ON enterprise_outputs(owner_user_id, category, updated_at DESC);

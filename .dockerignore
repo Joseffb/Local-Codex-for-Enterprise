@@ -1,0 +1,14 @@
+.git
+.github
+.codex
+.env
+.env.*
+.DS_Store
+node_modules
+target
+codex-rs/target
+dist
+private
+screenshots
+tmp
+*.log

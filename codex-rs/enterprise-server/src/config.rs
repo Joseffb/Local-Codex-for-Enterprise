@@ -20,6 +20,8 @@ pub struct EnterpriseConfig {
     pub worker_log_dir: String,
     pub handoff_token_secret: String,
     pub handoff_token_ttl_seconds: u64,
+    pub default_workspace_root: Option<String>,
+    pub output_artifact_root: String,
 }
 
 impl Default for EnterpriseConfig {
@@ -36,6 +38,9 @@ impl Default for EnterpriseConfig {
             worker_log_dir: "/tmp/local-codex-enterprise/logs".to_string(),
             handoff_token_secret: "local-codex-enterprise-dev-handoff-secret".to_string(),
             handoff_token_ttl_seconds: 120,
+            default_workspace_root: env::var("LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT").ok(),
+            output_artifact_root: env::var("LOCAL_CODEX_ENTERPRISE_OUTPUT_ARTIFACT_ROOT")
+                .unwrap_or_else(|_| "/tmp/local-codex-enterprise/outputs".to_string()),
         }
     }
 }

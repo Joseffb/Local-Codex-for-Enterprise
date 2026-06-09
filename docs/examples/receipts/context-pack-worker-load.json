@@ -1,0 +1,19 @@
+{
+  "receipt_id": "receipt_01J00000000000000000000000",
+  "trace_id": "00000000-0000-4000-8000-000000000001",
+  "actor_user_id": "user_owner",
+  "workspace_id": "workspace_01J0000000000000000000000",
+  "session_id": "session_01J0000000000000000000000",
+  "worker_id": "worker_01J0000000000000000000000",
+  "event_type": "context_pack.worker_load",
+  "result": "completed",
+  "metadata_json": {
+    "pack_id": "pack_basic",
+    "document_id": "doc_verification",
+    "content_hash": "sha256:9e1f6f64b49a2f4fd8365f2fb2c8d872f6bb84e6f3ce8f08f3d6f6c3f2d5b1a0",
+    "load_order": 30,
+    "assignment_source": "workspace",
+    "phase": "worker_start"
+  },
+  "created_at": "2026-01-01T00:00:00Z"
+}

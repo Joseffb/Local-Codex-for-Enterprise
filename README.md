@@ -1,164 +1,395 @@
 # Local Codex for Enterprise
 
-Local Codex for Enterprise is an experimental private enterprise extension of Local Codex for Docker. It is not affiliated with, endorsed by, or supported by OpenAI.
+Local Codex for Enterprise is a community fork and self-hosted enterprise extension of Local Codex for Docker. It keeps the local-first Docker Model Runner direction and adds an enterprise control plane for teams that want governed access to local coding agents.
 
-This repository starts from the Local Codex for Docker codebase and will add self-hosted enterprise controls for multi-user local Codex deployments: authentication, Postgres-backed state, RBAC, workspace allowlisting, worker supervision, audit trails, and terminal remote access. The current baseline still retains the single-user Docker Model Runner behavior while the enterprise server is under development.
+This repository is not affiliated with, endorsed by, or supported by OpenAI. It is derived from the open-source OpenAI Codex project and preserves the upstream Apache-2.0 license and attribution.
 
-## Status
+## What This Is
 
-- Local Docker Model Runner execution has been smoke-tested.
-- Large-prompt handling has been smoke-tested with a Docker Model context-size variant.
-- Container packaging is present. The optimized `release` image path and Compose release override have been validated against a responsive local Docker daemon; Compose still defaults to the faster `dev` build profile for iteration.
-- Enterprise server scaffold is now runnable as `codex-enterprise-server`.
-- Enterprise server currently supports health/config endpoints, first-run owner setup, password login with opaque API-token issuance, token-authenticated session create/list/get, token-authenticated worker start/list/stop, role-enforced session and worker routes, HTTPS-only repo clone onboarding into allowlisted roots, short-lived single-use worker handoff tokens, an initial websocket tunnel to supervised worker Unix sockets, Postgres migrations, workspace allowlist enforcement for session and worker launch, supervised worker process launch, trace-aware audit events, execution receipts, Argon2 password hashing, Casbin RBAC policy checks, and Utoipa OpenAPI generation.
-- Enterprise server persists a workspace-bound coding session ledger and structured evidence records, but does not yet persist full chat transcripts, provide admin user/role management APIs, reconcile workers after server restart, or provide audit query/export APIs.
+- A local-first Codex fork for Docker Model Runner and Docker Model Gateway.
+- A self-hosted enterprise control plane with Postgres-backed state.
+- A managed path for users, seeded RBAC roles, workspace root allowlisting, user workspaces, projects, repositories, threads, workers, handoff tokens, trace-aware audit events, and execution receipts.
+- A Workflow Context Pack system for versioned Markdown startup context.
+- A release candidate foundation for a public community project.
 
-## Enterprise Server Smoke
+## What This Is Not
 
-Run the enterprise control plane against Postgres:
+- It is not an official OpenAI product.
+- It is not a cloud-hosted Codex service.
+- It is not a governance reasoning engine.
+- It does not include SSO, custom RBAC policy editing, approval workflows, Fernain integration, or full browser IDE polish.
+- It does not store prompts, model outputs, auth headers, handoff tokens, passwords, API tokens, repo credentials, or private real-life examples in receipts or audit metadata.
 
-```sh
-DATABASE_URL="postgres://codex:codex@127.0.0.1:5432/codex_enterprise" \
-  cargo run -p codex-enterprise-server -- \
-  --bind-addr 127.0.0.1:8787
-```
+## Current Status
 
-By default, workers launch:
+The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Workflow Context Pack upload/assignment/receipts, thread/session records, workers, short-lived handoff tokens, initial websocket tunneling to worker sockets, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
 
-```sh
-codex-app-server --listen unix://{socket_path}
-```
+The product domain contract is defined in [docs/enterprise-domain-contract.md](docs/enterprise-domain-contract.md). In short: workspace roots are server allowlist boundaries, user workspaces are per-user filesystem spaces, projects are human work containers, repositories are cloned checkouts inside projects, and threads are chat histories attached to projects/repositories.
 
-For smoke tests, override the worker command:
+Default user workspaces are generated as `<workspace root>/user/<user-email>`, for example `/enterprise-workspaces/user/alex@example.com`. Admins can override this default by assigning explicit allowed workspace paths to a user.
 
-```sh
---worker-command /bin/sh --worker-arg=-c --worker-arg 'sleep 30'
-```
+Known current limits are listed in [Current Limitations](#current-limitations).
 
-First-run setup:
+## Install Modes
 
-```sh
-curl -X POST http://127.0.0.1:8787/v1/setup/enterprise \
-  -H 'content-type: application/json' \
-  -d '{
-    "owner_email": "owner@example.com",
-    "owner_password": "change-me",
-    "workspace_roots": ["/srv/workspaces"]
-  }'
-```
+Local Codex for Enterprise supports both containerized and locally installed server deployments.
 
-Workspace roots must exist on the enterprise server host. Worker launch
-canonicalizes the requested workspace path and rejects paths outside the
-registered roots.
+- **Docker Compose local evaluation**: Compose starts Postgres and the enterprise server. This is the fastest path for a single-machine demo.
+- **Containerized enterprise server with external services**: Run the enterprise app in a container, but point it at an existing Postgres service and host/container Docker Model Runner.
+- **Local/server install**: Install the binaries directly on a server, point them at an external Postgres database, and configure workspace roots that exist on that server.
 
-The setup response returns the owner API token once. Use it with:
+In all modes, the browser `/setup` flow initializes the application owner and initial workspace allowlist. It does not provision Postgres. The database must already be available unless you use the included Compose stack.
 
-```sh
-curl http://127.0.0.1:8787/v1/workers \
-  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
-```
+## Deployment Profiles And Hardware Guidance
 
-After bootstrap, sign in with the owner password to issue a fresh API token:
+Local Codex for Enterprise has two different hardware concerns:
 
-```sh
-curl -X POST http://127.0.0.1:8787/v1/auth/login \
-  -H 'content-type: application/json' \
-  -d '{
-    "email": "owner@example.com",
-    "password": "change-me"
-  }'
-```
+- The enterprise control plane: browser UI, API server, Postgres, workspace metadata, workers, handoffs, audit, and receipts.
+- Inference: the model runtime that actually runs the LLM.
 
-Clone a repository into an allowlisted workspace root:
+The enterprise control plane itself is not GPU-heavy. GPU requirements depend on where inference runs. Small deployments can use external/API model providers or an existing model server. Larger deployments should separate the control plane, Postgres, workspace storage, and inference hardware.
 
-```sh
-curl -X POST http://127.0.0.1:8787/v1/workspaces/clone \
-  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{
-    "repo_url": "https://example.com/org/repo.git",
-    "workspace_root": "/srv/workspaces",
-    "destination_name": "repo"
-  }'
-```
+Model size, context length, concurrency, and whether inference is local or external matter more than the control-plane requirements.
 
-Clone intake is intentionally narrow in v1: HTTPS only, no embedded
-credentials, no localhost/private/link-local targets, and a destination name
-directly under a registered workspace root.
+### Local Evaluation
 
-Create and list workspace-bound coding sessions:
+Use this profile for one person testing the project on their own machine.
 
-```sh
-curl -X POST http://127.0.0.1:8787/v1/sessions \
-  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{
-    "workspace_path": "/srv/workspaces/project-a",
-    "title": "Project A iteration"
-  }'
+Minimum:
 
-curl http://127.0.0.1:8787/v1/sessions \
-  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
-```
+- 8-core CPU.
+- 32GB RAM.
+- 100GB SSD.
+- Remote/API model provider recommended for smoother evaluation.
 
-Sessions are bound to the authenticated user and a canonicalized allowlisted
-workspace path. Starting a worker with a `session_id` creates or updates the
-session ledger and records the latest worker attached to that coding thread.
+Recommended:
 
-Start and stop a worker:
+- 12+ CPU cores.
+- 64GB RAM.
+- 1TB NVMe.
+- Apple Silicon M2 Max/M3 Max or NVIDIA RTX 3060 12GB+.
 
-```sh
-curl -X POST http://127.0.0.1:8787/v1/workers \
-  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{
-    "workspace_path": "/srv/workspaces/project-a",
-    "session_id": "session-1"
-  }'
+Best local experience:
 
-curl -X DELETE http://127.0.0.1:8787/v1/workers/$WORKER_ID \
-  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
-```
+- 16+ CPU cores.
+- 128GB RAM.
+- NVIDIA RTX 4090/5090 or Apple Silicon with 128GB unified memory.
 
-Issue and consume a worker handoff token:
+### Enterprise Server
+
+Use this profile for a self-hosted team deployment.
+
+Pilot / small team:
+
+- 16+ CPU cores.
+- 128GB RAM.
+- 2TB NVMe.
+- Dedicated inference GPU optional when using external/API models or an existing model server.
+- Suggested GPU class for local inference: NVIDIA RTX 4090/5090, L40S, or RTX PRO 6000.
+
+Production / serious internal AI platform:
+
+- AMD EPYC or Intel Xeon server.
+- 256GB-512GB ECC RAM.
+- 4TB-16TB enterprise NVMe.
+- 2x L40S or 2x RTX PRO 6000-class GPUs for centralized local inference.
+- Postgres on reliable storage.
+- Separate backup and disaster-recovery plan.
+
+Clean positioning:
+
+- Runs locally for evaluation.
+- Deploys to enterprise hardware for shared team use.
+- Inference can be local, remote, or centralized.
+
+## Quick Start With Docker Compose
+
+Prerequisites:
+
+- Docker Desktop or Docker Engine.
+- Docker Model Runner enabled.
+- A local Docker model pulled, for example:
+
+  ```sh
+  docker model pull ai/qwen3-coder
+  ```
+
+Start the enterprise stack:
 
 ```sh
-curl -X POST http://127.0.0.1:8787/v1/workers/$WORKER_ID/handoff \
-  -H "authorization: Bearer $LOCAL_CODEX_ENTERPRISE_TOKEN"
-
-curl -X POST http://127.0.0.1:8787/v1/worker-handoffs/$JTI/consume \
-  -H 'content-type: application/json' \
-  -d "{\"handoff_token\":\"$HANDOFF_TOKEN\"}"
+LOCAL_CODEX_ENTERPRISE_WORKSPACES="$PWD" \
+LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET="change-me-for-real-use" \
+  docker compose -f compose.enterprise.yaml up --build
 ```
 
-Handoff tokens are purpose-bound to a worker, owner user, workspace, and
-session. They are short-lived and single-use. This is the control-plane contract
-that the remote TUI/websocket broker consumes before tunneling frames to the
-worker socket.
-
-Connect to a worker websocket tunnel:
+Open the web shell:
 
 ```text
-GET /v1/workers/$WORKER_ID/rpc?handoff_token=$HANDOFF_TOKEN
+http://127.0.0.1:8787
 ```
 
-The tunnel relays websocket frames to the worker's private
-`codex-app-server --listen unix://...` socket. It keeps the app-server JSON-RPC
-protocol opaque to the enterprise control plane.
+Check health:
 
-## Trace Spine
+```sh
+curl -fsS http://127.0.0.1:8787/healthz
+```
 
-Enterprise routes emit an `x-trace-id` response header. Callers may provide a
-valid UUID `x-trace-id`; invalid or missing values are replaced with a server
-generated UUID. Audit events and execution receipts use that trace to connect
-setup, auth, sessions, workspace access, workers, handoffs, and websocket
-tunnel actions.
+Expected response:
 
-The trace spine is evidence instrumentation, not governance runtime. It records
-who acted, which workspace/session/worker was involved, whether the action was
-allowed, denied, failed, or completed, and redacted metadata. It does not decide
-authority, run policy reasoning, or implement Fernain orchestration. Receipts
-are evidence, not reasoning.
+```json
+{"product":"Local Codex for Enterprise","status":"ok"}
+```
+
+Then open `/setup` and bootstrap the owner account.
+
+For the initial workspace root:
+
+- Docker Compose users should use `/enterprise-workspaces`.
+- Local/server installs should use a real path visible to the server process.
+- Do not enter a host-only path such as a desktop home directory when the server is running inside a container unless that exact path is mounted inside the container.
+
+## Docker Compose Setup
+
+The enterprise Compose stack is defined in [compose.enterprise.yaml](compose.enterprise.yaml).
+
+It starts:
+
+- `postgres`: Postgres 17 with a named volume.
+- `enterprise`: Local Codex for Enterprise server.
+
+The enterprise container:
+
+- Builds `codex`, `codex-enterprise-server`, and `codex-app-server`.
+- Mounts `LOCAL_CODEX_ENTERPRISE_WORKSPACES` at `/enterprise-workspaces`.
+- Sets `LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT=/enterprise-workspaces` so the setup UI shows the container-visible workspace path.
+- Mounts the host Docker socket for local Docker services.
+- Points Docker Model Runner traffic at `http://host.docker.internal:12434/engines/v1`.
+- Launches workers through `codex-container-entrypoint app-server --listen unix://{socket_path}` so worker processes receive the same local Docker model provider config as the container CLI path.
+- Sets the default container model from `CODEX_MODEL`, defaulting to `ai/qwen3-coder`.
+- Uses container `/tmp` for ephemeral worker sockets and logs.
+
+For a clean reset:
+
+```sh
+docker compose -f compose.enterprise.yaml down --volumes
+```
+
+### Docker Compose With External Workspace Path
+
+Mount the directory you want Codex workers to access:
+
+```sh
+LOCAL_CODEX_ENTERPRISE_WORKSPACES="/srv/engineering-workspaces" \
+LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET="change-me-for-real-use" \
+  docker compose -f compose.enterprise.yaml up --build
+```
+
+Inside the web setup form, still use:
+
+```text
+/enterprise-workspaces
+```
+
+That is the path visible from inside the enterprise container. The host path is only the source of the bind mount.
+
+### Containerized App With External Postgres
+
+For production-like container deployments, you can run the enterprise app container while using an external Postgres service instead of the Compose-managed `postgres` service. This is the main path for teams that want the app containerized but database storage managed by a platform such as a database VM, RDS, Cloud SQL, Neon, Supabase, or an internal Postgres service.
+
+In this mode:
+
+- The enterprise app is containerized.
+- Postgres is external to the app container.
+- Migrations still run automatically when `codex-enterprise-server` starts.
+- Workspace paths entered in the browser must be paths visible inside the app container.
+
+Required inputs:
+
+- `DATABASE_URL`: Postgres connection string reachable from the enterprise container.
+- `LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET`: long random secret used to sign short-lived worker handoff tokens.
+- `LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT`: the path users should enter during setup, as seen by the container.
+- Workspace bind mount: the host or volume path mounted into the container at the same runtime-visible workspace root.
+- Docker Model Runner or Docker Model Gateway endpoint reachable from the container.
+
+Example:
+
+```sh
+docker run --rm \
+  --name local-codex-enterprise \
+  --entrypoint codex-enterprise-server \
+  -p 8787:8787 \
+  -e DATABASE_URL="postgres://codex:REPLACE_ME@postgres.internal:5432/codex_enterprise" \
+  -e LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET="REPLACE_WITH_LONG_RANDOM_SECRET" \
+  -e LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT="/enterprise-workspaces" \
+  -e CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG=1 \
+  -e CODEX_MODEL="ai/qwen3-coder" \
+  -e CODEX_MODEL_PROVIDER_ID="docker-model-runner-container" \
+  -e CODEX_MODEL_PROVIDER_NAME="Docker Model Runner" \
+  -e CODEX_MODEL_PROVIDER_BASE_URL="http://host.docker.internal:12434/engines/v1" \
+  -v "/srv/engineering-workspaces:/enterprise-workspaces" \
+  -v "$HOME/.docker/run/docker.sock:/docker.sock" \
+  local-codex-enterprise:dev \
+  --bind-addr 0.0.0.0:8787 \
+  --worker-command /usr/local/bin/codex-container-entrypoint \
+  --worker-arg app-server \
+  --worker-arg --listen \
+  --worker-arg 'unix://{socket_path}'
+```
+
+Adapt the Docker socket mount and model endpoint for your server. On Linux, `host.docker.internal` may require explicit host-gateway configuration if you are not using Compose.
+
+If the external Postgres service is another container on a Docker network, attach this app container to that network and use the Postgres container or service DNS name in `DATABASE_URL`.
+
+## Local Server Install With External Postgres
+
+Use this mode when Local Codex for Enterprise is installed directly on a server rather than run as the enterprise container.
+
+### Local Prerequisites
+
+- Rust toolchain matching the repository toolchain.
+- Postgres reachable from the server.
+- `git`, `rg`, and normal build prerequisites for the Codex Rust workspace.
+- Docker Model Runner or Docker Model Gateway reachable from the server if you want the default local model path.
+- A dedicated workspace root on the server, for example `/srv/local-codex/workspaces`.
+- A dedicated Codex home, for example `/var/lib/local-codex-enterprise/codex-home`.
+
+### Create The External Database
+
+Create a database and application user in your Postgres service. Example SQL:
+
+```sql
+CREATE USER codex_enterprise WITH PASSWORD 'REPLACE_WITH_STRONG_PASSWORD';
+CREATE DATABASE codex_enterprise OWNER codex_enterprise;
+GRANT ALL PRIVILEGES ON DATABASE codex_enterprise TO codex_enterprise;
+```
+
+The enterprise server runs its embedded migrations automatically on startup. The browser setup page does not create the database.
+
+### Build The Server Binaries
+
+From the repository root:
+
+```sh
+cd codex-rs
+cargo build --locked \
+  -p codex-enterprise-server --bin codex-enterprise-server \
+  -p codex-app-server --bin codex-app-server \
+  -p codex-cli --bin codex
+```
+
+Install or reference the resulting binaries from `codex-rs/target/debug` or `codex-rs/target/release`, depending on your build profile.
+
+### Configure Local Runtime
+
+Create server-owned directories:
+
+```sh
+sudo mkdir -p /srv/local-codex/workspaces
+sudo mkdir -p /var/lib/local-codex-enterprise/codex-home
+sudo mkdir -p /var/log/local-codex-enterprise
+```
+
+Set environment variables for the server process:
+
+```sh
+export DATABASE_URL="postgres://codex_enterprise:REPLACE_WITH_STRONG_PASSWORD@127.0.0.1:5432/codex_enterprise"
+export CODEX_HOME="/var/lib/local-codex-enterprise/codex-home"
+export LOCAL_CODEX_ENTERPRISE_BIND="0.0.0.0:8787"
+export LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET="REPLACE_WITH_LONG_RANDOM_SECRET"
+export LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT="/srv/local-codex/workspaces"
+```
+
+If `codex-app-server` is not on `PATH`, pass its absolute path:
+
+```sh
+codex-enterprise-server \
+  --database-url "$DATABASE_URL" \
+  --bind-addr "$LOCAL_CODEX_ENTERPRISE_BIND" \
+  --worker-command /absolute/path/to/codex-app-server \
+  --worker-arg --listen \
+  --worker-arg 'unix://{socket_path}'
+```
+
+If `codex-app-server` is on `PATH`, the default worker command can be used:
+
+```sh
+codex-enterprise-server \
+  --database-url "$DATABASE_URL" \
+  --bind-addr "$LOCAL_CODEX_ENTERPRISE_BIND"
+```
+
+The server will:
+
+1. Connect to Postgres.
+2. Run enterprise migrations.
+3. Start the web UI.
+4. Launch supervised workers as needed.
+
+Open:
+
+```text
+http://SERVER_HOST:8787/setup
+```
+
+For the initial workspace root in local/server install mode, enter a real path visible to the server process, such as:
+
+```text
+/srv/local-codex/workspaces
+```
+
+### Local Model Configuration
+
+For local installs, configure Codex to use Docker Model Runner or Docker Model Gateway through the normal Local Codex configuration path. A typical local Docker Model Runner endpoint is:
+
+```text
+http://localhost:12434/engines/v1
+```
+
+If the enterprise server launches workers on the same host, workers inherit the server process environment and use the configured `CODEX_HOME`. Make sure the service user can read the relevant Codex config and can access the configured workspace roots.
+
+### Local Install Health Check
+
+```sh
+curl -fsS http://SERVER_HOST:8787/healthz
+```
+
+Expected response:
+
+```json
+{"product":"Local Codex for Enterprise","status":"ok"}
+```
+
+## Architecture Overview
+
+```mermaid
+flowchart LR
+    Browser["Browser UI"] --> Enterprise["Enterprise Server"]
+    CLI["CLI/API Client"] --> Enterprise
+    Enterprise --> Postgres["Postgres"]
+    Enterprise --> Worker["Supervised Codex Worker"]
+    Worker --> AppServer["codex-app-server"]
+    AppServer --> Codex["Codex Runtime"]
+    Codex --> DockerModel["Docker Model Runner or Gateway"]
+    Enterprise --> Audit["Audit Events and Receipts"]
+```
+
+Core boundaries:
+
+- The enterprise server owns identity, RBAC checks, workspace root validation, user workspace/project/repository/thread records, worker supervision, handoff issuance, and audit evidence.
+- Workers are scoped to an actor, user workspace, project/repository working path, thread/session, and socket.
+- The app-server protocol remains opaque to the enterprise control plane.
+- Context packs are loaded as instruction/context material only.
+- Receipts are evidence, not reasoning.
+
+Domain hierarchy:
+
+```text
+workspace root -> user workspace -> project -> repository -> thread
+```
+
+Workspace is not a project. Projects are not filesystem security boundaries. Repositories are not user workspaces. Threads are not login sessions.
+
+The default per-user path is `<workspace root>/user/<user-email>`. Setup assigns this default to the bootstrap admin, and user creation assigns it when admins leave the per-user workspace field blank.
 
 ## Local-Only Contract
 
@@ -168,155 +399,135 @@ are evidence, not reasoning.
 - Cloud providers remain available only when explicitly configured or selected.
 - Docker/local execution remains the default behavior.
 
-## Defaults
-
-The bootstrap default config is:
+Default model config:
 
 ```toml
 model_provider = "docker-model-runner"
 model = "ai/qwen3-coder"
 ```
 
-`ai/qwen3-coder` is only the starter model. Change `model` through the normal Codex config paths to use newer Docker Models as they become available.
+`ai/qwen3-coder` is a starter default, not a permanent product assumption. Change `model` through normal Codex config paths.
 
 Built-in local providers:
 
 - `docker-model-runner`: `http://localhost:12434/engines/v1`
 - `docker-model-gateway`: `http://localhost:4000/v1`
 
-Both use `wire_api = "chat_completions"`. The legacy `wire_api = "chat"` value remains rejected.
+Both use `wire_api = "chat_completions"`.
 
-## Docker MCP Toolkit
+## Workflow Context Packs
 
-On first interactive startup, Codex for Docker checks for Docker MCP Toolkit. If it is available and no `docker` MCP server is already configured, it prompts:
+Workflow Context Packs are versioned Markdown startup context for governed coding sessions. They are meant for durable organizational operating context such as project rules, handoffs, verification protocols, escalation paths, and required session-start instructions.
 
-```text
-Docker MCP Toolkit detected. Configure automatically? [Y/n]
+Standard filenames:
+
+- `PACK.md`
+- `CALIBRATION.md`
+- `OPERATING-INSTRUCTIONS.md`
+- `PROJECT-RULES.md`
+- `HANDOFF.md`
+- `VERIFICATION.md`
+- `ESCALATION.md`
+- `CONTEXT.md`
+
+Only `PACK.md` is universally required. Other documents are optional and can be required by the pack manifest.
+
+Hard boundary:
+
+- Packs are loaded as instruction/context material only.
+- Packs do not execute code.
+- Packs do not trigger actions.
+- Packs do not create agents.
+- Packs do not alter RBAC.
+- Packs do not perform governance reasoning.
+
+See [docs/examples/context-pack-basic](docs/examples/context-pack-basic) for a safe synthetic example.
+
+## Example Context Pack
+
+Minimal `PACK.md`:
+
+```markdown
+# Basic Engineering Pack
+
+required_documents:
+- OPERATING-INSTRUCTIONS.md
+- VERIFICATION.md
+
+load_order:
+- PACK.md
+- OPERATING-INSTRUCTIONS.md
+- VERIFICATION.md
+
+This pack provides basic session startup context for a generic engineering project.
 ```
 
-Accepting persists:
+The server validates that required documents are present and that load order is deterministic. If multiple assignments create an ambiguous order for the same user/project context, the request is rejected.
 
-```toml
-[mcp_servers.docker]
-command = "docker"
-args = ["mcp", "gateway", "run"]
+## Example Receipt
+
+Receipts record what context was loaded without storing document bodies, prompts, model outputs, tokens, or credentials.
+
+```json
+{
+  "receipt_id": "receipt_01J00000000000000000000000",
+  "trace_id": "00000000-0000-4000-8000-000000000001",
+  "actor_user_id": "user_owner",
+  "workspace_id": "workspace_01J0000000000000000000000",
+  "session_id": "session_01J0000000000000000000000",
+  "worker_id": "worker_01J0000000000000000000000",
+  "event_type": "context_pack.worker_load",
+  "result": "completed",
+  "metadata_json": {
+    "pack_id": "pack_basic",
+    "document_id": "doc_verification",
+    "content_hash": "sha256:9e1f6f64b49a2f4fd8365f2fb2c8d872f6bb84e6f3ce8f08f3d6f6c3f2d5b1a0",
+    "load_order": 30,
+    "assignment_source": "workspace",
+    "phase": "worker_start"
+  },
+  "created_at": "2026-01-01T00:00:00Z"
+}
 ```
 
-Declining persists:
+See [docs/examples/receipts](docs/examples/receipts) for additional examples.
 
-```toml
-docker_mcp_auto_configure = false
-```
+## Demo
 
-Existing user-defined `docker` MCP servers are preserved.
+The release-readiness demo is documented in [docs/demo-browser-worker-local-model.md](docs/demo-browser-worker-local-model.md).
 
-## Runtime Order
+The demo covers Compose startup, `/healthz`, browser login, session creation, worker launch, handoff issuance, audit/receipt query, and a local Docker model code-change proof.
 
-Build and validate locally first:
+## Roadmap
 
-1. Enable Docker Model Runner.
-2. Pull the bootstrap model:
+See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled sessions are listed there as deferred functionality that reuses the existing session, worker, trace, audit, receipt, and Context Pack loading lifecycle. Context Packs remain instruction/context artifacts only; they are not executable workflow definitions.
 
-   ```sh
-   docker model pull ai/qwen3-coder
-   ```
+## Current Limitations
 
-3. Run Codex for Docker locally against Docker Model Runner.
-4. Verify a coding-agent turn and Docker MCP tool discovery.
+- Browser UI is a functional server-served control-plane shell, not a polished IDE.
+- The public-ready browser-to-worker coding client is not complete.
+- The app-server `model/list` response can still expose upstream model catalog text even when the worker runtime is configured for the local Docker model.
+- Project/repository domain tables are the next migration slice; current scaffold still has transitional workspace-path session fields.
+- Worker restart reconciliation is not implemented.
+- Custom RBAC policy editing is intentionally deferred.
+- SSO/SAML/OIDC is intentionally deferred.
+- Groups, teams, and org hierarchy are intentionally deferred.
+- Full audit export/reporting dashboards are intentionally deferred.
+- Approval workflows and Fernain bridge are intentionally deferred.
+- Model/tool invocation capture from worker boundaries is schema groundwork only.
 
-For large prompts, Codex for Docker inspects the selected Docker Model and creates/reuses a `codex-for-docker/...:ctxN` variant with the model's native context size when Docker exposes that metadata.
+## Security
 
-## Container Runtime
+See [SECURITY.md](SECURITY.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
 
-The v1 container image packages the Codex for Docker CLI/runtime and a Docker CLI. It does not start or bundle Docker Model Runner, Docker Model Gateway, or a separate Docker MCP Gateway service. Those stay on the host, or must otherwise be reachable from inside the container.
+Security-sensitive release rule:
 
-Build the image:
+Do not commit prompts, model outputs, auth headers, handoff tokens, passwords, API tokens, repo credentials, screenshots with private data, local machine paths, or private real-life examples.
 
-```sh
-docker build -t codex-for-docker:local .
-```
+## Contributing
 
-The default release container build still uses Cargo's release profile, but overrides the repo's fat-LTO defaults with Docker-friendly settings:
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-```text
-CARGO_PROFILE_RELEASE_LTO=thin
-CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-```
+## License
 
-This keeps the image on an optimized release build while avoiding Docker Desktop memory failures during Rust's final link step. On machines with more builder memory, you can override those build args.
-
-For a faster local smoke build, use:
-
-```sh
-docker build --build-arg BUILD_PROFILE=dev -t codex-for-docker:dev .
-```
-
-Run with Compose from this repository:
-
-```sh
-docker compose run --build --rm codex
-```
-
-Run from any project directory by pointing Docker Compose at this repo's Compose file:
-
-```sh
-docker compose -f /path/to/Local-Codex-for-Docker/compose.yaml run --build --rm codex
-```
-
-By default, Compose mounts the shell's current working directory at `/workspace` and uses the faster `dev` build profile. To launch Codex for Docker against another codebase explicitly, point `CODEX_WORKSPACE` at that folder:
-
-```sh
-CODEX_WORKSPACE="/path/to/your/project" docker compose run --rm codex
-```
-
-Run from the project root when possible. If your shell is inside a subdirectory, set `CODEX_WORKSPACE` to the repository root so Codex can see the project metadata:
-
-```sh
-CODEX_WORKSPACE="$(git rev-parse --show-toplevel)" docker compose run --rm codex
-```
-
-On Linux Docker Engine, use the Linux socket path:
-
-```sh
-CODEX_WORKSPACE="$PWD" DOCKER_HOST_SOCKET=/var/run/docker.sock docker compose run --rm codex
-```
-
-To force the optimized release build through Compose:
-
-```sh
-CODEX_BUILD_PROFILE=release docker compose build codex
-```
-
-Release build tuning can also be overridden:
-
-```sh
-CODEX_BUILD_PROFILE=release \
-CODEX_CARGO_PROFILE_RELEASE_LTO=fat \
-CODEX_CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
-docker compose build codex
-```
-
-The Compose example:
-
-- Mounts `CODEX_WORKSPACE` at `/workspace`, defaulting to the shell's current working directory.
-- Persists container Codex state in the `codex-home` volume.
-- Mounts the host Docker socket at `/docker.sock` so Docker CLI commands can talk to the host Docker engine. On Docker Desktop, this defaults to `${HOME}/.docker/run/docker.sock`; on Linux, run with `DOCKER_HOST_SOCKET=/var/run/docker.sock`.
-- Points the container provider at `http://host.docker.internal:12434/engines/v1`.
-- Installs the Docker Model CLI plugin and configures a container-local Docker Model context for `http://host.docker.internal:12434`, so dynamic context matching can call `docker model inspect` and `docker model package` from inside the container without trying to start a second standalone Model Runner.
-- Injects the Docker provider config in the container entrypoint so normal Codex arguments still work, for example `docker compose run --rm codex exec "summarize this repo"`.
-- Defaults Codex's inner sandbox to `danger-full-access` because Docker is the outer sandbox boundary. Many Docker runtimes do not allow an unprivileged container process to create the nested Linux namespaces that bubblewrap needs. To opt back into nested Codex sandboxing in a privileged/container-runtime-specific setup, set `CODEX_CONTAINER_SANDBOX_MODE=workspace-write`; set it to an empty value to skip the container entrypoint sandbox override entirely.
-
-To use Docker Model Gateway instead, change the Compose provider URL to `http://host.docker.internal:4000/v1`.
-
-To use a different Docker Model, set `model` through normal Codex config, or add another Compose `-c` override such as:
-
-```yaml
-- -c
-- 'model="ai/your-model"'
-```
-
-Inside the container, dynamic context matching requires Docker socket access plus the Docker Model CLI plugin, which this image installs from Docker's Debian package repository.
-
-Docker MCP Toolkit is different: recent Docker Desktop installs the `docker mcp` CLI plugin on the host, while Docker Engine/Linux users may need to install the MCP Gateway plugin separately. The v1 image does not bundle `docker-mcp`; run Docker MCP Gateway on the host, or mount/provide a Linux-compatible `docker-mcp` CLI plugin inside the container if you want Codex's first-run Docker MCP auto-configuration to run from inside the container.
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+This repository is licensed under the [Apache-2.0 License](LICENSE). It is derived from OpenAI Codex and keeps upstream attribution in [NOTICE](NOTICE).

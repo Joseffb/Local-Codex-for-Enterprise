@@ -3,6 +3,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod context_packs;
 pub mod rbac;
 pub mod repo_clone;
 pub mod setup;

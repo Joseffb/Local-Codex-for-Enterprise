@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::time::Duration;
+use tokio::time::Instant;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -92,6 +94,10 @@ impl WorkerRuntimeSupervisor {
             .append(true)
             .open(&log_path)?;
         let stderr = log.try_clone()?;
+        let should_wait_for_socket = config
+            .worker_args
+            .iter()
+            .any(|arg| arg.contains("{socket_path}"));
         let args = config
             .worker_args
             .iter()
@@ -114,6 +120,9 @@ impl WorkerRuntimeSupervisor {
             .lock()
             .await
             .insert(worker.worker_id.clone(), child);
+        if should_wait_for_socket {
+            wait_for_socket_path(&socket_path).await?;
+        }
 
         Ok(WorkerRuntime {
             pid,
@@ -130,6 +139,19 @@ impl WorkerRuntimeSupervisor {
 
         child.kill().await?;
         Ok(true)
+    }
+}
+
+async fn wait_for_socket_path(socket_path: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Path::new(socket_path).exists() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("worker socket was not created at {socket_path}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 

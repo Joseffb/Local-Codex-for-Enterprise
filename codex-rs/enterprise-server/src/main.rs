@@ -36,6 +36,9 @@ struct Args {
 
     #[arg(long, env = "LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_TTL_SECONDS")]
     handoff_token_ttl_seconds: Option<u64>,
+
+    #[arg(long, env = "LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT")]
+    default_workspace_root: Option<String>,
 }
 
 #[tokio::main]
@@ -61,6 +64,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(handoff_token_ttl_seconds) = args.handoff_token_ttl_seconds {
         config.handoff_token_ttl_seconds = handoff_token_ttl_seconds;
+    }
+    if let Some(default_workspace_root) = args.default_workspace_root {
+        config.default_workspace_root = Some(default_workspace_root);
     }
     let database_url = config
         .database_url

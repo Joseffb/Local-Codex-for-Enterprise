@@ -13,6 +13,7 @@ use casbin::MgmtApi;
 pub enum EnterpriseRole {
     Owner,
     Admin,
+    Manager,
     Developer,
     Viewer,
 }
@@ -20,16 +21,23 @@ pub enum EnterpriseRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnterpriseAction {
     AdministerUsers,
+    AssignRoles,
     ManageWorkspaces,
+    GrantWorkspaceAccess,
+    ManageContextPacks,
+    ManageOutputs,
+    ManageOwnContextPacks,
     StartWorker,
     ReadThreads,
+    ReadAudit,
 }
 
 impl EnterpriseRole {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Owner => "owner",
+            Self::Owner => "admin",
             Self::Admin => "admin",
+            Self::Manager => "manager",
             Self::Developer => "developer",
             Self::Viewer => "viewer",
         }
@@ -37,8 +45,9 @@ impl EnterpriseRole {
 
     pub fn from_storage(value: &str) -> Option<Self> {
         match value {
-            "owner" => Some(Self::Owner),
+            "owner" => Some(Self::Admin),
             "admin" => Some(Self::Admin),
+            "manager" => Some(Self::Manager),
             "developer" => Some(Self::Developer),
             "viewer" => Some(Self::Viewer),
             _ => None,
@@ -50,9 +59,15 @@ impl EnterpriseAction {
     fn as_policy_action(self) -> &'static str {
         match self {
             Self::AdministerUsers => "administer_users",
+            Self::AssignRoles => "assign_roles",
             Self::ManageWorkspaces => "manage_workspaces",
+            Self::GrantWorkspaceAccess => "grant_workspace_access",
+            Self::ManageContextPacks => "manage_context_packs",
+            Self::ManageOutputs => "manage_outputs",
+            Self::ManageOwnContextPacks => "manage_own_context_packs",
             Self::StartWorker => "start_worker",
             Self::ReadThreads => "read_threads",
+            Self::ReadAudit => "read_audit",
         }
     }
 }
@@ -63,9 +78,26 @@ pub fn role_allows(role: EnterpriseRole, action: EnterpriseAction) -> bool {
 
     match role {
         Owner => true,
-        Admin => !matches!(action, AdministerUsers),
-        Developer => matches!(action, StartWorker | ReadThreads),
-        Viewer => matches!(action, ReadThreads),
+        Admin => matches!(
+            action,
+            AdministerUsers
+                | AssignRoles
+                | ManageWorkspaces
+                | GrantWorkspaceAccess
+                | ManageContextPacks
+                | StartWorker
+                | ReadThreads
+                | ReadAudit
+        ),
+        Manager => matches!(
+            action,
+            GrantWorkspaceAccess | ManageOutputs | StartWorker | ReadThreads | ReadAudit
+        ),
+        Developer => matches!(
+            action,
+            GrantWorkspaceAccess | ManageOwnContextPacks | StartWorker | ReadThreads
+        ),
+        Viewer => matches!(action, StartWorker | ReadThreads),
     }
 }
 
@@ -116,15 +148,24 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 
 fn policy_matrix() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("owner", "administer_users"),
-        ("owner", "manage_workspaces"),
-        ("owner", "start_worker"),
-        ("owner", "read_threads"),
+        ("admin", "administer_users"),
+        ("admin", "assign_roles"),
         ("admin", "manage_workspaces"),
+        ("admin", "grant_workspace_access"),
+        ("admin", "manage_context_packs"),
         ("admin", "start_worker"),
         ("admin", "read_threads"),
+        ("admin", "read_audit"),
+        ("manager", "grant_workspace_access"),
+        ("manager", "manage_outputs"),
+        ("manager", "start_worker"),
+        ("manager", "read_threads"),
+        ("manager", "read_audit"),
+        ("developer", "grant_workspace_access"),
+        ("developer", "manage_own_context_packs"),
         ("developer", "start_worker"),
         ("developer", "read_threads"),
         ("viewer", "read_threads"),
+        ("viewer", "start_worker"),
     ]
 }

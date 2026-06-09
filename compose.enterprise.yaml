@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: codex
+      POSTGRES_PASSWORD: codex
+      POSTGRES_DB: codex_enterprise
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codex -d codex_enterprise"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - enterprise-postgres:/var/lib/postgresql/data
+
+  enterprise:
+    image: local-codex-enterprise:dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        BUILD_PROFILE: ${CODEX_BUILD_PROFILE:-dev}
+        CARGO_PROFILE_RELEASE_LTO: ${CODEX_CARGO_PROFILE_RELEASE_LTO:-thin}
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${CODEX_CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["codex-enterprise-server"]
+    command:
+      - "--database-url"
+      - "postgres://codex:codex@postgres:5432/codex_enterprise"
+      - "--bind-addr"
+      - "0.0.0.0:8787"
+      - "--worker-command"
+      - "/usr/local/bin/codex-container-entrypoint"
+      - "--worker-arg=app-server"
+      - "--worker-arg=--listen"
+      - "--worker-arg=unix://{socket_path}"
+      - "--worker-socket-dir"
+      - "/tmp/local-codex-enterprise/workers"
+      - "--worker-log-dir"
+      - "/tmp/local-codex-enterprise/logs"
+    environment:
+      CODEX_HOME: /codex-home
+      HOME: /codex-home
+      DOCKER_HOST: unix:///docker.sock
+      CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG: "1"
+      CODEX_MODEL: ${CODEX_MODEL:-ai/qwen3-coder}
+      CODEX_MODEL_PROVIDER_ID: docker-model-runner-container
+      CODEX_MODEL_PROVIDER_NAME: Docker Model Runner
+      CODEX_MODEL_PROVIDER_BASE_URL: http://host.docker.internal:12434/engines/v1
+      CODEX_DOCKER_MODEL_CONTEXT_HOST: http://host.docker.internal:12434
+      CODEX_DOCKER_MODEL_CONTEXT_NAME: codex-host
+      LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET: ${LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET:-local-enterprise-dev-secret-change-me}
+      LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT: /enterprise-workspaces
+    ports:
+      - "${LOCAL_CODEX_ENTERPRISE_PORT:-8787}:8787"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${LOCAL_CODEX_ENTERPRISE_WORKSPACES:-${PWD}}:/enterprise-workspaces
+      - enterprise-home:/codex-home
+      - ${DOCKER_HOST_SOCKET:-${HOME}/.docker/run/docker.sock}:/docker.sock
+
+volumes:
+  enterprise-postgres:
+  enterprise-home:

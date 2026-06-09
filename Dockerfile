@@ -29,8 +29,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/codex-rs/target \
     cd codex-rs \
     && case "$BUILD_PROFILE" in \
-        release) CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$CARGO_PROFILE_RELEASE_CODEGEN_UNITS" cargo build --locked --release -p codex-cli --bin codex && install -m 0755 target/release/codex /usr/local/bin/codex ;; \
-        dev) cargo build --locked -p codex-cli --bin codex && install -m 0755 target/debug/codex /usr/local/bin/codex ;; \
+        release) \
+            CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$CARGO_PROFILE_RELEASE_CODEGEN_UNITS" cargo build --locked --release -p codex-cli --bin codex -p codex-enterprise-server --bin codex-enterprise-server -p codex-app-server --bin codex-app-server \
+            && install -m 0755 target/release/codex /usr/local/bin/codex \
+            && install -m 0755 target/release/codex-enterprise-server /usr/local/bin/codex-enterprise-server \
+            && install -m 0755 target/release/codex-app-server /usr/local/bin/codex-app-server ;; \
+        dev) \
+            cargo build --locked -p codex-cli --bin codex -p codex-enterprise-server --bin codex-enterprise-server -p codex-app-server --bin codex-app-server \
+            && install -m 0755 target/debug/codex /usr/local/bin/codex \
+            && install -m 0755 target/debug/codex-enterprise-server /usr/local/bin/codex-enterprise-server \
+            && install -m 0755 target/debug/codex-app-server /usr/local/bin/codex-app-server ;; \
         *) echo "unsupported BUILD_PROFILE=$BUILD_PROFILE; use release or dev" >&2; exit 1 ;; \
     esac
 
@@ -63,6 +71,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/codex /usr/local/bin/codex
+COPY --from=builder /usr/local/bin/codex-enterprise-server /usr/local/bin/codex-enterprise-server
+COPY --from=builder /usr/local/bin/codex-app-server /usr/local/bin/codex-app-server
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/codex-container-entrypoint
 
 RUN useradd --create-home --uid 1000 --shell /bin/zsh codex \

@@ -1,0 +1,11 @@
+target/
+codex-rs/target/
+
+.DS_Store
+.codex/
+.env
+.env.*
+!.env.example
+
+private/
+screenshots/

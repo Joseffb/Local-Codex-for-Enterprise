@@ -241,13 +241,13 @@ Start a fresh thread when you need a new Codex conversation.
     // Optionally set config settings. If not specified, will use the user's
     // current config settings.
     "model": "gpt-5.1-codex",
-    "cwd": "/Users/me/project",
+    "cwd": "/workspace/project",
     "approvalPolicy": "never",
     "sandbox": "workspaceWrite",
     // Prefer experimental profile selection:
     // "permissions": ":workspace"
     // Experimental runtime roots for :workspace_roots materialization:
-    // "runtimeWorkspaceRoots": ["/Users/me/project", "/Users/me/openai"],
+    // "runtimeWorkspaceRoots": ["/workspace/project", "/workspace/other-root"],
     // Do not send both "sandbox" and "permissions".
     "personality": "friendly",
     "serviceName": "my_app_server_client", // optional metrics tag (`service_name`)
@@ -356,7 +356,7 @@ Example:
 { "method": "thread/list", "id": 20, "params": {
     "cursor": null,
     "limit": 25,
-    "cwd": ["/Users/me/project", "/Users/me/project-worktree"],
+    "cwd": ["/workspace/project", "/workspace/project-worktree"],
     "sortKey": "created_at"
 } }
 { "id": 20, "result": {
@@ -669,21 +669,21 @@ You can optionally specify config overrides on the new turn. If specified, these
     "clientUserMessageId": "client_msg_123",
     "input": [ { "type": "text", "text": "Run tests" } ],
     // Below are optional config overrides
-    "cwd": "/Users/me/project",
+    "cwd": "/workspace/project",
     // Experimental: turn-scoped environment selection.
     "environments": [
-        { "environmentId": "local", "cwd": "/Users/me/project" }
+        { "environmentId": "local", "cwd": "/workspace/project" }
     ],
     "approvalPolicy": "unlessTrusted",
     "sandboxPolicy": {
         "type": "workspaceWrite",
-        "writableRoots": ["/Users/me/project"],
+        "writableRoots": ["/workspace/project"],
         "networkAccess": true
     },
     // Prefer experimental profile selection:
     // "permissions": ":workspace"
     // Experimental runtime roots for :workspace_roots materialization:
-    // "runtimeWorkspaceRoots": ["/Users/me/project", "/Users/me/openai"],
+    // "runtimeWorkspaceRoots": ["/workspace/project", "/workspace/other-root"],
     // Do not send both "sandboxPolicy" and "permissions".
     "model": "gpt-5.1-codex",
     "effort": "medium",
@@ -714,7 +714,7 @@ Invoke a skill explicitly by including `$<skill-name>` in the text input and add
     "threadId": "thr_123",
     "input": [
         { "type": "text", "text": "$skill-creator Add a new skill for triaging flaky CI and include step-by-step usage." },
-        { "type": "skill", "name": "skill-creator", "path": "/Users/me/.codex/skills/skill-creator/SKILL.md" }
+        { "type": "skill", "name": "skill-creator", "path": "$CODEX_HOME/skills/skill-creator/SKILL.md" }
     ]
 } }
 { "id": 33, "result": { "turn": {
@@ -953,7 +953,7 @@ Run a standalone command (argv vector) in the server’s sandbox without creatin
 { "method": "command/exec", "id": 32, "params": {
     "command": ["ls", "-la"],
     "processId": "ls-1",                           // optional string; required for streaming and ability to terminate the process
-    "cwd": "/Users/me/project",                    // optional; defaults to server cwd
+    "cwd": "/workspace/project",                    // optional; defaults to server cwd
     "env": { "FOO": "override" },                  // optional; merges into the server env and overrides matching names
     "size": { "rows": 40, "cols": 120 },           // optional; PTY size in character cells, only valid with tty=true
     "permissionProfile": ":workspace",             // optional profile id; defaults to user config
@@ -1049,7 +1049,7 @@ Use `process/spawn` to start a standalone argv-based process without the Codex s
 { "method": "process/spawn", "id": 40, "params": {
     "command": ["cargo", "check"],
     "processHandle": "cargo-check-1",
-    "cwd": "/Users/me/project",                    // required absolute path
+    "cwd": "/workspace/project",                    // required absolute path
     "env": { "RUST_LOG": null },                    // optional; override or unset app-server env vars
     "outputBytesCap": 1048576,                     // optional; omit for default, null disables
     "timeoutMs": 10000                             // optional; omit for default, null disables
@@ -1071,7 +1071,7 @@ For interactive or streaming processes, set `tty: true` or `streamStdoutStderr: 
 { "method": "process/spawn", "id": 41, "params": {
     "command": ["bash", "-i"],
     "processHandle": "bash-1",
-    "cwd": "/Users/me/project",
+    "cwd": "/workspace/project",
     "tty": true,
     "size": { "rows": 40, "cols": 120 },
     "outputBytesCap": null,
@@ -1166,14 +1166,14 @@ All filesystem paths in this section must be absolute.
 ```json
 { "method": "fs/watch", "id": 44, "params": {
     "watchId": "0195ec6b-1d6f-7c2e-8c7a-56f2c4a8b9d1",
-    "path": "/Users/me/project/.git/HEAD"
+    "path": "/workspace/project/.git/HEAD"
 } }
 { "id": 44, "result": {
-    "path": "/Users/me/project/.git/HEAD"
+    "path": "/workspace/project/.git/HEAD"
 } }
 { "method": "fs/changed", "params": {
     "watchId": "0195ec6b-1d6f-7c2e-8c7a-56f2c4a8b9d1",
-    "changedPaths": ["/Users/me/project/.git/HEAD"]
+    "changedPaths": ["/workspace/project/.git/HEAD"]
 } }
 { "method": "fs/unwatch", "id": 45, "params": {
     "watchId": "0195ec6b-1d6f-7c2e-8c7a-56f2c4a8b9d1"
@@ -1392,11 +1392,11 @@ The built-in `request_permissions` tool sends an `item/permissions/requestApprov
     "turnId": "turn_123",
     "itemId": "call_123",
     "environmentId": "local",
-    "cwd": "/Users/me/project",
+    "cwd": "/workspace/project",
     "reason": "Select a workspace root",
     "permissions": {
       "fileSystem": {
-        "write": ["/Users/me/project", "/Users/me/shared"]
+        "write": ["/workspace/project", "/workspace/shared"]
       }
     }
   }
@@ -1412,7 +1412,7 @@ The client responds with `result.permissions`, which should be the granted subse
     "scope": "session",
     "permissions": {
       "fileSystem": {
-        "write": ["/Users/me/project"]
+        "write": ["/workspace/project"]
       }
     }
   }
@@ -1493,7 +1493,7 @@ Invoke a skill by including `$<skill-name>` in the text input. Add a `skill` inp
       {
         "type": "skill",
         "name": "skill-creator",
-        "path": "/Users/me/.codex/skills/skill-creator/SKILL.md"
+        "path": "$CODEX_HOME/skills/skill-creator/SKILL.md"
       }
     ]
   }
@@ -1515,12 +1515,12 @@ Use `skills/extraRoots/set` to replace additional standalone skill roots for the
 
 ```json
 { "method": "skills/list", "id": 25, "params": {
-    "cwds": ["/Users/me/project", "/Users/me/other-project"],
+    "cwds": ["/workspace/project", "/workspace/other-project"],
     "forceReload": true
 } }
 { "id": 25, "result": {
     "data": [{
-        "cwd": "/Users/me/project",
+        "cwd": "/workspace/project",
         "skills": [
             {
               "name": "skill-creator",
@@ -1553,7 +1553,7 @@ Use `skills/extraRoots/set` to replace additional standalone skill roots for the
   "method": "skills/extraRoots/set",
   "id": 26,
   "params": {
-    "extraRoots": ["/Users/me/generated-skills"]
+    "extraRoots": ["/workspace/generated-skills"]
   }
 }
 { "id": 26, "result": {} }
@@ -1566,7 +1566,7 @@ To enable or disable a skill by absolute path:
   "method": "skills/config/write",
   "id": 27,
   "params": {
-    "path": "/Users/alice/.codex/skills/skill-creator/SKILL.md",
+    "path": "$CODEX_HOME/skills/skill-creator/SKILL.md",
     "name": null,
     "enabled": false
   }
@@ -1600,7 +1600,7 @@ For unmanaged hooks, `currentHash` and `trustStatus` describe whether the curren
   "method": "hooks/list",
   "id": 28,
   "params": {
-    "cwds": ["/Users/me/project"]
+    "cwds": ["/workspace/project"]
   }
 }
 ```
@@ -1610,17 +1610,17 @@ For unmanaged hooks, `currentHash` and `trustStatus` describe whether the curren
   "id": 28,
   "result": {
     "data": [{
-      "cwd": "/Users/me/project",
+      "cwd": "/workspace/project",
       "hooks": [{
-        "key": "/Users/me/.codex/config.toml:pre_tool_use:0:0",
+        "key": "$CODEX_HOME/config.toml:pre_tool_use:0:0",
         "eventName": "pre_tool_use",
         "handlerType": "command",
         "isManaged": false,
         "matcher": "Bash",
-        "command": "python3 /Users/me/hook.py",
+        "command": "python3 /workspace/hooks/hook.py",
         "timeoutSec": 5,
         "statusMessage": "running hook",
-        "sourcePath": "/Users/me/.codex/config.toml",
+        "sourcePath": "$CODEX_HOME/config.toml",
         "source": "user",
         "pluginId": null,
         "displayOrder": 0,
@@ -1645,7 +1645,7 @@ To disable a non-managed hook, upsert a state entry at `hooks.state` with `confi
     "edits": [{
       "keyPath": "hooks.state",
       "value": {
-        "/Users/me/.codex/config.toml:pre_tool_use:0:0": {
+        "$CODEX_HOME/config.toml:pre_tool_use:0:0": {
           "enabled": false
         }
       },
