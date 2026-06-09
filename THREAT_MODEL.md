@@ -10,8 +10,9 @@ Local Codex for Enterprise is a community fork. It is not affiliated with, endor
 - Codex workers are scoped to a user, user workspace, project/repository working path, thread/session, and socket.
 - Coding threads are persisted as server-side chat histories bound to a user and, after the project/repository migration, a project plus optional repository. Transitional session records may still carry a canonical workspace path.
 - Workspace roots are server allowlist boundaries. User workspaces are per-user filesystem spaces. Projects are human work containers. Repositories are cloned checkouts inside projects. Threads are chat histories, not login sessions.
-- Workflow Context Packs are trusted only as versioned Markdown instruction/context material.
-- Workflow Context Packs must not execute code, trigger actions, create agents, alter RBAC, or perform governance reasoning.
+- Context Packs are trusted only as versioned Markdown operating packages.
+- Context Packs must not execute code, trigger schedules, call MCP tools, create sessions, create workers, create agents, alter RBAC, dispatch agents, act as workflow engines, or perform governance reasoning.
+- Context Packs are not Codex skills; they use enterprise assignment, receipt, audit, tenancy, and RBAC controls instead of local runtime skill installation.
 - Trace records and execution receipts are evidence only. They must not become a governance reasoning, authority, or orchestration runtime.
 - The websocket tunnel is trusted only to authenticate/authorize connection setup and relay frames to the correct worker socket; app-server JSON-RPC remains opaque.
 - Docker Model Runner, Docker Model Gateway, and MCP gateways are external local services and must be explicitly configured.
@@ -50,8 +51,8 @@ Local Codex for Enterprise is a community fork. It is not affiliated with, endor
 
 - Audit authentication events, authorization decisions, workspace root/user workspace/project/repository access, thread/session lifecycle events, token lifecycle events, worker lifecycle events, setup/bootstrap actions, and administrative changes.
 - Audit, security, and receipt records must include trace ID, actor, applicable workspace/session/worker context, event type, result, redacted metadata, and creation time.
-- Audit records must avoid storing plaintext secrets, bearer headers, handoff JWTs, credential-bearing repo URLs, prompts, raw model outputs, or environment secrets.
-- Audit records, receipts, logs, seeded docs, and example docs must avoid storing prompts, model outputs, auth headers, handoff tokens, passwords, API tokens, repo credentials, or private real-life examples.
+- Audit records must avoid storing plaintext secrets, bearer headers, handoff JWTs, credential-bearing repo URLs, private/runtime prompts, raw model outputs, or environment secrets.
+- Audit records, receipts, logs, seeded docs, and example docs must avoid storing private/runtime prompts, model outputs, auth headers, handoff tokens, passwords, API tokens, repo credentials, or private real-life examples. Synthetic reusable prompt templates are allowed in Context Pack examples only as inert text assets.
 - Context Pack receipts must record pack ID, document ID, content hash, load order, assignment source, actor, workspace, session, optional worker, phase, trace ID, and creation time. They must not store Markdown document bodies.
 - Initial trace coverage records bootstrap, login success/failure, RBAC denial, workspace clone, session create/list/get, worker start/stop, handoff issue/consume, and websocket tunnel connection events.
 - Execution receipts are emitted for session creation, context pack session/worker loading, repo clone attempts, worker start/stop, handoff issue/consume, and websocket tunnel connection.
@@ -64,7 +65,7 @@ See [docs/enterprise-domain-contract.md](docs/enterprise-domain-contract.md) for
 - The public-ready browser coding client is not complete; the current browser shell manages setup, admin, sessions, workers, and audit evidence.
 - OIDC is not implemented in v1.
 - Cedar/ABAC policy packs are reserved for future work.
-- Password login, browser login, minimal user management, seeded role assignment, workspace registration/validation, Workflow Context Pack upload/assignment/receipts, session ledger persistence, trace-aware audit events, execution receipts, audit query APIs, worker process launch, HTTPS-only repo clone intake, handoff token issue/consume, and the initial remote TUI websocket tunnel are implemented.
+- Password login, browser login, minimal user management, seeded role assignment, workspace registration/validation, Context Pack upload/assignment/receipts, session ledger persistence, trace-aware audit events, execution receipts, audit query APIs, worker process launch, HTTPS-only repo clone intake, handoff token issue/consume, and the initial remote TUI websocket tunnel are implemented.
 - Project/repository domain tables, model/tool invocation capture from worker boundaries, worker restart reconciliation, custom RBAC policy editing, and full audit export/reporting are still incomplete.
 - Dashboards, SIEM export, Fernain bridge, approval workflow engine, resolver graphs, cognition phases, and generalized governance orchestration are intentionally out of this slice.
 - Argon2, Casbin, and Utoipa are wired for password hashing, seeded RBAC policy evaluation, and OpenAPI generation. Custom policy persistence and full route documentation are still incomplete.

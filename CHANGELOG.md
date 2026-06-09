@@ -6,6 +6,23 @@ This project is a community fork and is not affiliated with, endorsed by, or sup
 
 ## [Unreleased]
 
+## [0.0.1-beta.3] - 2026-06-09
+
+### Changed
+
+- Improved browser chat turn controls with copy, resubmit, and inline edit/reset behavior.
+- Preserved persisted turn timestamps when rendering loaded thread history.
+- Added default-thread auto-labeling after the first user/assistant exchange.
+- Routed greetings and acknowledgements to brief conversational replies instead of conceptual planning mode.
+
+## [0.0.1-beta.2] - 2026-06-09
+
+### Changed
+
+- Added the Context Pack contract, defining packs as versioned operating packages rather than Codex skills, executable workflows, or governance runtimes.
+- Added canonical `WORKFLOWS.md` and `PROMPTS.md` Context Pack files plus custom uppercase Markdown import support.
+- Added server-provided chat turn guidance for conceptual planning and collapsed raw tool output in the browser transcript.
+
 ## [0.0.1-beta.1] - 2026-06-09
 
 ### Fixed

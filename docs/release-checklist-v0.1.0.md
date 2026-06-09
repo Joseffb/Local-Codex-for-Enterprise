@@ -15,7 +15,9 @@ Use this checklist before making the repository public.
 - [ ] README quick start works from a clean checkout.
 - [ ] Docker Compose setup is documented.
 - [ ] Architecture overview is documented.
-- [ ] Workflow Context Packs are explained.
+- [ ] Context Packs are explained as versioned operating packages.
+- [ ] Context Pack docs clearly distinguish packs from Codex skills.
+- [ ] Context Pack docs clearly state packs are not executable workflows or governance runtimes.
 - [ ] Example Context Pack is synthetic and safe.
 - [ ] Example receipts contain IDs, hashes, and redacted metadata only.
 - [ ] Demo guide covers browser/session/worker/local-model validation.
@@ -26,7 +28,8 @@ Use this checklist before making the repository public.
 
 ## Safety
 
-- [ ] No prompts are committed.
+- [ ] No private/runtime prompts are committed.
+- [ ] Any synthetic prompt templates are clearly documented as inert Context Pack examples.
 - [ ] No model outputs are committed.
 - [ ] No auth headers are committed.
 - [ ] No handoff tokens are committed.

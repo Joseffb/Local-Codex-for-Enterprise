@@ -212,6 +212,36 @@ async fn traced_responses_emit_generated_preserved_and_replaced_trace_ids() {
         .oneshot(generated)
         .await
         .expect("generated trace response");
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("config body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("config json body");
+    assert_eq!(
+        body["turn_guidance"]["planning_sequence"][0],
+        "business goal"
+    );
+    assert!(
+        body["turn_guidance"]["repository_tool_rule"]
+            .as_str()
+            .expect("repository rule")
+            .contains("Before using repository tools")
+    );
+    assert!(
+        body["turn_guidance"]["tool_output_rule"]
+            .as_str()
+            .expect("tool output rule")
+            .contains("Do not print raw HTML, JSON, or full tool output")
+    );
+    let generated = Request::builder()
+        .method("GET")
+        .uri("/v1/config")
+        .body(Body::empty())
+        .expect("request");
+    let response = router
+        .clone()
+        .oneshot(generated)
+        .await
+        .expect("generated trace response");
     let generated_trace = response
         .headers()
         .get("x-trace-id")
@@ -3068,13 +3098,13 @@ async fn login_page_redirects_home_and_nav_says_home_when_authenticated() {
     assert!(
         chat_with_auth
             .text
-            .contains("Local Codex for Enterprise v0.0.1-beta.1")
+            .contains("Local Codex for Enterprise v0.0.1-beta.3")
     );
     assert!(chat_with_auth.text.contains("Made with Codex"));
     assert!(
         chat_with_auth
             .text
-            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.1</span></div></div>"#)
+            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.3</span></div></div>"#)
     );
     let footer_index = chat_with_auth
         .text
@@ -3369,10 +3399,31 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("Conceptual planning request"));
     assert!(
         chat.text
-            .contains("Do not inspect repository files unless the user asks")
+            .contains("do not inspect the repository unless the user explicitly asks")
     );
+    assert!(chat.text.contains("workbenchTurnGuidance"));
+    assert!(chat.text.contains("chat-turn-guidance"));
+    assert!(
+        chat.text
+            .contains("Before using repository tools, decide whether")
+    );
+    assert!(chat.text.contains("business planning, architecture advice"));
+    assert!(
+        chat.text
+            .contains("Do not print raw HTML, JSON, or full tool output")
+    );
+    assert!(chat.text.contains("business goal"));
+    assert!(chat.text.contains("users/stakeholders"));
+    assert!(chat.text.contains("decisions the system must support"));
     assert!(chat.text.contains("turn/start"));
     assert!(chat.text.contains("item/agentMessage/delta"));
+    assert!(chat.text.contains("handleWorkbenchCommandOutputDelta"));
+    assert!(chat.text.contains("Raw tool output is collapsed"));
+    assert!(
+        !chat
+            .text
+            .contains("workbenchMessage('assistant', 'Command', params.delta)")
+    );
     assert!(!chat.text.contains("Codex app-server connection is ready."));
     assert!(!chat.text.contains("Worker ready"));
     assert!(!chat.text.contains("Thread ready"));
@@ -3432,12 +3483,118 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("clearWorkbenchTranscript"));
     assert!(chat.text.contains("loadWorkbenchThreadHistory"));
     assert!(chat.text.contains("recordWorkbenchThreadMessage"));
+    assert!(
+        chat.text
+            .contains("autoLabelWorkbenchThreadAfterFirstAiTurn")
+    );
+    assert!(chat.text.contains("deriveWorkbenchThreadTitle"));
+    assert!(chat.text.contains("isDefaultWorkbenchThreadTitle"));
+    assert!(chat.text.contains("normalized === 'New chat thread'"));
+    assert!(chat.text.contains("firstUserTurn"));
+    assert!(chat.text.contains("firstAssistantTurn"));
+    assert!(
+        chat.text
+            .contains("if (!isDefaultWorkbenchThreadTitle(workbench.threadTitle)) return")
+    );
+    assert!(
+        chat.text
+            .contains("await recordWorkbenchThreadMessage('assistant', 'Codex', assistantText)")
+    );
+    assert!(
+        chat.text
+            .contains("await autoLabelWorkbenchThreadAfterFirstAiTurn()")
+    );
+    assert!(
+        chat.text
+            .contains("renameWorkbenchThread(workbench.sessionId, title)")
+    );
     assert!(chat.text.contains("composerKeydown"));
     assert!(chat.text.contains("showWorkbenchEmptyState"));
     assert!(chat.text.contains("clearEphemeralMessages"));
     assert!(chat.text.contains("appendWorkbenchAssistantPending"));
     assert!(chat.text.contains("replacePendingAssistantDelta"));
     assert!(chat.text.contains("appendWorkbenchAssistantDelta"));
+    assert!(chat.text.contains("completeWorkbenchAssistantTurn"));
+    assert!(chat.text.contains("completeLastMessage"));
+    assert!(chat.text.contains("copyWorkbenchMessage"));
+    assert!(chat.text.contains("resubmitWorkbenchMessage"));
+    assert!(chat.text.contains("beginEditResubmitWorkbenchMessage"));
+    assert!(chat.text.contains("submitEditedWorkbenchMessage"));
+    assert!(chat.text.contains("data-resubmit-index"));
+    assert!(chat.text.contains("data-begin-edit-index"));
+    assert!(chat.text.contains("data-submit-edit-index"));
+    assert!(chat.text.contains("inline-turn-editor"));
+    assert!(chat.text.contains("data-edit-value-index"));
+    assert!(chat.text.contains("title=\"Resubmit turn\""));
+    assert!(chat.text.contains("title=\"Edit turn\""));
+    assert!(chat.text.contains("message.kind === 'user'"));
+    assert!(
+        chat.text
+            .contains("this.setMessages(this.messages.slice(0, index + 1))")
+    );
+    assert!(
+        !chat
+            .text
+            .contains("window.prompt('Edit and resubmit this turn', text)")
+    );
+    assert!(chat.text.contains("workbench.appThreadId = null"));
+    assert!(
+        chat.text
+            .contains("await sendWorkbenchRpcMessage(text, {recordUser:false, appendUser:false})")
+    );
+    assert!(chat.text.contains("isSocialWorkbenchMessage"));
+    assert!(chat.text.contains("isPlanningWorkbenchMessage"));
+    assert!(chat.text.contains("Conversational acknowledgement"));
+    assert!(chat.text.contains("Reply briefly and naturally"));
+    assert!(chat.text.contains("hello"));
+    assert!(chat.text.contains("Do not start planning"));
+    assert!(chat.text.contains("Do not mention unavailable tools"));
+    assert!(chat.text.contains("General chat request"));
+    assert!(chat.text.contains("Conceptual planning request"));
+    assert!(chat.text.contains("copyable-message"));
+    assert!(chat.text.contains("message-actions"));
+    assert!(chat.text.contains("last-completed-assistant"));
+    assert!(chat.text.contains(".message:hover .message-actions"));
+    assert!(chat.text.contains(".message:focus-within .message-actions"));
+    assert!(chat.text.contains("opacity:0"));
+    assert!(chat.text.contains("color:#9aa3b2"));
+    assert!(chat.text.contains("formatAssistantMessage(message)"));
+    assert!(chat.text.contains("body+actions"));
+    assert!(chat.text.contains("formatWorkbenchTurnTime"));
+    assert!(chat.text.contains("11:31 pm"));
+    assert!(chat.text.contains("Jun 8, 11:31 pm"));
+    assert!(chat.text.contains("sameDay"));
+    assert!(chat.text.contains("toLocaleDateString"));
+    assert!(chat.text.contains("message-timestamp"));
+    assert!(chat.text.contains("message-actions-left"));
+    assert!(
+        chat.text
+            .contains("createdAt:message.created_at || message.createdAt")
+    );
+    assert!(
+        chat.text
+            .contains("message.created_at || message.createdAt || new Date().toISOString()")
+    );
+    assert!(chat.text.contains("new Date()"));
+    assert!(chat.text.contains("findLastIndex"));
+    assert!(!chat.text.contains(
+        "message-header\"><small>'+workbenchEscape(message.label)+'</small>'+copyButton"
+    ));
+    assert!(chat.text.contains("thinking-dots"));
+    assert!(chat.text.contains("@keyframes thinkingPulse"));
+    assert!(
+        chat.text
+            .contains("message.pending && message.kind === 'assistant'")
+    );
+    assert!(chat.text.contains("data-copy-index"));
+    assert!(chat.text.contains("'copy'"));
+    assert!(chat.text.contains("Copy turn"));
+    assert!(
+        chat.text
+            .contains("message.kind === 'user' || message.kind === 'assistant'")
+    );
+    assert!(chat.text.contains("!message.streaming"));
+    assert!(chat.text.contains("reverse().find"));
     assert!(chat.text.contains("renderWorkbenchMarkdown"));
     assert!(chat.text.contains("formatAssistantMessage"));
     assert!(chat.text.contains("scrollToBottom()"));
@@ -3970,13 +4127,28 @@ async fn admin_pages_offer_dropdown_assignment_controls_instead_of_manual_ids() 
         "CALIBRATION.md",
         "OPERATING-INSTRUCTIONS.md",
         "PROJECT-RULES.md",
+        "WORKFLOWS.md",
         "HANDOFF.md",
         "VERIFICATION.md",
         "ESCALATION.md",
         "CONTEXT.md",
+        "PROMPTS.md",
     ] {
         assert!(pack_create_page.text.contains(filename), "{filename}");
     }
+    assert!(
+        pack_create_page
+            .text
+            .contains("Context Packs are versioned operating packages")
+    );
+    assert!(pack_create_page.text.contains("They are not Codex skills"));
+    assert!(
+        pack_create_page
+            .text
+            .contains("Context Packs do not execute workflows")
+    );
+    assert!(pack_create_page.text.contains("isContextPackMarkdownFile"));
+    assert!(pack_create_page.text.contains("CUSTOM-STANDARD.md"));
 
     let packs_page = empty_request(
         router.clone(),
@@ -3990,6 +4162,8 @@ async fn admin_pages_offer_dropdown_assignment_controls_instead_of_manual_ids() 
     assert!(packs_page.text.contains("Admin Console"));
     assert!(packs_page.text.contains("Governed Context"));
     assert!(packs_page.text.contains("Context Pack Index"));
+    assert!(packs_page.text.contains("versioned operating packages"));
+    assert!(packs_page.text.contains("not Codex skills"));
     assert!(packs_page.text.contains("context-pack-index"));
     assert!(packs_page.text.contains("/admin/context-packs/new"));
     assert!(packs_page.text.contains("/admin/context-packs/assignments"));

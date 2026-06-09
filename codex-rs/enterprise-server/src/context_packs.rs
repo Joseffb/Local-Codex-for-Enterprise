@@ -13,10 +13,12 @@ const STANDARD_FILENAMES: &[&str] = &[
     "CALIBRATION.md",
     "OPERATING-INSTRUCTIONS.md",
     "PROJECT-RULES.md",
+    "WORKFLOWS.md",
     "HANDOFF.md",
     "VERIFICATION.md",
     "ESCALATION.md",
     "CONTEXT.md",
+    "PROMPTS.md",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -129,7 +131,7 @@ fn parse_manifest(content: &str) -> Result<PackManifest> {
             continue;
         }
         current_list = match line {
-            "required_files:" | "required:" => Some("required_files"),
+            "required_files:" | "required_documents:" | "required:" => Some("required_files"),
             "load_order:" => Some("load_order"),
             _ => None,
         };
@@ -177,4 +179,54 @@ fn has_duplicate(values: &[String]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_operating_package_standard_and_custom_markdown_files() {
+        let validated = validate_documents(&[
+            ContextPackDocumentInput {
+                filename: "PACK.md".to_string(),
+                content: "name: Operating Pack\nrequired_documents:\n- WORKFLOWS.md\nload_order:\n- PACK.md\n- WORKFLOWS.md\n- PROMPTS.md\n- CUSTOM-STANDARD.md\n"
+                    .to_string(),
+            },
+            ContextPackDocumentInput {
+                filename: "WORKFLOWS.md".to_string(),
+                content: "workflow guidance only".to_string(),
+            },
+            ContextPackDocumentInput {
+                filename: "PROMPTS.md".to_string(),
+                content: "prompt templates only".to_string(),
+            },
+            ContextPackDocumentInput {
+                filename: "CUSTOM-STANDARD.md".to_string(),
+                content: "custom markdown is allowed".to_string(),
+            },
+        ])
+        .expect("context pack validates");
+
+        let filenames = validated
+            .documents
+            .iter()
+            .map(|document| document.filename.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            filenames,
+            vec![
+                "PACK.md",
+                "WORKFLOWS.md",
+                "PROMPTS.md",
+                "CUSTOM-STANDARD.md"
+            ]
+        );
+        assert!(
+            validated
+                .documents
+                .iter()
+                .any(|document| document.filename == "WORKFLOWS.md" && document.required)
+        );
+    }
 }

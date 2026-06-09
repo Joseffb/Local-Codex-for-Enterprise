@@ -8,6 +8,6 @@ Do not include:
 - Tokens.
 - Private paths.
 - Customer data.
-- Prompts.
+- Private/runtime prompts.
 - Model outputs.
 - Credential-bearing repository URLs.

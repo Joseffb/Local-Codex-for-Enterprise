@@ -6,7 +6,7 @@ This roadmap tracks public product direction for Local Codex for Enterprise. It 
 
 - Prove the browser chat, project, repository, thread, worker, app-server, and local Docker model loop end to end.
 - Keep the domain hierarchy explicit: workspace root -> user workspace -> project -> repository -> thread.
-- Keep Context Packs as governed instruction/context material only.
+- Keep Context Packs as governed operating packages only.
 - Preserve trace, audit, and receipt continuity without storing prompts, model outputs, credentials, handoff tokens, or private examples.
 - Keep the UI functional for setup, login, admin, projects, context packs, outputs, audit, and chat.
 
@@ -29,7 +29,7 @@ This roadmap tracks public product direction for Local Codex for Enterprise. It 
 
 Scheduled sessions are planned, but they are not part of the current project/thread cleanup run.
 
-The architectural decision is that automation is implemented as scheduled sessions. A scheduler creates sessions on behalf of a user according to a schedule definition. The scheduler does not execute Context Packs directly, and Context Packs remain guidance/context artifacts only.
+The architectural decision is that automation is implemented as scheduled sessions. A scheduler creates sessions on behalf of a user according to a schedule definition. The scheduler does not execute Context Packs directly, and Context Packs remain operating packages only.
 
 Everything that can be represented as a session should be a session. Interactive use is a user-created session. Automation is a scheduler-created session. Both share the same workers, traces, receipts, audits, Context Pack loading, and execution lifecycle.
 
@@ -48,7 +48,7 @@ Schedule
 
 Responsibility split:
 
-- Context Pack = knowledge, rules, calibration, handoffs, operating guidance, and project context.
+- Context Pack = versioned operating package for knowledge, rules, calibration, handoffs, operating guidance, workflow guidance, reusable prompt templates, and project context.
 - Schedule = trigger, owner, target scope, cadence, and enabled/disabled state.
 - Prompt = task instruction for what Codex should do during the scheduled session.
 - Session = execution boundary that combines the prompt and assigned Context Packs.
@@ -71,11 +71,12 @@ Minimal design direction:
 
 Hard boundary:
 
-- Context Packs remain instructions, knowledge, calibration, handoffs, operating rules, verification guidance, and project context.
-- Context Packs answer how Codex should think, what context applies, and what rules should be followed.
+- Context Packs remain versioned operating packages: instructions, knowledge, calibration, handoffs, operating rules, workflow guidance, verification guidance, reusable prompt templates, and project context.
+- Context Packs answer what Codex should know and how Codex should operate in a user, team, project, workspace, or organization.
 - Schedules answer when a task should run, who it runs for, and what scope it targets.
 - Prompts answer what Codex should do.
-- Context Packs do not execute code, trigger actions, create agents, alter RBAC, perform governance reasoning, or function as workflow definitions.
+- Context Packs do not execute code, trigger actions, call MCP tools, create sessions, create workers, create agents, alter RBAC, perform governance reasoning, or function as workflow definitions.
+- Context Packs are not Codex skills. Skills are runtime capability packages; Context Packs are enterprise operating packages with assignment, audit, receipt, tenancy, and RBAC surfaces.
 - Execution prompts are not stored inside Context Packs as the thing that runs. They belong to scheduled sessions, or to a schedule-owned reference to an inert reusable template.
 - Scheduled sessions do not introduce a workflow engine, automation runtime, pack execution engine, agent orchestration framework, approval workflow engine, Fernain bridge, policy reasoning engine, committee runtime, or generalized governance system.
 - The goal is to extend the existing session architecture, not create a second execution architecture.

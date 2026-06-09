@@ -9,7 +9,7 @@ This repository is not affiliated with, endorsed by, or supported by OpenAI. It 
 - A local-first Codex fork for Docker Model Runner and Docker Model Gateway.
 - A self-hosted enterprise control plane with Postgres-backed state.
 - A managed path for users, seeded RBAC roles, workspace root allowlisting, user workspaces, projects, repositories, threads, workers, handoff tokens, trace-aware audit events, and execution receipts.
-- A Workflow Context Pack system for versioned Markdown startup context.
+- A Context Pack system for versioned Markdown operating packages.
 - A release candidate foundation for a public community project.
 
 ## What This Is Not
@@ -22,7 +22,7 @@ This repository is not affiliated with, endorsed by, or supported by OpenAI. It 
 
 ## Current Status
 
-The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Workflow Context Pack upload/assignment/receipts, thread/session records, workers, short-lived handoff tokens, initial websocket tunneling to worker sockets, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
+The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Context Pack upload/assignment/receipts, thread/session records, workers, short-lived handoff tokens, initial websocket tunneling to worker sockets, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
 
 The product domain contract is defined in [docs/enterprise-domain-contract.md](docs/enterprise-domain-contract.md). In short: workspace roots are server allowlist boundaries, user workspaces are per-user filesystem spaces, projects are human work containers, repositories are cloned checkouts inside projects, and threads are chat histories attached to projects/repositories.
 
@@ -378,7 +378,7 @@ Core boundaries:
 - The enterprise server owns identity, RBAC checks, workspace root validation, user workspace/project/repository/thread records, worker supervision, handoff issuance, and audit evidence.
 - Workers are scoped to an actor, user workspace, project/repository working path, thread/session, and socket.
 - The app-server protocol remains opaque to the enterprise control plane.
-- Context packs are loaded as instruction/context material only.
+- Context packs are loaded as operating material only.
 - Receipts are evidence, not reasoning.
 
 Domain hierarchy:
@@ -415,9 +415,13 @@ Built-in local providers:
 
 Both use `wire_api = "chat_completions"`.
 
-## Workflow Context Packs
+## Context Packs
 
-Workflow Context Packs are versioned Markdown startup context for governed coding sessions. They are meant for durable organizational operating context such as project rules, handoffs, verification protocols, escalation paths, and required session-start instructions.
+Context Packs are versioned operating packages that bundle project knowledge, operating instructions, workflows, procedures, checklists, calibration, handoffs, verification guidance, escalation guidance, and reusable prompt templates. They are loaded into sessions to guide Codex behavior and produce receipts proving which operating package influenced the run.
+
+Context Packs are not Codex skills. Codex skills are runtime capability packages for agent behavior or tool use. Context Packs are enterprise-owned operating packages with user, workspace, project, assignment, receipt, audit, and RBAC surfaces.
+
+See [docs/context-pack-contract.md](docs/context-pack-contract.md) for the authoritative Context Pack contract.
 
 Standard filenames:
 
@@ -425,21 +429,26 @@ Standard filenames:
 - `CALIBRATION.md`
 - `OPERATING-INSTRUCTIONS.md`
 - `PROJECT-RULES.md`
+- `WORKFLOWS.md`
 - `HANDOFF.md`
 - `VERIFICATION.md`
 - `ESCALATION.md`
 - `CONTEXT.md`
+- `PROMPTS.md`
 
-Only `PACK.md` is universally required. Other documents are optional and can be required by the pack manifest.
+Only `PACK.md` is universally required. Other canonical documents are optional and can be required by the pack manifest. Custom uppercase Markdown files are allowed.
 
 Hard boundary:
 
-- Packs are loaded as instruction/context material only.
+- Packs are loaded as operating material only.
 - Packs do not execute code.
 - Packs do not trigger actions.
+- Packs do not call MCP tools.
+- Packs do not create sessions or workers.
 - Packs do not create agents.
 - Packs do not alter RBAC.
 - Packs do not perform governance reasoning.
+- Packs do not function as workflow engines or Codex skills.
 
 See [docs/examples/context-pack-basic](docs/examples/context-pack-basic) for a safe synthetic example.
 
@@ -459,7 +468,7 @@ load_order:
 - OPERATING-INSTRUCTIONS.md
 - VERIFICATION.md
 
-This pack provides basic session startup context for a generic engineering project.
+This pack provides basic operating material for a generic engineering project.
 ```
 
 The server validates that required documents are present and that load order is deterministic. If multiple assignments create an ambiguous order for the same user/project context, the request is rejected.
@@ -500,7 +509,7 @@ The demo covers Compose startup, `/healthz`, browser login, session creation, wo
 
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled sessions are listed there as deferred functionality that reuses the existing session, worker, trace, audit, receipt, and Context Pack loading lifecycle. Context Packs remain instruction/context artifacts only; they are not executable workflow definitions.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled sessions are listed there as deferred functionality that reuses the existing session, worker, trace, audit, receipt, and Context Pack loading lifecycle. Context Packs remain operating packages only; they are not executable workflow definitions, schedulers, governance runtimes, or Codex skills.
 
 ## Current Limitations
 
@@ -522,7 +531,7 @@ See [SECURITY.md](SECURITY.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
 
 Security-sensitive release rule:
 
-Do not commit prompts, model outputs, auth headers, handoff tokens, passwords, API tokens, repo credentials, screenshots with private data, local machine paths, or private real-life examples.
+Do not commit private/runtime prompts, model outputs, auth headers, handoff tokens, passwords, API tokens, repo credentials, screenshots with private data, local machine paths, or private real-life examples. Synthetic reusable prompt templates are allowed only as Context Pack template examples.
 
 ## Contributing
 

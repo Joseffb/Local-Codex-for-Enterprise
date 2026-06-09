@@ -112,6 +112,14 @@ pub struct ConfigResponse {
     pub mode: &'static str,
     pub default_model_provider: String,
     pub default_model: String,
+    pub turn_guidance: TurnGuidanceResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TurnGuidanceResponse {
+    pub repository_tool_rule: String,
+    pub tool_output_rule: String,
+    pub planning_sequence: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -578,6 +586,21 @@ pub fn health_response() -> HealthResponse {
     }
 }
 
+fn turn_guidance_response() -> TurnGuidanceResponse {
+    TurnGuidanceResponse {
+        repository_tool_rule: "Before using repository tools, decide whether the user request is actually about the current codebase. If the request is business planning, architecture advice, writing, strategy, or general analysis, answer directly and do not inspect the repository unless the user explicitly asks.".to_string(),
+        tool_output_rule: "When using web or documentation tools, summarize findings. Do not print raw HTML, JSON, or full tool output unless explicitly requested.".to_string(),
+        planning_sequence: vec![
+            "business goal".to_string(),
+            "users/stakeholders".to_string(),
+            "decisions the system must support".to_string(),
+            "data sources".to_string(),
+            "architecture".to_string(),
+            "implementation path".to_string(),
+        ],
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/healthz",
@@ -802,6 +825,7 @@ where
         mode: "enterprise",
         default_model_provider: state.config.default_model_provider,
         default_model: state.config.default_model,
+        turn_guidance: turn_guidance_response(),
     })
 }
 
@@ -3782,7 +3806,7 @@ __CONTENT__
           {label:'Name', value:(pack) => pack.name},
           {label:'Status', value:(pack) => pack.status},
           {label:'Created', value:(pack) => pack.created_at}
-        ], packs, {message:'No context packs exist yet. Add or import a Context Pack before assigning governed startup context.', href:'/admin/context-packs/new', label:'Add Context Pack'});
+        ], packs, {message:'No context packs exist yet. Add or import a Context Pack before assigning governed operating packages.', href:'/admin/context-packs/new', label:'Add Context Pack'});
         renderAssignments('assignment-index', assignments, packs, users);
         renderTable('output-index', [
           {label:'Category', value:(output) => output.category},
@@ -3892,18 +3916,22 @@ __CONTENT__
         {filename:'CALIBRATION.md', content:v('pack-calibration')},
         {filename:'OPERATING-INSTRUCTIONS.md', content:v('pack-operating-instructions')},
         {filename:'PROJECT-RULES.md', content:v('pack-project-rules')},
+        {filename:'WORKFLOWS.md', content:v('pack-workflows')},
         {filename:'HANDOFF.md', content:v('pack-handoff')},
         {filename:'VERIFICATION.md', content:v('pack-verification')},
         {filename:'ESCALATION.md', content:v('pack-escalation')},
-        {filename:'CONTEXT.md', content:v('pack-context')}
+        {filename:'CONTEXT.md', content:v('pack-context')},
+        {filename:'PROMPTS.md', content:v('pack-prompts')}
       ];
     }
+    function isContextPackMarkdownFile(fileName) {
+      return /^[A-Z0-9][A-Z0-9._-]*\.md$/.test(fileName) && !fileName.startsWith('.');
+    }
     async function createPackFromSelectedFiles() {
-      const allowed = new Set(['PACK.md','CALIBRATION.md','OPERATING-INSTRUCTIONS.md','PROJECT-RULES.md','HANDOFF.md','VERIFICATION.md','ESCALATION.md','CONTEXT.md']);
       const input = document.getElementById('pack-files');
       const documents = [];
       for (const file of input.files) {
-        if (allowed.has(file.name)) {
+        if (isContextPackMarkdownFile(file.name)) {
           documents.push({filename:file.name, content:await file.text()});
         }
       }
@@ -3953,6 +3981,7 @@ __CONTENT__
       constructor() {
         super();
         this.messages = [];
+        this.editingIndex = null;
         this.maxRenderedMessages = 80;
         this.rowEstimate = 92;
         this.windowStart = 0;
@@ -3960,11 +3989,37 @@ __CONTENT__
         this.attachShadow({mode:'open'});
       }
       connectedCallback() {
-        this.shadowRoot.innerHTML = '<style>:host{display:block;height:100%;overflow:hidden;min-height:0;}#scroll{height:100%;overflow-y:auto;overflow-x:hidden;padding:28px max(22px,5vw) 24px;box-sizing:border-box;scrollbar-gutter:stable;}#top-spacer,#bottom-spacer{height:0;}#messages{display:flex;flex-direction:column;gap:22px;min-height:100%;}.message{max-width:min(var(--chat-content-width,980px),100%);border:0;border-radius:18px;padding:14px 16px;line-height:1.55;font-size:15px;box-sizing:border-box;}.message.system,.message.assistant{background:transparent;color:#d7dce7;}.message.user{align-self:flex-end;background:#1f2027;color:#f5f6fa;}.message.pending div{color:#858b98;}.message small{display:block;color:#858b98;font-size:11px;font-weight:800;text-transform:uppercase;margin-bottom:6px;}.message-body{white-space:normal;}.message-body p{margin:0 0 10px;}.message-body p:last-child{margin-bottom:0;}.message-body h1,.message-body h2,.message-body h3{margin:16px 0 8px;color:#f4f6fb;line-height:1.25;}.message-body h1{font-size:22px;}.message-body h2{font-size:19px;}.message-body h3{font-size:16px;}.message-body ul,.message-body ol{margin:8px 0 12px;padding-left:22px;}.message-body li{margin:4px 0;}.message-body code{background:#151820;border:1px solid #2a2d37;border-radius:5px;padding:1px 5px;}.message-body pre{background:#0d0f14;border:1px solid #2a2d37;border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;}@media (max-width:480px){#scroll{padding:18px 14px 18px;}.message{font-size:14px;padding:12px 13px;}}</style><div id="scroll"><div id="top-spacer"></div><div id="messages"></div><div id="bottom-spacer"></div></div>';
+        this.shadowRoot.innerHTML = '<style>:host{display:block;height:100%;overflow:hidden;min-height:0;}#scroll{height:100%;overflow-y:auto;overflow-x:hidden;padding:28px max(22px,5vw) 24px;box-sizing:border-box;scrollbar-gutter:stable;}#top-spacer,#bottom-spacer{height:0;}#messages{display:flex;flex-direction:column;gap:22px;min-height:100%;}.message{max-width:min(var(--chat-content-width,980px),100%);border:0;border-radius:18px;padding:14px 16px;line-height:1.55;font-size:15px;box-sizing:border-box;position:relative;}.message.system,.message.assistant{background:transparent;color:#d7dce7;}.message.user{align-self:flex-end;background:#1f2027;color:#f5f6fa;}.message.pending div{color:#858b98;}.message small{display:block;color:#858b98;font-size:11px;font-weight:800;text-transform:uppercase;margin-bottom:6px;}.message-body{white-space:normal;}.message-body p{margin:0 0 10px;}.message-body p:last-child{margin-bottom:0;}.message-body h1,.message-body h2,.message-body h3{margin:16px 0 8px;color:#f4f6fb;line-height:1.25;}.message-body h1{font-size:22px;}.message-body h2{font-size:19px;}.message-body h3{font-size:16px;}.message-body ul,.message-body ol{margin:8px 0 12px;padding-left:22px;}.message-body li{margin:4px 0;}.message-body code{background:#151820;border:1px solid #2a2d37;border-radius:5px;padding:1px 5px;}.message-body pre{background:#0d0f14;border:1px solid #2a2d37;border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;}.message-actions{display:flex;align-items:center;justify-content:flex-start;margin-top:12px;opacity:0;transition:opacity .14s ease;}.message:hover .message-actions,.message:focus-within .message-actions,.message.last-completed-assistant .message-actions{opacity:1;}.message-actions-left{display:inline-flex;align-items:center;gap:8px;color:#9aa3b2;}.message-timestamp{font-size:12px;color:#9aa3b2;}.copyable-message{appearance:none;border:0;background:transparent;color:#9aa3b2;padding:4px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;opacity:.84;cursor:pointer;}.copyable-message:hover,.copyable-message:focus{background:rgba(154,163,178,.12);color:#c9d1dd;opacity:1;outline:none;}.copyable-message.copied{color:#d7dce7;}.copyable-message svg{width:16px;height:16px;}.inline-turn-editor{display:grid;gap:10px;min-width:min(520px,70vw);}.inline-turn-editor textarea{width:100%;min-height:96px;box-sizing:border-box;background:#0d0f14;color:#f5f6fa;border:1px solid #3a4151;border-radius:10px;padding:10px;font:inherit;resize:vertical;}.inline-turn-editor-actions{display:flex;gap:8px;justify-content:flex-end;}.inline-turn-editor-actions button{border:0;border-radius:9px;padding:8px 12px;font-weight:800;cursor:pointer;}.inline-turn-editor-actions .submit-edit{background:var(--lc-accent,#8bf5a2);color:var(--lc-accent-text,#061008);}.inline-turn-editor-actions .cancel-edit{background:#253044;color:#dce4f2;}.thinking-dots{display:inline-flex;align-items:center;gap:2px;color:#a3aab8;}.thinking-dots::after{content:\'...\';display:inline-block;min-width:22px;animation:thinkingPulse 1.1s steps(4,end) infinite;}@keyframes thinkingPulse{0%{content:\'\';}25%{content:\'.\';}50%{content:\'..\';}75%,100%{content:\'...\';}}@media (max-width:480px){#scroll{padding:18px 14px 18px;}.message{font-size:14px;padding:12px 13px;}}</style><div id="scroll"><div id="top-spacer"></div><div id="messages"></div><div id="bottom-spacer"></div></div>';
         this.scrollElement = this.shadowRoot.getElementById('scroll');
         this.messageElement = this.shadowRoot.getElementById('messages');
         this.topSpacerElement = this.shadowRoot.getElementById('top-spacer');
         this.bottomSpacerElement = this.shadowRoot.getElementById('bottom-spacer');
+        this.shadowRoot.addEventListener('click', (event) => {
+          const resubmitButton = event.target.closest('[data-resubmit-index]');
+          if (resubmitButton) {
+            this.resubmitWorkbenchMessage(Number(resubmitButton.dataset.resubmitIndex));
+            return;
+          }
+          const beginEditButton = event.target.closest('[data-begin-edit-index]');
+          if (beginEditButton) {
+            this.beginEditResubmitWorkbenchMessage(Number(beginEditButton.dataset.beginEditIndex));
+            return;
+          }
+          const submitEditButton = event.target.closest('[data-submit-edit-index]');
+          if (submitEditButton) {
+            this.submitEditedWorkbenchMessage(Number(submitEditButton.dataset.submitEditIndex));
+            return;
+          }
+          const cancelEditButton = event.target.closest('[data-cancel-edit-index]');
+          if (cancelEditButton) {
+            this.editingIndex = null;
+            this.renderAfterMessageChange();
+            return;
+          }
+          const button = event.target.closest('[data-copy-index]');
+          if (!button) return;
+          this.copyWorkbenchMessage(Number(button.dataset.copyIndex), button);
+        });
         this.scrollElement.addEventListener('scroll', () => {
           this.stickToBottom = this.isAtBottom();
           this.renderForScroll();
@@ -3981,7 +4036,7 @@ __CONTENT__
       }
       appendMessage(kind, label, text) {
         this.clearEphemeralMessages();
-        this.messages.push({kind, label, text});
+        this.messages.push({kind, label, text, createdAt:new Date().toISOString()});
         if (kind === 'user') this.stickToBottom = true;
         this.renderAfterMessageChange();
       }
@@ -3990,7 +4045,7 @@ __CONTENT__
         if (last && last.kind === kind && last.label === label) {
           last.text = String(last.text || '') + String(delta || '');
         } else {
-          this.messages.push({kind, label, text: String(delta || '')});
+          this.messages.push({kind, label, text: String(delta || ''), createdAt:new Date().toISOString()});
         }
         this.renderAfterMessageChange();
       }
@@ -3999,23 +4054,32 @@ __CONTENT__
         if (last && last.pending && last.kind === kind && last.label === label) {
           last.text = text;
         } else {
-          this.messages.push({kind, label, text, pending:true});
+          this.messages.push({kind, label, text, pending:true, streaming:kind === 'assistant', createdAt:new Date().toISOString()});
         }
         this.renderAfterMessageChange();
       }
       replacePendingMessage(kind, label, delta) {
         const last = this.messages[this.messages.length - 1];
-        if (last && last.pending && last.kind === kind && last.label === label) {
-          last.text = String(delta || '');
+        if (last && last.kind === kind && last.label === label && (last.pending || last.streaming)) {
+          last.text = last.pending ? String(delta || '') : String(last.text || '') + String(delta || '');
           last.pending = false;
+          last.streaming = true;
         } else {
           this.appendToLastMessage(kind, label, delta);
           return;
         }
         this.renderAfterMessageChange();
       }
+      completeLastMessage(kind, label) {
+        const last = [...this.messages].reverse().find((message) => message.kind === kind && message.label === label && (message.pending || message.streaming));
+        if (last && last.kind === kind && last.label === label && (last.pending || last.streaming)) {
+          last.pending = false;
+          last.streaming = false;
+          this.renderAfterMessageChange();
+        }
+      }
       setMessages(messages) {
-        this.messages = Array.isArray(messages) ? messages : [];
+        this.messages = Array.isArray(messages) ? messages.map((message) => Object.assign({}, message, {createdAt:message.created_at || message.createdAt || new Date().toISOString()})) : [];
         this.renderWindow(Math.max(0, this.messages.length - this.maxRenderedMessages));
         requestAnimationFrame(() => this.scrollToBottom());
       }
@@ -4052,15 +4116,105 @@ __CONTENT__
         const visible = this.messages.slice(start, start + this.maxRenderedMessages);
         this.topSpacerElement.style.height = String(start * this.rowEstimate) + 'px';
         this.bottomSpacerElement.style.height = String(Math.max(0, this.messages.length - start - visible.length) * this.rowEstimate) + 'px';
-        this.messageElement.innerHTML = visible.map((message) => '<div class="message '+workbenchEscape(message.kind)+(message.pending ? ' pending' : '')+'"><small>'+workbenchEscape(message.label)+'</small><div class="message-body">'+formatAssistantMessage(message)+'</div></div>').join('');
+        const lastCompletedAssistant = this.messages.findLastIndex((message) => message.kind === 'assistant' && !message.pending && !message.streaming && !message.ephemeral);
+        this.messageElement.innerHTML = visible.map((message, index) => this.renderMessage(message, start + index, start + index === lastCompletedAssistant)).join('');
+      }
+      renderMessage(message, index, isLastCompletedAssistant) {
+        const copyable = (message.kind === 'user' || message.kind === 'assistant') && !message.pending && !message.streaming && !message.ephemeral;
+        const copyButton = copyable ? '<button class="copyable-message" title="Copy turn" data-copy-index="'+String(index)+'">'+workbenchIcon('copy')+'</button>' : '';
+        const resubmitButton = copyable && message.kind === 'user' ? '<button class="copyable-message" title="Resubmit turn" data-resubmit-index="'+String(index)+'">'+workbenchIcon('rotate-ccw')+'</button>' : '';
+        const editResubmitButton = copyable && message.kind === 'user' ? '<button class="copyable-message" title="Edit turn" data-begin-edit-index="'+String(index)+'">'+workbenchIcon('pencil')+'</button>' : '';
+        const actions = copyable ? '<div class="message-actions"><div class="message-actions-left">'+copyButton+resubmitButton+editResubmitButton+'<span class="message-timestamp">'+workbenchEscape(formatWorkbenchTurnTime(message.createdAt))+'</span></div></div>' : '';
+        const body = index === this.editingIndex && message.kind === 'user'
+          ? '<div class="inline-turn-editor"><textarea data-edit-value-index="'+String(index)+'">'+workbenchEscape(message.text || '')+'</textarea><div class="inline-turn-editor-actions"><button class="cancel-edit" data-cancel-edit-index="'+String(index)+'">Cancel</button><button class="submit-edit" data-submit-edit-index="'+String(index)+'">Submit</button></div></div>'
+          : message.pending && message.kind === 'assistant' ? '<span class="thinking-dots">Thinking</span>' : formatAssistantMessage(message);
+        return '<div class="message '+workbenchEscape(message.kind)+(message.pending ? ' pending' : '')+(message.streaming ? ' streaming' : '')+(isLastCompletedAssistant ? ' last-completed-assistant' : '')+'"><small>'+workbenchEscape(message.label)+'</small><div class="message-body">'+body+actions+'</div></div>';
+      }
+      async copyWorkbenchMessage(index, button) {
+        const message = this.messages[index];
+        if (!message || message.pending || message.streaming) return;
+        const text = String(message.text || '');
+        try {
+          await navigator.clipboard.writeText(text);
+          if (button) {
+            button.classList.add('copied');
+            button.title = 'Copied';
+            setTimeout(() => {
+              button.classList.remove('copied');
+              button.title = 'Copy turn';
+            }, 1200);
+          }
+        } catch (_) {
+          window.prompt('Copy this turn', text);
+        }
+      }
+      async resubmitWorkbenchMessage(index) {
+        const message = this.messages[index];
+        if (!message || message.kind !== 'user' || message.pending || message.streaming) return;
+        const text = String(message.text || '').trim();
+        if (!text) return;
+        this.editingIndex = null;
+        this.setMessages(this.messages.slice(0, index + 1));
+        workbench.appThreadId = null;
+        workbench.pendingAssistantText = '';
+        workbench.commandOutputChars = 0;
+        try {
+          await ensureWorkbenchConnected();
+          await sendWorkbenchRpcMessage(text, {recordUser:false, appendUser:false});
+        } catch (error) {
+          workbenchMessage('system', 'Resubmit failed', error.message || 'Could not resubmit this turn.');
+        }
+      }
+      beginEditResubmitWorkbenchMessage(index) {
+        const message = this.messages[index];
+        if (!message || message.kind !== 'user' || message.pending || message.streaming) return;
+        this.editingIndex = index;
+        this.renderAfterMessageChange();
+        requestAnimationFrame(() => {
+          const input = this.shadowRoot.querySelector('[data-edit-value-index="'+String(index)+'"]');
+          if (input) {
+            input.focus();
+            input.select();
+          }
+        });
+      }
+      async submitEditedWorkbenchMessage(index) {
+        const message = this.messages[index];
+        if (!message || message.kind !== 'user' || message.pending || message.streaming) return;
+        const input = this.shadowRoot.querySelector('[data-edit-value-index="'+String(index)+'"]');
+        const text = String(input?.value || '').trim();
+        if (!text) return;
+        const nextMessages = this.messages.slice(0, index + 1);
+        nextMessages[index] = Object.assign({}, message, {text, createdAt:new Date().toISOString()});
+        this.editingIndex = null;
+        this.setMessages(nextMessages);
+        workbench.appThreadId = null;
+        workbench.pendingAssistantText = '';
+        workbench.commandOutputChars = 0;
+        try {
+          await ensureWorkbenchConnected();
+          await sendWorkbenchRpcMessage(text, {recordUser:false, appendUser:false});
+        } catch (error) {
+          workbenchMessage('system', 'Edit failed', error.message || 'Could not resubmit this edited turn.');
+        }
       }
     }
     if (!customElements.get('workbench-transcript')) {
       customElements.define('workbench-transcript', WorkbenchTranscript);
     }
-    const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], contextThreadId:null, pendingAssistantText:'' };
+    const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], contextThreadId:null, pendingAssistantText:'', commandOutputChars:0 };
     function workbenchEscape(value) {
       return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    }
+    function formatWorkbenchTurnTime(value) {
+      const date = value ? new Date(value) : new Date();
+      if (Number.isNaN(date.getTime())) return '';
+      const now = new Date();
+      const sameDay = date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate();
+      const time = date.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}).toLowerCase();
+      if (sameDay) return time;
+      // Turn action timestamp examples: "11:31 pm" today, "Jun 8, 11:31 pm" after the day has passed.
+      return date.toLocaleDateString([], {month:'short', day:'numeric'})+', '+time;
     }
     function renderWorkbenchInlineMarkdown(value) {
       return workbenchEscape(value)
@@ -4147,10 +4301,12 @@ __CONTENT__
       const icons = {
         'check': '<path d="M20 6 9 17l-5-5"/>',
         'message-circle': '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+        'copy': '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
         'more-horizontal': '<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
         'panel-left-close': '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/>',
         'pencil': '<path d="M21.2 6.8a2.8 2.8 0 0 0-4-4L4 16v4h4Z"/><path d="m14 5 5 5"/>',
         'plus': '<path d="M5 12h14"/><path d="M12 5v14"/>',
+        'rotate-ccw': '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>',
         'send': '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'
       };
       const body = icons[name] || icons['more-horizontal'];
@@ -4183,7 +4339,8 @@ __CONTENT__
       chat.setMessages((messages || []).map((message) => ({
         kind: message.kind || 'assistant',
         label: message.label || (message.kind === 'user' ? 'You' : 'Codex'),
-        text: message.text || ''
+        text: message.text || '',
+        createdAt:message.created_at || message.createdAt
       })));
       workbench.pendingAssistantText = '';
     }
@@ -4198,7 +4355,7 @@ __CONTENT__
     }
     async function recordWorkbenchThreadMessage(kind, label, text) {
       if (!workbench.sessionId || !text || !String(text).trim()) return;
-      await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages', {kind, label, text});
+      return await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages', {kind, label, text});
     }
     function appendWorkbenchAssistantDelta(delta) {
       if (!delta) return;
@@ -4218,8 +4375,33 @@ __CONTENT__
         workbenchMessage('assistant', 'Codex', 'Thinking...');
       }
     }
+    function completeWorkbenchAssistantTurn() {
+      const chat = document.getElementById('workbench-chat');
+      if (chat && typeof chat.completeLastMessage === 'function') {
+        chat.completeLastMessage('assistant', 'Codex');
+      }
+    }
     function replacePendingAssistantDelta(delta) {
       appendWorkbenchAssistantDelta(delta);
+    }
+    function workbenchTurnGuidance() {
+      const raw = document.getElementById('chat-turn-guidance')?.value || '{}';
+      try {
+        return JSON.parse(raw);
+      } catch (_) {
+        return {};
+      }
+    }
+    function handleWorkbenchCommandOutputDelta(delta) {
+      if (!delta) return;
+      workbench.commandOutputChars += String(delta).length;
+      const chat = document.getElementById('workbench-chat');
+      const text = 'Raw tool output is collapsed in the browser transcript. Codex can use the result, but '+workbench.commandOutputChars+' characters of command output are hidden from chat.';
+      if (chat && typeof chat.appendPendingMessage === 'function') {
+        chat.appendPendingMessage('system', 'Tool output', text);
+      } else {
+        workbenchMessage('system', 'Tool output', text);
+      }
     }
     function setWorkbenchStatus(text, connected) {
       const label = document.getElementById('workbench-status-label');
@@ -4279,6 +4461,53 @@ __CONTENT__
       }));
       renderWorkbenchProjects();
       return session;
+    }
+    function isDefaultWorkbenchThreadTitle(title) {
+      const normalized = String(title || '').trim();
+      return !normalized || normalized === 'New chat thread' || normalized === 'Local Codex Chat';
+    }
+    function deriveWorkbenchThreadTitle(firstUserTurn, firstAssistantTurn) {
+      const combined = [firstUserTurn?.text, firstAssistantTurn?.text]
+        .filter(Boolean)
+        .join(' ')
+        .replace(/https?:\/\/\S+/g, ' ')
+        .replace(/[`*_#>{}\[\]()"']/g, ' ')
+        .replace(/&[a-z]+;/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!combined) return '';
+      const stopWords = new Set(['a','an','and','are','as','at','based','be','but','by','can','codex','do','for','from','have','hello','help','hey','hi','i','if','in','is','it','let','me','of','on','or','our','please','project','repo','repository','should','simple','specific','that','the','their','this','to','we','what','with','work','would','you','your']);
+      const seen = new Set();
+      const words = combined
+        .split(/[^A-Za-z0-9.+-]+/)
+        .map((word) => word.trim())
+        .filter((word) => word.length > 2)
+        .filter((word) => !stopWords.has(word.toLowerCase()))
+        .filter((word) => {
+          const key = word.toLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .slice(0, 6)
+        .map((word) => word.length <= 4 && word === word.toUpperCase() ? word : word.charAt(0).toUpperCase()+word.slice(1).toLowerCase());
+      const title = words.join(' ').trim();
+      if (title.length > 54) return title.slice(0, 51).trim()+'...';
+      return title || 'New chat thread';
+    }
+    async function autoLabelWorkbenchThreadAfterFirstAiTurn() {
+      if (!workbench.sessionId) return;
+      if (!isDefaultWorkbenchThreadTitle(workbench.threadTitle)) return;
+      const chat = document.getElementById('workbench-chat');
+      const messages = Array.isArray(chat?.messages) ? chat.messages.filter((message) => !message.ephemeral) : [];
+      const userTurns = messages.filter((message) => message.kind === 'user');
+      const assistantTurns = messages.filter((message) => message.kind === 'assistant' && !message.pending && !message.streaming);
+      if (userTurns.length !== 1 || assistantTurns.length !== 1) return;
+      const firstUserTurn = userTurns[0];
+      const firstAssistantTurn = assistantTurns[0];
+      const title = deriveWorkbenchThreadTitle(firstUserTurn, firstAssistantTurn);
+      if (!title || isDefaultWorkbenchThreadTitle(title)) return;
+      await renameWorkbenchThread(workbench.sessionId, title);
     }
     async function saveWorkbenchTitleEdit() {
       const input = document.getElementById('workbench-thread-title-input');
@@ -4761,7 +4990,7 @@ __CONTENT__
         clientInfo: {
           name: 'local-codex-enterprise-browser',
           title: 'Local Codex Enterprise Browser Chat',
-          version: '0.0.1-beta.1'
+          version: '0.0.1-beta.3'
         },
         capabilities: {
           experimentalApi: true,
@@ -4810,18 +5039,23 @@ __CONTENT__
           break;
         case 'item/commandExecution/outputDelta':
         case 'command/exec/outputDelta':
-          if (params.delta) workbenchMessage('assistant', 'Command', params.delta);
+          handleWorkbenchCommandOutputDelta(params.delta);
           break;
         case 'turn/started':
           setWorkbenchStatus('working', true);
           workbench.pendingAssistantText = '';
+          workbench.commandOutputChars = 0;
           break;
         case 'turn/completed':
           setWorkbenchStatus('connected to worker', true);
           if (workbench.pendingAssistantText.trim()) {
             const assistantText = workbench.pendingAssistantText;
             workbench.pendingAssistantText = '';
-            recordWorkbenchThreadMessage('assistant', 'Codex', assistantText).catch((error) => {
+            completeWorkbenchAssistantTurn();
+            (async () => {
+              await recordWorkbenchThreadMessage('assistant', 'Codex', assistantText);
+              await autoLabelWorkbenchThreadAfterFirstAiTurn();
+            })().catch((error) => {
               workbenchMessage('system', 'History', 'Could not save Codex reply: '+error.message);
             });
           }
@@ -4837,13 +5071,14 @@ __CONTENT__
           break;
       }
     }
-    async function sendWorkbenchRpcMessage(text) {
+    async function sendWorkbenchRpcMessage(text, options) {
+      const settings = Object.assign({recordUser:true, appendUser:true}, options || {});
       if (!workbench.appThreadId) {
         await startWorkbenchRpcThread();
       }
       const modelText = buildWorkbenchUserPrompt(text);
-      workbenchMessage('user', 'You', text);
-      await recordWorkbenchThreadMessage('user', 'You', text);
+      if (settings.appendUser) workbenchMessage('user', 'You', text);
+      if (settings.recordUser) await recordWorkbenchThreadMessage('user', 'You', text);
       appendWorkbenchAssistantPending();
       await sendWorkbenchRpcRequest('turn/start', {
         threadId: workbench.appThreadId,
@@ -4853,7 +5088,27 @@ __CONTENT__
     }
     function buildWorkbenchUserPrompt(text) {
       if (workbench.repositoryId) return text;
-      return 'Conceptual planning request. This Local Codex project does not currently have a selected repository. Do not inspect repository files unless the user asks to inspect code, modify files, run tests, or analyze a repository. If the user is asking for a concept, plan, architecture, or strategy, answer from the concept described by the user.\\n\\nUser request:\\n'+text;
+      if (isSocialWorkbenchMessage(text)) {
+        return 'Conversational acknowledgement. Reply briefly and naturally. Do not start planning, inspect the repository, mention AGENTS.md, or ask what planning is needed. Do not mention unavailable tools or internal tool names.\\n\\nUser message:\\n'+text;
+      }
+      const guidance = workbenchTurnGuidance();
+      if (!isPlanningWorkbenchMessage(text)) {
+        return 'General chat request. Answer directly and concisely. Do not inspect the repository unless the user explicitly asks about the current codebase. Do not mention unavailable tools or internal tool names. '+(guidance.repository_tool_rule || '')+' '+(guidance.tool_output_rule || '')+'\\n\\nUser request:\\n'+text;
+      }
+      const planning = Array.isArray(guidance.planning_sequence)
+        ? guidance.planning_sequence.map((item, index) => String(index + 1)+'. '+item).join(' ')
+        : '1. business goal 2. users/stakeholders 3. decisions the system must support 4. data sources 5. architecture 6. implementation path';
+      return 'Conceptual planning request. This Local Codex project does not currently have a selected repository. '+(guidance.repository_tool_rule || '')+' '+(guidance.tool_output_rule || '')+' Start planning tasks with: '+planning+'.\\n\\nUser request:\\n'+text;
+    }
+    function isSocialWorkbenchMessage(text) {
+      const normalized = String(text || '').trim().toLowerCase().replace(/[.!?]+$/g, '');
+      if (!normalized) return false;
+      if (/^(thanks|thank you|thx|ty|appreciate it|got it|ok|okay|cool|nice|great|awesome|perfect|sounds good|that works|good deal|yep|yes|no problem|np)(\s+(thanks|thank you|again|codex|sir|man|bro|friend))?$/.test(normalized)) return true;
+      return normalized.length <= 32 && /^(hi|hello|hey|yo|sup|good morning|good afternoon|good evening)$/.test(normalized);
+    }
+    function isPlanningWorkbenchMessage(text) {
+      const normalized = String(text || '').toLowerCase();
+      return /(plan|planning|strategy|architecture|architect|roadmap|design|proposal|approach|requirements|solution|system|workflow|implementation path|business goal|stakeholder|dashboard|portal|app|build|feature|product|project plan)/.test(normalized);
     }
     async function retryWorkbenchMessageOnce(text, firstError) {
       workbenchMessage('system', 'Reconnecting', firstError.message || 'Worker websocket disconnected. Starting a fresh handoff.');
@@ -4965,7 +5220,7 @@ fn admin_overview_page(role: Option<EnterpriseRole>) -> String {
           </section>
           <section>
             <h2>Governed Context</h2>
-            <p>Upload Workflow Context Packs and assign them to users or workspaces.</p>
+            <p>Upload Context Pack operating packages and assign them to users or workspaces.</p>
             <div class="toolbar"><a href="/admin/context-packs">Open Context Packs</a></div>
           </section>
           <section>
@@ -5150,7 +5405,7 @@ fn context_packs_page() -> String {
         r#"
       <section>
         <h2>Context Pack Index</h2>
-        <p class="hint">Workflow Context Packs are instruction/context material only. They do not execute code, alter RBAC, or run governance reasoning.</p>
+        <p class="hint">Context Packs are versioned operating packages for session guidance. They are not Codex skills, executable workflows, RBAC policy, or governance runtimes.</p>
         <div class="toolbar">
           <a href="/admin/context-packs/new">Create Pack</a>
           <a class="secondary" href="/admin/context-packs/import">Import Folder Or Files</a>
@@ -5166,25 +5421,31 @@ fn context_pack_create_page() -> String {
         r#"
       <section>
         <h2>Create Context Pack</h2>
+        <p class="hint">Context Packs are versioned operating packages. They are not Codex skills. Context Packs do not execute workflows, call tools, create sessions, alter RBAC, or run governance reasoning. Canonical files are listed below; custom uppercase Markdown files such as CUSTOM-STANDARD.md can be imported from a folder.</p>
         <label>Name<input id="pack-name" value="Standard Engineering Pack"></label>
         <label>PACK.md<textarea id="pack-manifest">name: Standard Engineering Pack
 version: 1
-required_files:
+required_documents:
 - CALIBRATION.md
 - OPERATING-INSTRUCTIONS.md
 - PROJECT-RULES.md
+- WORKFLOWS.md
 - HANDOFF.md
 - VERIFICATION.md
 - ESCALATION.md
 - CONTEXT.md
+- PROMPTS.md
 load_order:
+- PACK.md
 - CALIBRATION.md
 - OPERATING-INSTRUCTIONS.md
 - PROJECT-RULES.md
+- WORKFLOWS.md
 - HANDOFF.md
 - VERIFICATION.md
 - ESCALATION.md
-- CONTEXT.md</textarea></label>
+- CONTEXT.md
+- PROMPTS.md</textarea></label>
         <label>CALIBRATION.md<textarea id="pack-calibration"># Calibration
 
 Treat the user as the accountable project owner. Preserve their intent, ask for missing context only when needed, and raise concerns with concrete tradeoffs.</textarea></label>
@@ -5194,9 +5455,12 @@ Read the required session-start context, follow repository instructions, keep wo
         <label>PROJECT-RULES.md<textarea id="pack-project-rules"># Project Rules
 
 Respect auth, RBAC, workspace allowlisting, trace receipts, and local-only boundaries. Do not bypass controls to force a task through.</textarea></label>
+        <label>WORKFLOWS.md<textarea id="pack-workflows"># Workflows
+
+Describe task procedures and workflow guidance as inert operating material. Do not define executable workflows, schedules, agents, or tool calls here.</textarea></label>
         <label>HANDOFF.md<textarea id="pack-handoff"># Handoff
 
-Record current status, completed work, open decisions, validation evidence, and next action. Do not include secrets, private examples, prompts, or model outputs.</textarea></label>
+Record current status, completed work, open decisions, validation evidence, and next action. Do not include secrets, private examples, private/runtime prompts, or model outputs.</textarea></label>
         <label>VERIFICATION.md<textarea id="pack-verification"># Verification
 
 Run focused tests for changed behavior, then the relevant package validation. Report exact results and any unverified surfaces.</textarea></label>
@@ -5204,6 +5468,9 @@ Run focused tests for changed behavior, then the relevant package validation. Re
 
 Escalate only when a decision, access boundary, or safety issue cannot be resolved locally. State the minimum needed action and the risk of proceeding.</textarea></label>
         <label>CONTEXT.md<textarea id="pack-context">Follow repository instructions and verify before completion.</textarea></label>
+        <label>PROMPTS.md<textarea id="pack-prompts"># Prompt Templates
+
+Reusable prompt templates may live here as inert text assets. Sessions or schedules choose whether to use a template; templates do not execute by themselves.</textarea></label>
         <button onclick="postJson('/v1/context-packs',{name:v('pack-name'),documents:safeDocumentsFromTextareas()},'/admin/context-packs')">Create Pack</button>
       </section>"#,
     )
@@ -5214,7 +5481,7 @@ fn context_pack_import_page() -> String {
         r#"
       <section>
         <h2>Import Folder Or Files</h2>
-        <p class="hint">Allowed names: PACK.md, CALIBRATION.md, OPERATING-INSTRUCTIONS.md, PROJECT-RULES.md, HANDOFF.md, VERIFICATION.md, ESCALATION.md, CONTEXT.md.</p>
+        <p class="hint">Canonical names: PACK.md, CALIBRATION.md, OPERATING-INSTRUCTIONS.md, PROJECT-RULES.md, WORKFLOWS.md, VERIFICATION.md, HANDOFF.md, ESCALATION.md, CONTEXT.md, PROMPTS.md. Custom uppercase Markdown files such as CUSTOM-STANDARD.md are also allowed.</p>
         <label>Context pack folder or markdown files<input id="pack-files" type="file" accept=".md,text/markdown" multiple webkitdirectory></label>
         <button onclick="createPackFromSelectedFiles()">Import Pack</button>
       </section>"#,
@@ -5332,6 +5599,9 @@ fn chat_page(
 ) -> String {
     let default_workspace_root =
         html_escape(config.default_workspace_root.as_deref().unwrap_or(""));
+    let turn_guidance_json = html_escape(
+        &serde_json::to_string(&turn_guidance_response()).unwrap_or_else(|_| "{}".to_string()),
+    );
     let admin_menu_item = principal
         .filter(|principal| role_has_admin_console(principal.role))
         .map(|_| r#"<a href="/admin">Admin / settings</a>"#.to_string())
@@ -5525,7 +5795,8 @@ fn chat_page(
       <p class="hint">Project utilities will appear here as this surface grows.</p>
       <button class="secondary" onclick="document.getElementById('workbench-utility-modal').close()">Close</button>
     </dialog>
-    <input id="chat-default-workspace-root" type="hidden" value="{default_workspace_root}">"#
+    <input id="chat-default-workspace-root" type="hidden" value="{default_workspace_root}">
+    <input id="chat-turn-guidance" type="hidden" value="{turn_guidance_json}">"#
     )
 }
 
@@ -6034,7 +6305,7 @@ fn demo_context_pack_documents() -> Vec<crate::context_packs::ContextPackDocumen
     vec![
         document(
             "PACK.md",
-            "name: Demo Engineering Context Pack\nversion: 1\nrequired_files:\n- CALIBRATION.md\n- OPERATING-INSTRUCTIONS.md\n- PROJECT-RULES.md\n- HANDOFF.md\n- VERIFICATION.md\n- ESCALATION.md\n- CONTEXT.md\nload_order:\n- CALIBRATION.md\n- OPERATING-INSTRUCTIONS.md\n- PROJECT-RULES.md\n- HANDOFF.md\n- VERIFICATION.md\n- ESCALATION.md\n- CONTEXT.md\n",
+            "name: Demo Engineering Context Pack\nversion: 1\nrequired_documents:\n- CALIBRATION.md\n- OPERATING-INSTRUCTIONS.md\n- PROJECT-RULES.md\n- WORKFLOWS.md\n- HANDOFF.md\n- VERIFICATION.md\n- ESCALATION.md\n- CONTEXT.md\n- PROMPTS.md\nload_order:\n- PACK.md\n- CALIBRATION.md\n- OPERATING-INSTRUCTIONS.md\n- PROJECT-RULES.md\n- WORKFLOWS.md\n- HANDOFF.md\n- VERIFICATION.md\n- ESCALATION.md\n- CONTEXT.md\n- PROMPTS.md\n",
         ),
         document(
             "CALIBRATION.md",
@@ -6049,8 +6320,12 @@ fn demo_context_pack_documents() -> Vec<crate::context_packs::ContextPackDocumen
             "# Project Rules\n\nUse repository instructions as the local source of truth. Do not bypass auth, workspace allowlisting, trace receipts, or safety boundaries to make a task appear complete.\n",
         ),
         document(
+            "WORKFLOWS.md",
+            "# Workflows\n\nDescribe repeatable procedures as guidance only. Context Packs do not execute code, call tools, create sessions, dispatch agents, or trigger schedules.\n",
+        ),
+        document(
             "HANDOFF.md",
-            "# Handoff\n\nRecord current status, completed work, open decisions, validation evidence, and the next concrete action. Do not include private examples, credentials, prompts, or raw model outputs.\n",
+            "# Handoff\n\nRecord current status, completed work, open decisions, validation evidence, and the next concrete action. Do not include private examples, credentials, private/runtime prompts, or raw model outputs.\n",
         ),
         document(
             "VERIFICATION.md",
@@ -6062,7 +6337,11 @@ fn demo_context_pack_documents() -> Vec<crate::context_packs::ContextPackDocumen
         ),
         document(
             "CONTEXT.md",
-            "# Context\n\nThis demo pack represents durable organizational operating context for a governed coding-agent session. It is instruction material only; it does not execute code or make governance decisions.\n",
+            "# Context\n\nThis demo pack represents durable organizational operating context for a governed coding-agent session. It is an operating package, not a Codex skill, workflow engine, or governance runtime.\n",
+        ),
+        document(
+            "PROMPTS.md",
+            "# Prompt Templates\n\nPrompt templates may be reusable text assets. A session or future schedule chooses whether to use one; the template does not execute by itself.\n",
         ),
     ]
 }

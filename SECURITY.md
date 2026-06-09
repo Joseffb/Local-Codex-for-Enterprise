@@ -31,7 +31,7 @@ The enterprise server is responsible for:
 
 The enterprise server must not persist:
 
-- Prompts.
+- Private/runtime prompts.
 - Model outputs.
 - Auth headers.
 - Handoff JWTs.
@@ -42,6 +42,8 @@ The enterprise server must not persist:
 - Private real-life examples.
 
 Receipts are evidence, not reasoning. They record IDs, hashes, outcomes, and redacted metadata only.
+
+Synthetic reusable prompt templates may appear in Context Pack examples. They must not be confused with runtime prompts, private prompts, transcripts, or model outputs, and they must not be stored in receipts or audit metadata.
 
 ## Local Deployment Expectations
 
