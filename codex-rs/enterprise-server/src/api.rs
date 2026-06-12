@@ -12,6 +12,7 @@ use crate::storage::ContextLoadInput;
 use crate::storage::ContextPackAssignmentRecord;
 use crate::storage::ContextPackReceiptRecord;
 use crate::storage::ContextPackRecord;
+use crate::storage::CreateContextPackFileInput;
 use crate::storage::CreateContextPackInput;
 use crate::storage::CreateOutputInput;
 use crate::storage::CreateProjectInput;
@@ -30,6 +31,7 @@ use crate::storage::RepositoryRecord;
 use crate::storage::ResponseFeedbackRecord;
 use crate::storage::SessionMessageRecord;
 use crate::storage::SessionRecord;
+use crate::storage::UpdateContextPackFileInput;
 use crate::storage::UpdateProjectInput;
 use crate::storage::UpdateSessionTitleInput;
 use crate::storage::UpsertResponseFeedbackInput;
@@ -67,6 +69,8 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_uds::UnixStream;
@@ -289,6 +293,39 @@ pub struct ContextPackResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ContextPacksResponse {
     pub packs: Vec<ContextPackRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CreateContextPackFileRequest {
+    pub relative_path: String,
+    pub content_base64: String,
+    pub content_type: Option<String>,
+    pub load_order: Option<i32>,
+    pub required: Option<bool>,
+    pub file_kind: Option<String>,
+    pub loadable: Option<bool>,
+    pub source_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UpdateContextPackFileRequest {
+    pub relative_path: Option<String>,
+    pub content_type: Option<String>,
+    pub load_order: Option<i32>,
+    pub required: Option<bool>,
+    pub file_kind: Option<String>,
+    pub loadable: Option<bool>,
+    pub source_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ContextPackFileResponse {
+    pub file: ContextDocumentRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ContextPackFilesResponse {
+    pub files: Vec<ContextDocumentRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -591,6 +628,23 @@ impl ApiError {
         if message.contains("output owner user not found") || message.contains("output not found") {
             return Self::new(StatusCode::NOT_FOUND, message);
         }
+        if message.contains("context pack file not found")
+            || message.contains("context pack not found")
+        {
+            return Self::new(StatusCode::NOT_FOUND, message);
+        }
+        if message.contains("context pack file path already exists") {
+            return Self::new(StatusCode::CONFLICT, message);
+        }
+        if message.contains("context pack file exceeds 10 MB limit") {
+            return Self::new(StatusCode::PAYLOAD_TOO_LARGE, message);
+        }
+        if message.contains("context pack file path is not allowed")
+            || message.contains("context pack file kind is not allowed")
+            || message.contains("context pack file source type is not allowed")
+        {
+            return Self::new(StatusCode::BAD_REQUEST, message);
+        }
         Self::internal(error)
     }
 }
@@ -646,6 +700,9 @@ async fn healthz() -> Json<HealthResponse> {
         ConsumeWorkerHandoffRequest,
         ConsumeWorkerHandoffResponse,
         ConfigResponse,
+        ContextPackFileResponse,
+        ContextPackFilesResponse,
+        CreateContextPackFileRequest,
         CreateProjectThreadRequest,
         CreateSessionMessageRequest,
         EnterpriseSetupRequest,
@@ -662,6 +719,7 @@ async fn healthz() -> Json<HealthResponse> {
         SessionMessagesResponse,
         SessionsResponse,
         StartWorkerRequest,
+        UpdateContextPackFileRequest,
         UpdateThreadRequest,
         WorkerHandoffResponse,
         WorkerResponse,
@@ -706,6 +764,7 @@ where
         .route("/admin/context-packs", get(page::<S>))
         .route("/admin/context-packs/new", get(page::<S>))
         .route("/admin/context-packs/import", get(page::<S>))
+        .route("/admin/context-packs/files", get(page::<S>))
         .route("/admin/context-packs/assignments", get(page::<S>))
         .route("/admin/outputs", get(page::<S>))
         .route("/chat", get(page::<S>))
@@ -795,6 +854,19 @@ where
         .route(
             "/v1/context-packs",
             get(list_context_packs::<S>).post(create_context_pack::<S>),
+        )
+        .route(
+            "/v1/context-packs/{pack_id}/files",
+            get(list_context_pack_files::<S>).post(create_context_pack_file::<S>),
+        )
+        .route(
+            "/v1/context-packs/{pack_id}/files/{document_id}",
+            axum::routing::patch(update_context_pack_file::<S>)
+                .delete(delete_context_pack_file::<S>),
+        )
+        .route(
+            "/v1/context-packs/{pack_id}/files/{document_id}/download",
+            get(download_context_pack_file::<S>),
         )
         .route(
             "/v1/context-pack-assignments",
@@ -1994,6 +2066,199 @@ where
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(ContextPacksResponse { packs }))
+}
+
+async fn list_context_pack_files<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(pack_id): Path<String>,
+) -> Result<Json<ContextPackFilesResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageContextPacks,
+    )
+    .await?;
+    let files = state
+        .store
+        .list_context_pack_files(&principal, &pack_id)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(ContextPackFilesResponse { files }))
+}
+
+async fn create_context_pack_file<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(pack_id): Path<String>,
+    Json(request): Json<CreateContextPackFileRequest>,
+) -> Result<(StatusCode, Json<ContextPackFileResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageContextPacks,
+    )
+    .await?;
+    let content_bytes = BASE64_STANDARD
+        .decode(request.content_base64.as_bytes())
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "content_base64 is invalid"))?;
+    let file = state
+        .store
+        .create_context_pack_file(
+            &principal,
+            CreateContextPackFileInput {
+                pack_id,
+                relative_path: request.relative_path,
+                content_bytes,
+                content_type: request.content_type,
+                load_order: request.load_order,
+                required: request.required,
+                file_kind: request.file_kind,
+                loadable: request.loadable,
+                source_type: request.source_type,
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_context_pack_file_audit(&state, &trace, &principal, "context_pack.file.add", &file)
+        .await?;
+    Ok((StatusCode::CREATED, Json(ContextPackFileResponse { file })))
+}
+
+async fn update_context_pack_file<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path((pack_id, document_id)): Path<(String, String)>,
+    Json(request): Json<UpdateContextPackFileRequest>,
+) -> Result<Json<ContextPackFileResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageContextPacks,
+    )
+    .await?;
+    let file = state
+        .store
+        .update_context_pack_file(
+            &principal,
+            UpdateContextPackFileInput {
+                pack_id,
+                document_id,
+                relative_path: request.relative_path,
+                content_type: request.content_type,
+                load_order: request.load_order,
+                required: request.required,
+                file_kind: request.file_kind,
+                loadable: request.loadable,
+                source_type: request.source_type,
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_context_pack_file_audit(
+        &state,
+        &trace,
+        &principal,
+        "context_pack.file.update",
+        &file,
+    )
+    .await?;
+    Ok(Json(ContextPackFileResponse { file }))
+}
+
+async fn delete_context_pack_file<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path((pack_id, document_id)): Path<(String, String)>,
+) -> Result<Json<ContextPackFileResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageContextPacks,
+    )
+    .await?;
+    let file = state
+        .store
+        .delete_context_pack_file(&principal, &pack_id, &document_id)
+        .await
+        .map_err(ApiError::storage)?;
+    record_context_pack_file_audit(
+        &state,
+        &trace,
+        &principal,
+        "context_pack.file.remove",
+        &file,
+    )
+    .await?;
+    Ok(Json(ContextPackFileResponse { file }))
+}
+
+async fn download_context_pack_file<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path((pack_id, document_id)): Path<(String, String)>,
+) -> Result<Response, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageContextPacks,
+    )
+    .await?;
+    let file = state
+        .store
+        .get_context_pack_file(&principal, &pack_id, &document_id)
+        .await
+        .map_err(ApiError::storage)?;
+    record_context_pack_file_audit(
+        &state,
+        &trace,
+        &principal,
+        "context_pack.file.download",
+        &file,
+    )
+    .await?;
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        file.filename.replace('"', "")
+    );
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, file.content_type.clone()),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        file.content_bytes,
+    )
+        .into_response())
 }
 
 async fn assign_context_pack<S>(
@@ -3304,6 +3569,37 @@ where
         .map_err(ApiError::internal)
 }
 
+async fn record_context_pack_file_audit<S>(
+    state: &AppState<S>,
+    trace: &TraceContext,
+    principal: &crate::storage::AuthPrincipal,
+    event_type: &str,
+    file: &ContextDocumentRecord,
+) -> Result<(), ApiError>
+where
+    S: EnterpriseStore,
+{
+    record_audit(
+        state,
+        EvidenceRecordContext::new(trace).actor(principal.user_id.clone()),
+        event_type,
+        TraceResult::Completed,
+        serde_json::json!({
+            "pack_id": file.pack_id,
+            "document_id": file.document_id,
+            "relative_path": file.relative_path,
+            "file_kind": file.file_kind,
+            "source_type": file.source_type,
+            "loadable": file.loadable,
+            "is_system_file": file.is_system_file,
+            "file_size_bytes": file.file_size_bytes,
+            "content_hash": file.content_hash,
+            "deleted": file.deleted_at.is_some(),
+        }),
+    )
+    .await
+}
+
 async fn record_execution_receipt<S>(
     state: &AppState<S>,
     context: EvidenceRecordContext,
@@ -3527,6 +3823,7 @@ where
         "/admin/context-packs" => ("Context Packs", context_packs_page()),
         "/admin/context-packs/new" => ("Create Context Pack", context_pack_create_page()),
         "/admin/context-packs/import" => ("Import Context Pack", context_pack_import_page()),
+        "/admin/context-packs/files" => ("Context Pack Files", context_pack_files_page()),
         "/admin/context-packs/assignments" => {
             ("Context Pack Assignments", context_pack_assignments_page())
         }
@@ -3913,6 +4210,76 @@ __CONTENT__
         assignments.map((assignment) => '<tr><td>'+escape(packName.get(assignment.pack_id) || assignment.pack_id)+'</td><td>'+escape(userName.get(assignment.user_id) || 'All users')+'</td><td>'+escape(assignment.workspace_id || 'All workspaces')+'</td><td>'+escape(assignment.assignment_order)+'</td><td>'+escape(assignment.assignment_source)+'</td><td><button class="danger" onclick="deleteJson(&quot;/v1/context-pack-assignments/'+escape(assignment.assignment_id)+'&quot;)">Remove Assignment</button></td></tr>').join('')+
         '</tbody></table>';
     }
+    async function base64FromFile(file) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let binary = '';
+      const chunkSize = 8192;
+      for (let index = 0; index < bytes.length; index += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+      }
+      return btoa(binary);
+    }
+    async function refreshContextPackFiles() {
+      const packId = v('pack-file-pack-select');
+      const target = document.getElementById('context-pack-file-index');
+      if (!target) return;
+      if (!packId) {
+        target.innerHTML = emptyStateHtml('No context pack is selected. Create a Context Pack before registering package files.', '/admin/context-packs/new', 'Create Context Pack');
+        return;
+      }
+      const payload = await fetchJson('/v1/context-packs/'+encodeURIComponent(packId)+'/files').catch((error) => ({files: [], error: error.message}));
+      const files = payload.files || [];
+      if (!files.length) {
+        target.innerHTML = emptyStateHtml('No files are registered for this Context Pack yet. Upload package files or a bundle folder to make the pack portable.', null, null);
+        return;
+      }
+      const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+      target.innerHTML = '<table class="resource-table"><thead><tr><th>Path</th><th>Kind</th><th>Source</th><th>Loadable</th><th>System</th><th>Size</th><th>Hash</th><th>Actions</th></tr></thead><tbody>'+
+        files.map((file) => '<tr><td>'+escape(file.relative_path)+'</td><td>'+escape(file.file_kind)+'</td><td>'+escape(file.source_type)+'</td><td>'+escape(file.loadable)+'</td><td>'+escape(file.is_system_file ? 'system' : 'custom')+'</td><td>'+escape(file.file_size_bytes)+'</td><td><code>'+escape(file.content_hash)+'</code></td><td><a href="/v1/context-packs/'+escape(packId)+'/files/'+escape(file.document_id)+'/download">Download</a> <button onclick="renameContextPackFile(&quot;'+escape(packId)+'&quot;,&quot;'+escape(file.document_id)+'&quot;,&quot;'+escape(file.relative_path)+'&quot;)">Rename</button> <button onclick="toggleContextPackFileLoadable(&quot;'+escape(packId)+'&quot;,&quot;'+escape(file.document_id)+'&quot;,'+(!file.loadable)+')">'+(file.loadable ? 'Disable load' : 'Enable load')+'</button> <button class="danger" onclick="removeContextPackFile(&quot;'+escape(packId)+'&quot;,&quot;'+escape(file.document_id)+'&quot;)">Remove</button></td></tr>').join('')+
+        '</tbody></table>';
+    }
+    async function uploadContextPackFiles() {
+      const packId = v('pack-file-pack-select');
+      const input = document.getElementById('pack-file-input');
+      if (!packId || !input?.files?.length) {
+        document.getElementById('result').textContent = 'Choose a context pack and at least one file.';
+        return;
+      }
+      const kind = v('pack-file-kind');
+      const source = v('pack-file-source') || 'upload';
+      const forceLoadable = document.getElementById('pack-file-loadable')?.checked;
+      let order = Number(v('pack-file-load-order') || 100);
+      for (const file of input.files) {
+        const relativePath = file.webkitRelativePath || file.name;
+        const payload = {
+          relative_path: relativePath,
+          content_base64: await base64FromFile(file),
+          content_type: file.type || undefined,
+          source_type: source,
+          load_order: order
+        };
+        if (kind) payload.file_kind = kind;
+        if (forceLoadable) payload.loadable = true;
+        await postJsonPayload('/v1/context-packs/'+encodeURIComponent(packId)+'/files', payload);
+        order += 1;
+      }
+      await refreshContextPackFiles();
+    }
+    async function renameContextPackFile(packId, documentId, currentPath) {
+      const nextPath = prompt('New relative path', currentPath);
+      if (!nextPath || nextPath === currentPath) return;
+      await patchJsonPayload('/v1/context-packs/'+encodeURIComponent(packId)+'/files/'+encodeURIComponent(documentId), {relative_path: nextPath});
+      await refreshContextPackFiles();
+    }
+    async function toggleContextPackFileLoadable(packId, documentId, loadable) {
+      await patchJsonPayload('/v1/context-packs/'+encodeURIComponent(packId)+'/files/'+encodeURIComponent(documentId), {loadable});
+      await refreshContextPackFiles();
+    }
+    async function removeContextPackFile(packId, documentId) {
+      if (!confirm('Remove this file from future context loads? Historical receipts remain queryable.')) return;
+      await deleteJson('/v1/context-packs/'+encodeURIComponent(packId)+'/files/'+encodeURIComponent(documentId));
+      await refreshContextPackFiles();
+    }
     async function refreshAdminChoices() {
       try {
         const [usersPayload, workspacesPayload, userWorkspacesPayload, projectsPayload, packsPayload, assignmentsPayload, outputsPayload] = await Promise.all([
@@ -3962,12 +4329,14 @@ __CONTENT__
         fillSelect('user-assignment-user-select', users, (user) => user.email, (user) => user.user_id, 'No users available');
         fillSelect('user-pack-select', packs, (pack) => pack.name, (pack) => pack.pack_id, 'No context packs available');
         fillSelect('pack-assignment-pack-select', packs, (pack) => pack.name, (pack) => pack.pack_id, 'No context packs available');
+        fillSelect('pack-file-pack-select', packs, (pack) => pack.name, (pack) => pack.pack_id, 'No context packs available');
         fillSelect('pack-user-select', users, (user) => user.email, (user) => user.user_id, 'No users available');
         fillSelect('output-user-select', users, (user) => user.email+' ('+user.role+')', (user) => user.user_id, 'No users available');
         fillSelect('user-workspace-select', workspaces, (workspace) => workspace.root_path, (workspace) => workspace.root_path, 'No registered workspaces available');
         fillSelect('pack-workspace-select', workspaces, (workspace) => workspace.root_path, (workspace) => workspace.root_path, 'No registered workspaces available');
         setEmptyState('user-empty-state', users.length === 0, 'No users exist yet. Add a user before assigning roles, account status, or user-scoped context.', '/admin/users/new', 'Add user');
         setEmptyState('pack-empty-state', packs.length === 0, 'No context packs exist yet. Create a Context Pack before assigning it to a user.', '/admin/context-packs/new', 'Add Context Pack');
+        setEmptyState('pack-file-empty-state', packs.length === 0, 'No context packs exist yet. Create or import a Context Pack before registering package files.', '/admin/context-packs/new', 'Add Context Pack');
         setEmptyState('context-pack-empty-state', packs.length === 0, 'No context packs exist yet. Create a Context Pack before assigning it.', '/admin/context-packs/new', 'Add Context Pack');
         setEmptyState('workspace-empty-state', workspaces.length === 0, 'No registered workspaces are available. Add a workspace before assigning workspace-scoped context.', '/admin/workspaces/register', 'Add workspace');
         setEmptyState('pack-workspace-empty-state', workspaces.length === 0, 'No registered workspaces are available. Add a workspace before assigning this context pack.', '/admin/workspaces/register', 'Add workspace');
@@ -3975,12 +4344,16 @@ __CONTENT__
         setButtonDisabled('user-pack-assign-submit', disabled);
         disabled = packs.length === 0 || workspaces.length === 0;
         setButtonDisabled('pack-assign-submit', disabled);
+        setButtonDisabled('pack-file-upload-submit', packs.length === 0);
         setButtonDisabled('role-assign-submit', users.length === 0);
         setButtonDisabled('role-remove-submit', users.length === 0);
         setButtonDisabled('output-create-submit', users.length === 0);
         setButtonDisabled('user-status-deactivate-submit', users.length === 0);
         setButtonDisabled('user-status-reactivate-submit', users.length === 0);
         renderUserProjectControls();
+        if (document.getElementById('context-pack-file-index')) {
+          await refreshContextPackFiles();
+        }
       } catch (error) {
         document.getElementById('result').textContent = error.message;
       }
@@ -5234,7 +5607,7 @@ __CONTENT__
         clientInfo: {
           name: 'local-codex-enterprise-browser',
           title: 'Local Codex Enterprise Browser Chat',
-          version: '0.0.1-beta.4'
+          version: '0.0.1-beta.5'
         },
         capabilities: {
           experimentalApi: true,
@@ -5656,10 +6029,11 @@ fn context_packs_page() -> String {
         r#"
       <section>
         <h2>Context Pack Index</h2>
-        <p class="hint">Context Packs are versioned operating packages for session guidance. They are not Codex skills, executable workflows, RBAC policy, or governance runtimes.</p>
+        <p class="hint">Context Packs are versioned lifecycle packages for session guidance. They may include operating documents, reusable templates, outputs, and optional Codex skill files. Importing or loading a pack does not automatically execute skills, run workflows, change RBAC, or run governance reasoning.</p>
         <div class="toolbar">
           <a href="/admin/context-packs/new">Create Pack</a>
           <a class="secondary" href="/admin/context-packs/import">Import Folder Or Files</a>
+          <a class="secondary" href="/admin/context-packs/files">Manage Files</a>
           <a class="secondary" href="/admin/context-packs/assignments">Manage Assignments</a>
         </div>
         <div id="context-pack-index"></div>
@@ -5672,7 +6046,7 @@ fn context_pack_create_page() -> String {
         r#"
       <section>
         <h2>Create Context Pack</h2>
-        <p class="hint">Context Packs are versioned operating packages. They are not Codex skills. Context Packs do not execute workflows, call tools, create sessions, alter RBAC, or run governance reasoning. Canonical files are listed below; custom uppercase Markdown files such as CUSTOM-STANDARD.md can be imported from a folder.</p>
+        <p class="hint">Context Packs are versioned lifecycle packages. They may contain or reference Codex skill files, but a Context Pack is not itself the runtime. Importing or loading a pack does not automatically execute skills, call tools, create sessions, alter RBAC, or run governance reasoning. Canonical files are listed below; custom uppercase Markdown files such as CUSTOM-STANDARD.md can be imported from a folder.</p>
         <label>Name<input id="pack-name" value="Standard Engineering Pack"></label>
         <label>PACK.md<textarea id="pack-manifest">name: Standard Engineering Pack
 version: 1
@@ -5735,6 +6109,28 @@ fn context_pack_import_page() -> String {
         <p class="hint">Canonical names: PACK.md, CALIBRATION.md, OPERATING-INSTRUCTIONS.md, PROJECT-RULES.md, WORKFLOWS.md, VERIFICATION.md, HANDOFF.md, ESCALATION.md, CONTEXT.md, PROMPTS.md. Custom uppercase Markdown files such as CUSTOM-STANDARD.md are also allowed.</p>
         <label>Context pack folder or markdown files<input id="pack-files" type="file" accept=".md,text/markdown" multiple webkitdirectory></label>
         <button onclick="createPackFromSelectedFiles()">Import Pack</button>
+      </section>"#,
+    )
+}
+
+fn context_pack_files_page() -> String {
+    admin_console_page(
+        r#"
+      <section>
+        <h2>Manage Context Pack Files</h2>
+        <p class="hint">Context Pack bundle files may be included but not auto-executed. Stored files are hashed, audited, downloadable package contents; only active loadable text files are injected as session context.</p>
+        <div id="pack-file-empty-state" hidden></div>
+        <label>Context pack<select id="pack-file-pack-select" onchange="refreshContextPackFiles()"></select></label>
+        <label>Files or bundle folder<input id="pack-file-input" type="file" multiple webkitdirectory></label>
+        <label>File kind<select id="pack-file-kind"><option value="">Infer from path</option><option value="document">document</option><option value="bundle">bundle</option><option value="asset">asset</option></select></label>
+        <label>Source type<select id="pack-file-source"><option value="upload">upload</option><option value="manual">manual</option><option value="import">import</option></select></label>
+        <label><input id="pack-file-loadable" type="checkbox"> Force loadable</label>
+        <label>Starting load order<input id="pack-file-load-order" value="100"></label>
+        <button id="pack-file-upload-submit" onclick="uploadContextPackFiles()">Upload/Register Files</button>
+      </section>
+      <section>
+        <h2>Current Files</h2>
+        <div id="context-pack-file-index"></div>
       </section>"#,
     )
 }
@@ -6627,6 +7023,13 @@ fn document(filename: &str, content: &str) -> crate::context_packs::ContextPackD
     crate::context_packs::ContextPackDocumentInput {
         filename: filename.to_string(),
         content: content.to_string(),
+        relative_path: None,
+        content_type: None,
+        load_order: None,
+        required: None,
+        file_kind: None,
+        loadable: None,
+        source_type: None,
     }
 }
 

@@ -3,6 +3,8 @@ use axum::body::to_bytes;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_enterprise_server::api;
 use codex_enterprise_server::auth;
 use codex_enterprise_server::config::EnterpriseConfig;
@@ -2505,6 +2507,430 @@ async fn context_pack_assignment_admin_flow_lists_bulk_assigns_and_removes_witho
 }
 
 #[tokio::test]
+async fn context_pack_file_management_stores_bundle_files_and_filters_context_load_receipts() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    let project = workspace_root.join("project");
+    std::fs::create_dir_all(&project).expect("project workspace");
+    let router = api::build_test_router();
+    let trace_id = Uuid::new_v4().to_string();
+
+    let setup = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        Some(&trace_id),
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "correct horse battery staple",
+            "workspace_roots": [workspace_root]
+        }),
+    )
+    .await;
+    assert_eq!(setup.status, StatusCode::CREATED);
+    let token = setup.json["api_token"].as_str().expect("token").to_string();
+    let owner_user_id = setup.json["owner_user_id"]
+        .as_str()
+        .expect("owner user id")
+        .to_string();
+
+    let pack_id =
+        create_minimal_context_pack(router.clone(), &token, &trace_id, "Bundle Storage Pack").await;
+
+    let skill_file = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/context-packs/{pack_id}/files"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "relative_path": "skills/review/SKILL.md",
+            "content_base64": BASE64_STANDARD.encode("# Review Skill\nUse as inert bundle content.\n"),
+            "content_type": "text/markdown",
+            "file_kind": "bundle",
+            "source_type": "upload"
+        }),
+    )
+    .await;
+    assert_eq!(
+        skill_file.status,
+        StatusCode::CREATED,
+        "{}",
+        skill_file.text
+    );
+    let skill_document_id = skill_file.json["file"]["document_id"]
+        .as_str()
+        .expect("skill document id")
+        .to_string();
+    let skill_hash = skill_file.json["file"]["content_hash"]
+        .as_str()
+        .expect("skill hash")
+        .to_string();
+    assert_eq!(
+        skill_file.json["file"]["relative_path"],
+        "skills/review/SKILL.md"
+    );
+    assert_eq!(skill_file.json["file"]["filename"], "SKILL.md");
+    assert_eq!(skill_file.json["file"]["file_kind"], "bundle");
+    assert_eq!(skill_file.json["file"]["source_type"], "upload");
+    assert_eq!(skill_file.json["file"]["loadable"], true);
+    assert_eq!(skill_file.json["file"]["is_system_file"], false);
+    assert_eq!(skill_file.json["file"]["file_size_bytes"], 44);
+    assert!(skill_hash.starts_with("sha256:"));
+    assert!(!skill_file.text.contains("Use as inert bundle content"));
+
+    let script_file = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/context-packs/{pack_id}/files"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "relative_path": "skills/review/scripts/check.sh",
+            "content_base64": BASE64_STANDARD.encode("#!/bin/sh\necho never executed\n"),
+            "content_type": "text/x-shellscript",
+            "file_kind": "bundle",
+            "source_type": "upload"
+        }),
+    )
+    .await;
+    assert_eq!(
+        script_file.status,
+        StatusCode::CREATED,
+        "{}",
+        script_file.text
+    );
+    let script_document_id = script_file.json["file"]["document_id"]
+        .as_str()
+        .expect("script document id")
+        .to_string();
+    assert_eq!(script_file.json["file"]["loadable"], false);
+    assert!(
+        script_file.json["file"]["content_hash"]
+            .as_str()
+            .expect("script hash")
+            .starts_with("sha256:")
+    );
+
+    let files = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/context-packs/{pack_id}/files"),
+        Some(&token),
+        Some(&trace_id),
+    )
+    .await;
+    assert_eq!(files.status, StatusCode::OK, "{}", files.text);
+    let files_json = files.json["files"].as_array().expect("files");
+    assert!(
+        files_json
+            .iter()
+            .any(|file| file["relative_path"] == "skills/review/SKILL.md")
+    );
+    assert!(
+        files_json
+            .iter()
+            .any(|file| file["relative_path"] == "skills/review/scripts/check.sh")
+    );
+    assert!(!files.text.contains("never executed"));
+
+    let renamed = json_request(
+        router.clone(),
+        "PATCH",
+        &format!("/v1/context-packs/{pack_id}/files/{skill_document_id}"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "relative_path": "skills/review/SKILL-RENAMED.md"
+        }),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.text);
+    assert_eq!(
+        renamed.json["file"]["relative_path"],
+        "skills/review/SKILL-RENAMED.md"
+    );
+    assert_eq!(renamed.json["file"]["content_hash"], skill_hash);
+
+    let registered_workspace = json_request(
+        router.clone(),
+        "POST",
+        "/v1/workspace-roots",
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({ "root_path": project }),
+    )
+    .await;
+    assert_eq!(registered_workspace.status, StatusCode::CREATED);
+    let workspace_id = registered_workspace.json["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let workspace_access = json_request(
+        router.clone(),
+        "POST",
+        "/v1/user-workspace-access-grants",
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "user_id": owner_user_id,
+            "workspace_root": project
+        }),
+    )
+    .await;
+    assert_eq!(
+        workspace_access.status,
+        StatusCode::CREATED,
+        "{}",
+        workspace_access.text
+    );
+
+    let assignment = json_request(
+        router.clone(),
+        "POST",
+        "/v1/context-pack-assignments",
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "pack_id": pack_id,
+            "user_id": owner_user_id,
+            "workspace_id": workspace_id,
+            "assignment_order": 10,
+            "required_session": true,
+            "required_worker": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        assignment.status,
+        StatusCode::CREATED,
+        "{}",
+        assignment.text
+    );
+
+    let session = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "workspace_path": project,
+            "title": "File receipt proof"
+        }),
+    )
+    .await;
+    assert_eq!(session.status, StatusCode::CREATED, "{}", session.text);
+    let session_id = session.json["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let evidence = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/evidence-records?trace_id={trace_id}"),
+        Some(&token),
+        Some(&trace_id),
+    )
+    .await;
+    assert_eq!(evidence.status, StatusCode::OK);
+    let context_receipts = evidence.json["context_receipts"]
+        .as_array()
+        .expect("context receipts");
+    assert!(context_receipts.iter().any(|receipt| {
+        receipt["session_id"] == session_id && receipt["document_id"] == skill_document_id
+    }));
+    assert!(
+        !context_receipts
+            .iter()
+            .any(|receipt| receipt["document_id"] == script_document_id)
+    );
+    assert!(!evidence.text.contains("Review Skill"));
+    assert!(!evidence.text.contains("never executed"));
+
+    let removed = empty_request(
+        router.clone(),
+        "DELETE",
+        &format!("/v1/context-packs/{pack_id}/files/{skill_document_id}"),
+        Some(&token),
+        Some(&trace_id),
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::OK, "{}", removed.text);
+    assert!(removed.json["file"]["deleted_at"].is_string());
+
+    let active_files = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/context-packs/{pack_id}/files"),
+        Some(&token),
+        Some(&trace_id),
+    )
+    .await;
+    assert_eq!(active_files.status, StatusCode::OK);
+    assert!(!active_files.text.contains("SKILL-RENAMED.md"));
+
+    let second_trace_id = Uuid::new_v4().to_string();
+    let second_session = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&token),
+        Some(&second_trace_id),
+        serde_json::json!({
+            "workspace_path": project,
+            "title": "File receipt after delete"
+        }),
+    )
+    .await;
+    assert_eq!(
+        second_session.status,
+        StatusCode::CREATED,
+        "{}",
+        second_session.text
+    );
+    let second_evidence = empty_request(
+        router,
+        "GET",
+        &format!("/v1/evidence-records?trace_id={second_trace_id}"),
+        Some(&token),
+        Some(&second_trace_id),
+    )
+    .await;
+    assert_eq!(second_evidence.status, StatusCode::OK);
+    assert!(!second_evidence.text.contains(&skill_document_id));
+}
+
+#[tokio::test]
+async fn context_pack_file_management_rejects_unsafe_duplicate_large_and_unauthorized_files() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let router = api::build_test_router();
+    let trace_id = Uuid::new_v4().to_string();
+
+    let setup = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        Some(&trace_id),
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "correct horse battery staple",
+            "workspace_roots": [workspace_root]
+        }),
+    )
+    .await;
+    assert_eq!(setup.status, StatusCode::CREATED);
+    let token = setup.json["api_token"].as_str().expect("token").to_string();
+    let pack_id =
+        create_minimal_context_pack(router.clone(), &token, &trace_id, "Path Safety Pack").await;
+
+    let (_viewer_token, _) = create_and_login_user(
+        router.clone(),
+        &token,
+        "viewer@example.com",
+        "viewer password",
+        "viewer",
+    )
+    .await;
+
+    let unauthorized = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/context-packs/{pack_id}/files"),
+        Some(&_viewer_token),
+        Some(&trace_id),
+        serde_json::json!({
+            "relative_path": "safe.md",
+            "content_base64": BASE64_STANDARD.encode("safe")
+        }),
+    )
+    .await;
+    assert_eq!(unauthorized.status, StatusCode::FORBIDDEN);
+
+    for unsafe_path in [
+        "/absolute.md",
+        "../escape.md",
+        "nested/../escape.md",
+        "nested//empty.md",
+        "nested\\.md",
+        ".hidden/file.md",
+        "safe/\u{0007}.md",
+    ] {
+        let rejected = json_request(
+            router.clone(),
+            "POST",
+            &format!("/v1/context-packs/{pack_id}/files"),
+            Some(&token),
+            Some(&trace_id),
+            serde_json::json!({
+                "relative_path": unsafe_path,
+                "content_base64": BASE64_STANDARD.encode("unsafe")
+            }),
+        )
+        .await;
+        assert_eq!(
+            rejected.status,
+            StatusCode::BAD_REQUEST,
+            "{unsafe_path}: {}",
+            rejected.text
+        );
+    }
+
+    let created = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/context-packs/{pack_id}/files"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "relative_path": "docs/SAFE.md",
+            "content_base64": BASE64_STANDARD.encode("safe")
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+
+    let duplicate = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/context-packs/{pack_id}/files"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "relative_path": "docs/SAFE.md",
+            "content_base64": BASE64_STANDARD.encode("duplicate")
+        }),
+    )
+    .await;
+    assert_eq!(duplicate.status, StatusCode::CONFLICT, "{}", duplicate.text);
+
+    let oversized = json_request(
+        router,
+        "POST",
+        &format!("/v1/context-packs/{pack_id}/files"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "relative_path": "docs/LARGE.bin",
+            "content_base64": BASE64_STANDARD.encode(vec![42_u8; 10 * 1024 * 1024 + 1])
+        }),
+    )
+    .await;
+    assert_eq!(
+        oversized.status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "{}",
+        oversized.text
+    );
+}
+
+#[tokio::test]
 async fn demo_data_is_opt_in_idempotent_and_keeps_passwords_out_of_audit() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace_root = temp.path().join("workspaces");
@@ -3414,13 +3840,13 @@ async fn login_page_redirects_home_and_nav_says_home_when_authenticated() {
     assert!(
         chat_with_auth
             .text
-            .contains("Local Codex for Enterprise v0.0.1-beta.4")
+            .contains("Local Codex for Enterprise v0.0.1-beta.5")
     );
     assert!(chat_with_auth.text.contains("Made with Codex"));
     assert!(
         chat_with_auth
             .text
-            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.4</span></div></div>"#)
+            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.5</span></div></div>"#)
     );
     let footer_index = chat_with_auth
         .text
@@ -4455,13 +4881,17 @@ async fn admin_pages_offer_dropdown_assignment_controls_instead_of_manual_ids() 
     assert!(
         pack_create_page
             .text
-            .contains("Context Packs are versioned operating packages")
+            .contains("Context Packs are versioned lifecycle packages")
     );
-    assert!(pack_create_page.text.contains("They are not Codex skills"));
     assert!(
         pack_create_page
             .text
-            .contains("Context Packs do not execute workflows")
+            .contains("They may contain or reference Codex skill files")
+    );
+    assert!(
+        pack_create_page
+            .text
+            .contains("Importing or loading a pack does not automatically execute skills")
     );
     assert!(pack_create_page.text.contains("isContextPackMarkdownFile"));
     assert!(pack_create_page.text.contains("CUSTOM-STANDARD.md"));
@@ -4478,13 +4908,44 @@ async fn admin_pages_offer_dropdown_assignment_controls_instead_of_manual_ids() 
     assert!(packs_page.text.contains("Admin Console"));
     assert!(packs_page.text.contains("Governed Context"));
     assert!(packs_page.text.contains("Context Pack Index"));
-    assert!(packs_page.text.contains("versioned operating packages"));
-    assert!(packs_page.text.contains("not Codex skills"));
+    assert!(packs_page.text.contains("versioned lifecycle packages"));
+    assert!(packs_page.text.contains("optional Codex skill files"));
+    assert!(
+        packs_page
+            .text
+            .contains("does not automatically execute skills")
+    );
     assert!(packs_page.text.contains("context-pack-index"));
     assert!(packs_page.text.contains("/admin/context-packs/new"));
+    assert!(packs_page.text.contains("/admin/context-packs/files"));
     assert!(packs_page.text.contains("/admin/context-packs/assignments"));
     assert!(!packs_page.text.contains("<h2>Create Context Pack</h2>"));
     assert!(!packs_page.text.contains("Refresh Context Packs"));
+
+    let pack_files_page = empty_request(
+        router.clone(),
+        "GET",
+        "/admin/context-packs/files",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(pack_files_page.status, StatusCode::OK);
+    assert!(pack_files_page.text.contains("Manage Context Pack Files"));
+    assert!(pack_files_page.text.contains("pack-file-pack-select"));
+    assert!(pack_files_page.text.contains("pack-file-input"));
+    assert!(pack_files_page.text.contains("uploadContextPackFiles"));
+    assert!(pack_files_page.text.contains("context-pack-file-index"));
+    assert!(pack_files_page.text.contains("renameContextPackFile"));
+    assert!(pack_files_page.text.contains("removeContextPackFile"));
+    assert!(pack_files_page.text.contains("Download"));
+    assert!(
+        pack_files_page
+            .text
+            .contains("bundle files may be included but not auto-executed")
+    );
+    assert!(!pack_files_page.text.contains("<label>Pack ID"));
+    assert!(!pack_files_page.text.contains("<label>Document ID"));
 
     let pack_assignment_page = empty_request(
         router,

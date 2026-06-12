@@ -1,10 +1,10 @@
 # Context Pack Contract
 
-Context Packs are versioned operating packages for Local Codex for Enterprise.
+Context Packs are versioned lifecycle packages for Local Codex for Enterprise.
 
-They are not Codex skills. They are not executable workflows. They are not governance runtimes.
+They are not themselves Codex skills, executable workflows, or governance runtimes.
 
-Context Packs bundle durable operating material that tells Codex what to know and how to operate inside a user, team, project, workspace, or organization.
+Context Packs bundle durable operating material that tells Codex what to know and how to operate inside a user, team, project, workspace, or organization. They may contain or reference Codex skill files as governed package contents, but importing or loading a Context Pack does not automatically execute skills, call tools, create sessions, alter RBAC, or run governance reasoning.
 
 ## Responsibilities
 
@@ -24,6 +24,7 @@ A Context Pack may contain:
 - role expectations
 - team conventions
 - organizational standards
+- optional Codex skill files or skill references
 
 Context Packs answer:
 
@@ -54,6 +55,25 @@ The intended authoring flow is:
 ```text
 Copy Pack -> Edit Pack -> Assign Pack -> Use Pack
 ```
+
+## Stored Files And Loaded Context
+
+Context Packs may store more than Markdown documents. A pack can contain documents, bundle files, assets, templates, scripts, or skill-style file trees as package contents.
+
+Stored files can be hashed, downloaded, audited, and preserved as evidence. Storage does not mean execution.
+
+Only active files marked as loadable participate in session context loading. Loadable files should be text-like operating material such as Markdown, text, JSON, TOML, or YAML. Assets, scripts, binaries, and other non-loadable files may remain in the package for provenance or download, but they are not injected into prompts.
+
+Path safety is part of the contract:
+
+- no absolute paths
+- no traversal such as `..`
+- no empty path segments
+- no backslashes
+- no control characters
+- hidden path segments are blocked by default unless a future explicit policy allows them
+
+Deletion is soft deletion. Removing a file changes future context loading, but historical receipts remain queryable.
 
 ## PACK.md Manifest
 
@@ -182,12 +202,12 @@ Receipts must not store:
 - credentials
 - private secrets
 
-## Why Not Codex Skills
+## Relationship To Codex Skills
 
 Codex skills are runtime capability packages for agent behavior, procedural tool use, or local assistant extensions.
 
-Context Packs are enterprise-owned operating packages. They need user, workspace, project, assignment, receipt, audit, and RBAC surfaces. Those are enterprise control-plane concerns, not local runtime skill installation concerns.
+Context Packs are enterprise-owned lifecycle packages. They need user, workspace, project, assignment, receipt, audit, and RBAC surfaces. Those are enterprise control-plane concerns, not local runtime skill installation concerns.
 
-Local Codex for Enterprise does not use Codex skills for governed operating context because skills do not provide the correct tenancy, assignment, audit, or receipt boundary for this product.
+Local Codex for Enterprise does not treat a Context Pack as a Codex skill because skills alone do not provide the correct tenancy, assignment, audit, or receipt boundary for this product.
 
-Skills can still exist in the underlying Codex ecosystem. They are a different mechanism with a different responsibility.
+Skills can still exist in the underlying Codex ecosystem, and a Context Pack may include or reference skill files. Runtime activation of any included skill must be explicit, auditable, and permissioned. Pack import, assignment, or session loading is not the same as skill execution.

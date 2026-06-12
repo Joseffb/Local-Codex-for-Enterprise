@@ -179,9 +179,25 @@ pub struct ContextDocumentRecord {
     pub document_id: String,
     pub pack_id: String,
     pub filename: String,
+    pub relative_path: String,
+    #[serde(skip_serializing, skip_deserializing)]
+    #[schema(ignore)]
+    pub content_bytes: Vec<u8>,
+    pub content_type: String,
+    pub file_size_bytes: i64,
+    pub file_kind: String,
+    pub loadable: bool,
+    pub is_system_file: bool,
+    pub source_type: String,
     pub content_hash: String,
     pub load_order: i32,
     pub required: bool,
+    #[schema(value_type = String)]
+    pub created_at: DateTime<Utc>,
+    #[schema(value_type = String)]
+    pub updated_at: DateTime<Utc>,
+    #[schema(value_type = Option<String>)]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -275,6 +291,32 @@ pub struct CreateOutputInput {
 pub struct CreateContextPackInput {
     pub name: String,
     pub documents: Vec<ContextPackDocumentInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateContextPackFileInput {
+    pub pack_id: String,
+    pub relative_path: String,
+    pub content_bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    pub load_order: Option<i32>,
+    pub required: Option<bool>,
+    pub file_kind: Option<String>,
+    pub loadable: Option<bool>,
+    pub source_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateContextPackFileInput {
+    pub pack_id: String,
+    pub document_id: String,
+    pub relative_path: Option<String>,
+    pub content_type: Option<String>,
+    pub load_order: Option<i32>,
+    pub required: Option<bool>,
+    pub file_kind: Option<String>,
+    pub loadable: Option<bool>,
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,6 +653,33 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
     ) -> Result<(ContextPackRecord, Vec<ContextDocumentRecord>)>;
     async fn list_context_packs(&self, principal: &AuthPrincipal)
     -> Result<Vec<ContextPackRecord>>;
+    async fn list_context_pack_files(
+        &self,
+        principal: &AuthPrincipal,
+        pack_id: &str,
+    ) -> Result<Vec<ContextDocumentRecord>>;
+    async fn create_context_pack_file(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateContextPackFileInput,
+    ) -> Result<ContextDocumentRecord>;
+    async fn update_context_pack_file(
+        &self,
+        principal: &AuthPrincipal,
+        input: UpdateContextPackFileInput,
+    ) -> Result<ContextDocumentRecord>;
+    async fn delete_context_pack_file(
+        &self,
+        principal: &AuthPrincipal,
+        pack_id: &str,
+        document_id: &str,
+    ) -> Result<ContextDocumentRecord>;
+    async fn get_context_pack_file(
+        &self,
+        principal: &AuthPrincipal,
+        pack_id: &str,
+        document_id: &str,
+    ) -> Result<ContextDocumentRecord>;
     async fn assign_context_pack(
         &self,
         principal: &AuthPrincipal,
@@ -1712,14 +1781,7 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         let documents = validated
             .documents
             .into_iter()
-            .map(|document| ContextDocumentRecord {
-                document_id: Uuid::new_v4().to_string(),
-                pack_id: pack_id.clone(),
-                filename: document.filename,
-                content_hash: document.content_hash,
-                load_order: document.load_order,
-                required: document.required,
-            })
+            .map(|document| context_document_record_from_validated(&pack_id, document))
             .collect::<Vec<_>>();
         state.context_packs.insert(pack_id, pack.clone());
         state.context_documents.extend(documents.clone());
@@ -1734,6 +1796,162 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         let mut packs = state.context_packs.values().cloned().collect::<Vec<_>>();
         packs.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(packs)
+    }
+
+    async fn list_context_pack_files(
+        &self,
+        _principal: &AuthPrincipal,
+        pack_id: &str,
+    ) -> Result<Vec<ContextDocumentRecord>> {
+        let state = self.state.lock().await;
+        if !state.context_packs.contains_key(pack_id) {
+            anyhow::bail!("context pack not found");
+        }
+        let mut documents = state
+            .context_documents
+            .iter()
+            .filter(|document| document.pack_id == pack_id && document.deleted_at.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        documents.sort_by(|left, right| {
+            left.load_order
+                .cmp(&right.load_order)
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        Ok(documents)
+    }
+
+    async fn create_context_pack_file(
+        &self,
+        _principal: &AuthPrincipal,
+        input: CreateContextPackFileInput,
+    ) -> Result<ContextDocumentRecord> {
+        let validated = context_packs::validate_context_pack_file(
+            &input.relative_path,
+            input.content_bytes,
+            input.content_type,
+            input.file_kind,
+            input.loadable,
+            input.source_type,
+            input.load_order,
+            input.required,
+        )?;
+        let mut state = self.state.lock().await;
+        if !state.context_packs.contains_key(&input.pack_id) {
+            anyhow::bail!("context pack not found");
+        }
+        if state.context_documents.iter().any(|document| {
+            document.pack_id == input.pack_id
+                && document.deleted_at.is_none()
+                && document.relative_path == validated.relative_path
+        }) {
+            anyhow::bail!("context pack file path already exists");
+        }
+        let document = context_document_record_from_validated(&input.pack_id, validated);
+        state.context_documents.push(document.clone());
+        Ok(document)
+    }
+
+    async fn update_context_pack_file(
+        &self,
+        _principal: &AuthPrincipal,
+        input: UpdateContextPackFileInput,
+    ) -> Result<ContextDocumentRecord> {
+        let mut state = self.state.lock().await;
+        let index = state
+            .context_documents
+            .iter()
+            .position(|document| {
+                document.pack_id == input.pack_id
+                    && document.document_id == input.document_id
+                    && document.deleted_at.is_none()
+            })
+            .context("context pack file not found")?;
+        if let Some(relative_path) = input.relative_path {
+            let relative_path = context_packs::validate_relative_path(&relative_path)?;
+            if state.context_documents.iter().any(|document| {
+                document.pack_id == input.pack_id
+                    && document.document_id != input.document_id
+                    && document.deleted_at.is_none()
+                    && document.relative_path == relative_path
+            }) {
+                anyhow::bail!("context pack file path already exists");
+            }
+            let filename = PathBuf::from(&relative_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .context("context pack file path is not allowed")?
+                .to_string();
+            state.context_documents[index].filename = filename;
+            state.context_documents[index].relative_path = relative_path.clone();
+            state.context_documents[index].is_system_file =
+                context_packs::is_system_file(&relative_path);
+        }
+        if let Some(content_type) = input.content_type {
+            state.context_documents[index].content_type = content_type;
+        }
+        if let Some(load_order) = input.load_order {
+            state.context_documents[index].load_order = load_order;
+        }
+        if let Some(required) = input.required {
+            state.context_documents[index].required = required;
+        }
+        if let Some(file_kind) = input.file_kind {
+            state.context_documents[index].file_kind = context_packs::normalize_file_kind(
+                Some(&file_kind),
+                &state.context_documents[index].relative_path,
+            )?;
+        }
+        if let Some(loadable) = input.loadable {
+            state.context_documents[index].loadable = loadable;
+        }
+        if let Some(source_type) = input.source_type {
+            state.context_documents[index].source_type =
+                context_packs::normalize_source_type(Some(&source_type))?;
+        }
+        state.context_documents[index].updated_at = Utc::now();
+        Ok(state.context_documents[index].clone())
+    }
+
+    async fn delete_context_pack_file(
+        &self,
+        _principal: &AuthPrincipal,
+        pack_id: &str,
+        document_id: &str,
+    ) -> Result<ContextDocumentRecord> {
+        let mut state = self.state.lock().await;
+        let document = state
+            .context_documents
+            .iter_mut()
+            .find(|document| {
+                document.pack_id == pack_id
+                    && document.document_id == document_id
+                    && document.deleted_at.is_none()
+            })
+            .context("context pack file not found")?;
+        let now = Utc::now();
+        document.deleted_at = Some(now);
+        document.updated_at = now;
+        Ok(document.clone())
+    }
+
+    async fn get_context_pack_file(
+        &self,
+        _principal: &AuthPrincipal,
+        pack_id: &str,
+        document_id: &str,
+    ) -> Result<ContextDocumentRecord> {
+        let state = self.state.lock().await;
+        state
+            .context_documents
+            .iter()
+            .find(|document| {
+                document.pack_id == pack_id
+                    && document.document_id == document_id
+                    && document.deleted_at.is_none()
+            })
+            .cloned()
+            .context("context pack file not found")
     }
 
     async fn assign_context_pack(
@@ -1827,7 +2045,11 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             let documents = state
                 .context_documents
                 .iter()
-                .filter(|document| document.pack_id == assignment.pack_id)
+                .filter(|document| {
+                    document.pack_id == assignment.pack_id
+                        && document.deleted_at.is_none()
+                        && document.loadable
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             for document in documents {
@@ -3165,13 +3387,21 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         for document in validated.documents {
             let row = sqlx::query(
                 "INSERT INTO enterprise_context_documents
-                 (document_id, pack_id, filename, content_hash, load_order, required)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 RETURNING document_id::text, pack_id::text, filename, content_hash, load_order, required",
+                 (document_id, pack_id, filename, relative_path, content_bytes, content_type, file_size_bytes, file_kind, loadable, is_system_file, source_type, content_hash, load_order, required)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 RETURNING document_id::text, pack_id::text, filename, relative_path, content_bytes, content_type, file_size_bytes, file_kind, loadable, is_system_file, source_type, content_hash, load_order, required, created_at, updated_at, deleted_at",
             )
             .bind(Uuid::new_v4())
             .bind(pack_id)
             .bind(document.filename)
+            .bind(document.relative_path)
+            .bind(document.content_bytes)
+            .bind(document.content_type)
+            .bind(document.file_size_bytes)
+            .bind(document.file_kind)
+            .bind(document.loadable)
+            .bind(document.is_system_file)
+            .bind(document.source_type)
             .bind(document.content_hash)
             .bind(document.load_order)
             .bind(document.required)
@@ -3197,6 +3427,193 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .await
         .context("list context packs")?;
         rows.into_iter().map(context_pack_from_row).collect()
+    }
+
+    async fn list_context_pack_files(
+        &self,
+        _principal: &AuthPrincipal,
+        pack_id: &str,
+    ) -> Result<Vec<ContextDocumentRecord>> {
+        let rows = sqlx::query(
+            "SELECT document_id::text, pack_id::text, filename, relative_path, content_bytes, content_type, file_size_bytes, file_kind, loadable, is_system_file, source_type, content_hash, load_order, required, created_at, updated_at, deleted_at
+             FROM enterprise_context_documents
+             WHERE pack_id = $1 AND deleted_at IS NULL
+             ORDER BY load_order, relative_path",
+        )
+        .bind(Uuid::parse_str(pack_id).context("parse context pack id")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("list context pack files")?;
+        rows.into_iter().map(context_document_from_row).collect()
+    }
+
+    async fn create_context_pack_file(
+        &self,
+        _principal: &AuthPrincipal,
+        input: CreateContextPackFileInput,
+    ) -> Result<ContextDocumentRecord> {
+        let validated = context_packs::validate_context_pack_file(
+            &input.relative_path,
+            input.content_bytes,
+            input.content_type,
+            input.file_kind,
+            input.loadable,
+            input.source_type,
+            input.load_order,
+            input.required,
+        )?;
+        let pack_id = Uuid::parse_str(&input.pack_id).context("parse context pack id")?;
+        let duplicate = sqlx::query(
+            "SELECT 1 FROM enterprise_context_documents
+             WHERE pack_id = $1 AND relative_path = $2 AND deleted_at IS NULL",
+        )
+        .bind(pack_id)
+        .bind(&validated.relative_path)
+        .fetch_optional(&self.pool)
+        .await
+        .context("check context pack file duplicate")?;
+        if duplicate.is_some() {
+            anyhow::bail!("context pack file path already exists");
+        }
+        let row = sqlx::query(
+            "INSERT INTO enterprise_context_documents
+             (document_id, pack_id, filename, relative_path, content_bytes, content_type, file_size_bytes, file_kind, loadable, is_system_file, source_type, content_hash, load_order, required)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             RETURNING document_id::text, pack_id::text, filename, relative_path, content_bytes, content_type, file_size_bytes, file_kind, loadable, is_system_file, source_type, content_hash, load_order, required, created_at, updated_at, deleted_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(pack_id)
+        .bind(validated.filename)
+        .bind(validated.relative_path)
+        .bind(validated.content_bytes)
+        .bind(validated.content_type)
+        .bind(validated.file_size_bytes)
+        .bind(validated.file_kind)
+        .bind(validated.loadable)
+        .bind(validated.is_system_file)
+        .bind(validated.source_type)
+        .bind(validated.content_hash)
+        .bind(validated.load_order)
+        .bind(validated.required)
+        .fetch_one(&self.pool)
+        .await
+        .context("insert context pack file")?;
+        context_document_from_row(row)
+    }
+
+    async fn update_context_pack_file(
+        &self,
+        principal: &AuthPrincipal,
+        input: UpdateContextPackFileInput,
+    ) -> Result<ContextDocumentRecord> {
+        let mut current = self
+            .get_context_pack_file(principal, &input.pack_id, &input.document_id)
+            .await?;
+        if let Some(relative_path) = input.relative_path {
+            let relative_path = context_packs::validate_relative_path(&relative_path)?;
+            let duplicate = sqlx::query(
+                "SELECT 1 FROM enterprise_context_documents
+                 WHERE pack_id = $1 AND document_id <> $2 AND relative_path = $3 AND deleted_at IS NULL",
+            )
+            .bind(Uuid::parse_str(&input.pack_id).context("parse context pack id")?)
+            .bind(Uuid::parse_str(&input.document_id).context("parse context document id")?)
+            .bind(&relative_path)
+            .fetch_optional(&self.pool)
+            .await
+            .context("check context pack file duplicate")?;
+            if duplicate.is_some() {
+                anyhow::bail!("context pack file path already exists");
+            }
+            current.filename = PathBuf::from(&relative_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .context("context pack file path is not allowed")?
+                .to_string();
+            current.relative_path = relative_path;
+            current.is_system_file = context_packs::is_system_file(&current.relative_path);
+        }
+        if let Some(content_type) = input.content_type {
+            current.content_type = content_type;
+        }
+        if let Some(load_order) = input.load_order {
+            current.load_order = load_order;
+        }
+        if let Some(required) = input.required {
+            current.required = required;
+        }
+        if let Some(file_kind) = input.file_kind {
+            current.file_kind =
+                context_packs::normalize_file_kind(Some(&file_kind), &current.relative_path)?;
+        }
+        if let Some(loadable) = input.loadable {
+            current.loadable = loadable;
+        }
+        if let Some(source_type) = input.source_type {
+            current.source_type = context_packs::normalize_source_type(Some(&source_type))?;
+        }
+        let row = sqlx::query(
+            "UPDATE enterprise_context_documents
+             SET filename = $3, relative_path = $4, content_type = $5, file_kind = $6, loadable = $7, is_system_file = $8, source_type = $9, load_order = $10, required = $11, updated_at = now()
+             WHERE pack_id = $1 AND document_id = $2 AND deleted_at IS NULL
+             RETURNING document_id::text, pack_id::text, filename, relative_path, content_bytes, content_type, file_size_bytes, file_kind, loadable, is_system_file, source_type, content_hash, load_order, required, created_at, updated_at, deleted_at",
+        )
+        .bind(Uuid::parse_str(&input.pack_id).context("parse context pack id")?)
+        .bind(Uuid::parse_str(&input.document_id).context("parse context document id")?)
+        .bind(current.filename)
+        .bind(current.relative_path)
+        .bind(current.content_type)
+        .bind(current.file_kind)
+        .bind(current.loadable)
+        .bind(current.is_system_file)
+        .bind(current.source_type)
+        .bind(current.load_order)
+        .bind(current.required)
+        .fetch_optional(&self.pool)
+        .await
+        .context("update context pack file")?
+        .context("context pack file not found")?;
+        context_document_from_row(row)
+    }
+
+    async fn delete_context_pack_file(
+        &self,
+        _principal: &AuthPrincipal,
+        pack_id: &str,
+        document_id: &str,
+    ) -> Result<ContextDocumentRecord> {
+        let row = sqlx::query(
+            "UPDATE enterprise_context_documents
+             SET deleted_at = now(), updated_at = now()
+             WHERE pack_id = $1 AND document_id = $2 AND deleted_at IS NULL
+             RETURNING document_id::text, pack_id::text, filename, relative_path, content_bytes, content_type, file_size_bytes, file_kind, loadable, is_system_file, source_type, content_hash, load_order, required, created_at, updated_at, deleted_at",
+        )
+        .bind(Uuid::parse_str(pack_id).context("parse context pack id")?)
+        .bind(Uuid::parse_str(document_id).context("parse context document id")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("delete context pack file")?
+        .context("context pack file not found")?;
+        context_document_from_row(row)
+    }
+
+    async fn get_context_pack_file(
+        &self,
+        _principal: &AuthPrincipal,
+        pack_id: &str,
+        document_id: &str,
+    ) -> Result<ContextDocumentRecord> {
+        let row = sqlx::query(
+            "SELECT document_id::text, pack_id::text, filename, relative_path, content_bytes, content_type, file_size_bytes, file_kind, loadable, is_system_file, source_type, content_hash, load_order, required, created_at, updated_at, deleted_at
+             FROM enterprise_context_documents
+             WHERE pack_id = $1 AND document_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(Uuid::parse_str(pack_id).context("parse context pack id")?)
+        .bind(Uuid::parse_str(document_id).context("parse context document id")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("get context pack file")?
+        .context("context pack file not found")?;
+        context_document_from_row(row)
     }
 
     async fn assign_context_pack(
@@ -3300,6 +3717,8 @@ impl EnterpriseStore for PostgresEnterpriseStore {
              WHERE a.required_worker = true
                AND (a.user_id IS NULL OR a.user_id = $1)
                AND (a.workspace_id IS NULL OR a.workspace_id = $2)
+               AND d.deleted_at IS NULL
+               AND d.loadable = true
              ORDER BY a.assignment_order, d.load_order"
         } else {
             "SELECT a.pack_id::text, a.assignment_source, a.assignment_order,
@@ -3309,6 +3728,8 @@ impl EnterpriseStore for PostgresEnterpriseStore {
              WHERE a.required_session = true
                AND (a.user_id IS NULL OR a.user_id = $1)
                AND (a.workspace_id IS NULL OR a.workspace_id = $2)
+               AND d.deleted_at IS NULL
+               AND d.loadable = true
              ORDER BY a.assignment_order, d.load_order"
         };
         let rows = sqlx::query(sql)
@@ -4036,9 +4457,20 @@ fn context_document_from_row(row: sqlx::postgres::PgRow) -> Result<ContextDocume
         document_id: row.try_get("document_id")?,
         pack_id: row.try_get("pack_id")?,
         filename: row.try_get("filename")?,
+        relative_path: row.try_get("relative_path")?,
+        content_bytes: row.try_get("content_bytes")?,
+        content_type: row.try_get("content_type")?,
+        file_size_bytes: row.try_get("file_size_bytes")?,
+        file_kind: row.try_get("file_kind")?,
+        loadable: row.try_get("loadable")?,
+        is_system_file: row.try_get("is_system_file")?,
+        source_type: row.try_get("source_type")?,
         content_hash: row.try_get("content_hash")?,
         load_order: row.try_get("load_order")?,
         required: row.try_get("required")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        deleted_at: row.try_get("deleted_at")?,
     })
 }
 
@@ -4309,6 +4741,32 @@ fn assignment_matches(
             .workspace_id
             .as_ref()
             .is_none_or(|assigned_workspace| assigned_workspace == workspace_id)
+}
+
+fn context_document_record_from_validated(
+    pack_id: &str,
+    document: context_packs::ValidatedContextDocument,
+) -> ContextDocumentRecord {
+    let now = Utc::now();
+    ContextDocumentRecord {
+        document_id: Uuid::new_v4().to_string(),
+        pack_id: pack_id.to_string(),
+        filename: document.filename,
+        relative_path: document.relative_path,
+        content_bytes: document.content_bytes,
+        content_type: document.content_type,
+        file_size_bytes: document.file_size_bytes,
+        file_kind: document.file_kind,
+        loadable: document.loadable,
+        is_system_file: document.is_system_file,
+        source_type: document.source_type,
+        content_hash: document.content_hash,
+        load_order: document.load_order,
+        required: document.required,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    }
 }
 
 fn ensure_user_workspace_record(

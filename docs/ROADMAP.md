@@ -20,6 +20,12 @@ This roadmap tracks public product direction for Local Codex for Enterprise. It 
   - remove projects
   - view repositories and threads by project
 - Add clearer repository management inside project menus.
+- Expand Context Pack file management after the first stored-file slice.
+  - Admins can create, upload, register, rename, download, and soft-remove pack files after a pack exists.
+  - Arbitrary file types may be stored as package contents, but paths must remain safe and portable.
+  - Only active loadable text files are loaded into session context; assets, scripts, and non-loadable files remain stored evidence/package contents.
+  - Skill files may be included or referenced as package contents, but importing a file must not activate or execute the skill.
+  - Registration and context loading should preserve receipts so future sessions prove exactly which loadable files were loaded.
 - Add first-class project CRUD views to the admin UI while preserving the REST API contract.
 - Improve browser-worker connection diagnostics so failed handoff, app-server, and model-call states are obvious to users.
 - Expand demo data to cover user workspace, project, repository, thread, context pack, output, and audit use cases.
@@ -29,7 +35,7 @@ This roadmap tracks public product direction for Local Codex for Enterprise. It 
 
 Scheduled sessions are planned, but they are not part of the current project/thread cleanup run.
 
-The architectural decision is that automation is implemented as scheduled sessions. A scheduler creates sessions on behalf of a user according to a schedule definition. The scheduler does not execute Context Packs directly, and Context Packs remain operating packages only.
+The architectural decision is that automation is implemented as scheduled sessions. A scheduler creates sessions on behalf of a user according to a schedule definition. The scheduler does not execute Context Packs directly. Context Packs are loaded into the scheduled session, and the session executes work through the existing worker lifecycle.
 
 Everything that can be represented as a session should be a session. Interactive use is a user-created session. Automation is a scheduler-created session. Both share the same workers, traces, receipts, audits, Context Pack loading, and execution lifecycle.
 
@@ -38,22 +44,21 @@ Conceptual lifecycle:
 ```text
 Schedule
   -> creates session
-  -> supplies task prompt
-  -> loads assigned Context Packs
+  -> loads Context Packs
   -> starts worker
-  -> runs Codex task
-  -> produces artifact/output
+  -> executes prompt/template
+  -> produces artifacts
   -> records receipts
 ```
 
 Responsibility split:
 
-- Context Pack = versioned operating package for knowledge, rules, calibration, handoffs, operating guidance, workflow guidance, reusable prompt templates, and project context.
+- Context Pack = versioned lifecycle package for knowledge, rules, calibration, handoffs, operating guidance, workflow guidance, reusable prompt templates, project context, outputs, and optional skill files or references.
 - Schedule = trigger, owner, target scope, cadence, and enabled/disabled state.
 - Prompt = task instruction for what Codex should do during the scheduled session.
 - Session = execution boundary that combines the prompt and assigned Context Packs.
 
-Example uses include weekly architecture review, daily repository audit, dependency/security review, documentation refresh, executive reporting, Power BI analysis, Salesforce analysis, and RAG maintenance jobs.
+Example uses include weekly executive reports, daily job application runs, weekly architecture review, security audit, documentation refresh, inventory analysis, sales reporting, dependency/security review, Power BI analysis, Salesforce analysis, and RAG maintenance jobs.
 
 Minimal design direction:
 
@@ -71,15 +76,23 @@ Minimal design direction:
 
 Hard boundary:
 
-- Context Packs remain versioned operating packages: instructions, knowledge, calibration, handoffs, operating rules, workflow guidance, verification guidance, reusable prompt templates, and project context.
+- Context Packs remain versioned lifecycle packages: instructions, knowledge, calibration, handoffs, operating rules, workflow guidance, verification guidance, reusable prompt templates, project context, outputs, and optional skill files or references.
 - Context Packs answer what Codex should know and how Codex should operate in a user, team, project, workspace, or organization.
 - Schedules answer when a task should run, who it runs for, and what scope it targets.
 - Prompts answer what Codex should do.
 - Context Packs do not execute code, trigger actions, call MCP tools, create sessions, create workers, create agents, alter RBAC, perform governance reasoning, or function as workflow definitions.
-- Context Packs are not Codex skills. Skills are runtime capability packages; Context Packs are enterprise operating packages with assignment, audit, receipt, tenancy, and RBAC surfaces.
+- Context Packs are not themselves Codex skills. Skills are runtime capability packages; Context Packs are enterprise lifecycle packages with assignment, audit, receipt, tenancy, and RBAC surfaces.
+- Context Packs may include or reference Codex skill files as governed package contents. Runtime activation of any included skill must be explicit, auditable, and permissioned.
 - Execution prompts are not stored inside Context Packs as the thing that runs. They belong to scheduled sessions, or to a schedule-owned reference to an inert reusable template.
 - Scheduled sessions do not introduce a workflow engine, automation runtime, pack execution engine, agent orchestration framework, approval workflow engine, Fernain bridge, policy reasoning engine, committee runtime, or generalized governance system.
 - The goal is to extend the existing session architecture, not create a second execution architecture.
+
+Acceptance criteria:
+
+- Scheduled automation is implemented as scheduled sessions.
+- Context Packs are loaded by sessions and never executed directly.
+- Interactive and scheduled sessions use the same worker, context loading, audit, trace, and receipt architecture.
+- No workflow engine, governance runtime, or agent orchestration framework is introduced.
 
 Deferred scheduled-session details:
 
@@ -90,6 +103,96 @@ Deferred scheduled-session details:
 - SIEM export.
 - Approval gates.
 - Fernain compatibility export.
+
+## Planned: Cross-Thread Knowledge Transfer
+
+Cross-thread knowledge transfer is planned for recurring reporting, long-running project work, and cases where a user needs work from one thread available in another thread. The goal is knowledge continuity, not agent-to-agent autonomy.
+
+Problem examples:
+
+- Read thread XYZ and summarize it.
+- Read the latest report thread and discuss the findings.
+- Use conclusions from architecture thread A in implementation thread B.
+
+Core decision:
+
+- Implement thread references, thread summaries, and thread artifacts before implementing thread messaging.
+- Focus on knowledge transfer, not agent communication.
+- Keep execution session-based.
+
+Initial capabilities:
+
+- Thread reference: read an existing thread by explicit user action.
+- Thread summary: summarize an existing thread into decisions, findings, action items, and open questions.
+- Thread artifact import: import reports, reviews, findings, or handoffs from another thread.
+- Thread handoff: create a handoff from thread A and use that handoff in thread B.
+
+Conceptual flows:
+
+```text
+Scheduled report thread
+  -> produces report artifact
+  -> interactive discussion thread
+  -> reads report artifact
+  -> performs analysis
+```
+
+```text
+Architecture thread
+  -> produces handoff
+  -> implementation thread
+```
+
+Future capability:
+
+- Sending a prompt to another thread may be evaluated only after references, summaries, handoffs, and artifacts prove useful.
+- Cross-thread prompting must remain heavily audited because it introduces execution across thread boundaries.
+
+Guiding principle:
+
+- Threads are knowledge containers.
+- Artifacts, summaries, and handoffs move knowledge between threads.
+- Execution remains session-based.
+- Schedules create sessions.
+- Context Packs guide sessions.
+- Receipts prove what happened.
+
+Acceptance criteria:
+
+- Thread summaries can be generated from existing threads.
+- Artifacts can be imported between threads.
+- Handoffs can move knowledge between threads.
+- Audit and receipt systems record cross-thread references.
+- No workflow engine, governance runtime, or agent orchestration framework is introduced.
+
+## Planned: Additional Model Provider Adapters
+
+Local Codex for Enterprise should remain local-first by default while allowing explicitly configured cloud or external model providers. The provider roadmap should extend the existing adapter approach instead of coupling the control plane to any one model vendor.
+
+Planned adapter sequence:
+
+1. Add a Gemini OpenAI-compatible provider path.
+   - Reuse the existing `chat_completions` wire adapter where possible.
+   - Treat this as the fastest validation path for Gemini support.
+   - Keep it explicitly configured; do not make it a fallback or default.
+
+2. Add a native Claude Messages adapter.
+   - Introduce a dedicated Claude/Anthropic wire API instead of forcing Claude through the OpenAI-compatible adapter.
+   - Translate Codex internal requests/events into Claude Messages API requests and streamed events.
+   - Support system/developer context, user and assistant messages, tool schemas, tool-use blocks, tool results, text deltas, stop reasons, and usage metadata.
+   - Keep Claude explicitly configured; do not add hidden cloud fallback.
+
+3. Add a native Gemini adapter only if the OpenAI-compatible path proves limiting.
+   - Candidate reasons include tool/function-call edge cases, multimodal support, long-context behavior, native streaming differences, or provider-specific safety/usage metadata.
+   - Prefer keeping Gemini on the generic chat-completions path until there is a concrete product reason to add a second adapter.
+
+Provider boundary:
+
+- Docker Model Runner and Docker Model Gateway remain the default local-first provider path.
+- Cloud providers are opt-in only.
+- Provider adapters must preserve the Local-Only Contract: no OpenAI, Anthropic, Google, or other outbound model calls unless the user explicitly configures/selects that provider.
+- Provider adapters should translate provider-specific wire formats into the existing Codex session, worker, trace, audit, and receipt model.
+- Provider support is not model training, preference learning, or governance reasoning.
 
 ## Later Work
 

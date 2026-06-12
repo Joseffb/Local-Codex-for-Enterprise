@@ -4,6 +4,8 @@ Local Codex for Enterprise is a community fork and self-hosted enterprise extens
 
 This repository is not affiliated with, endorsed by, or supported by OpenAI. It is derived from the open-source OpenAI Codex project and preserves the upstream Apache-2.0 license and attribution.
 
+Current beta: `0.0.1-beta.5`.
+
 ## What This Is
 
 - A local-first Codex fork for Docker Model Runner and Docker Model Gateway.
@@ -417,9 +419,11 @@ Both use `wire_api = "chat_completions"`.
 
 ## Context Packs
 
-Context Packs are versioned operating packages that bundle project knowledge, operating instructions, workflows, procedures, checklists, calibration, handoffs, verification guidance, escalation guidance, and reusable prompt templates. They are loaded into sessions to guide Codex behavior and produce receipts proving which operating package influenced the run.
+Context Packs are versioned lifecycle packages that bundle project knowledge, operating instructions, workflows, procedures, checklists, calibration, handoffs, verification guidance, escalation guidance, reusable prompt templates, outputs, and optional Codex skill files or references. They are loaded into sessions to guide Codex behavior and produce receipts proving which package influenced the run.
 
-Context Packs are not Codex skills. Codex skills are runtime capability packages for agent behavior or tool use. Context Packs are enterprise-owned operating packages with user, workspace, project, assignment, receipt, audit, and RBAC surfaces.
+Context Packs are not themselves Codex skills. Codex skills are runtime capability packages for agent behavior or tool use. Context Packs are enterprise-owned lifecycle packages with user, workspace, project, assignment, receipt, audit, and RBAC surfaces. A pack may include or reference skill files, but importing, assigning, or loading a pack does not automatically execute skills, call tools, create sessions, alter RBAC, or run governance reasoning.
+
+Context Packs distinguish stored files from loaded context. Stored files can be hashed, downloaded, audited, and preserved as package contents. Only active loadable text files are injected as session context; assets, scripts, binaries, and other non-loadable files remain package evidence and are not executed.
 
 See [docs/context-pack-contract.md](docs/context-pack-contract.md) for the authoritative Context Pack contract.
 
@@ -448,7 +452,7 @@ Hard boundary:
 - Packs do not create agents.
 - Packs do not alter RBAC.
 - Packs do not perform governance reasoning.
-- Packs do not function as workflow engines or Codex skills.
+- Packs do not function as workflow engines or runtime skills.
 
 See [docs/examples/context-pack-basic](docs/examples/context-pack-basic) for a safe synthetic example.
 
@@ -509,7 +513,7 @@ The demo covers Compose startup, `/healthz`, browser login, session creation, wo
 
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled sessions are listed there as deferred functionality that reuses the existing session, worker, trace, audit, receipt, and Context Pack loading lifecycle. Context Packs remain operating packages only; they are not executable workflow definitions, schedulers, governance runtimes, or Codex skills.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled sessions are listed there as deferred functionality that reuses the existing session, worker, trace, audit, receipt, and Context Pack loading lifecycle. Context Packs remain lifecycle packages; they are not executable workflow definitions, schedulers, governance runtimes, or automatic skill execution.
 
 ## Current Limitations
 
