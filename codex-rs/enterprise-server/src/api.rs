@@ -431,6 +431,9 @@ pub struct CreateSessionMessageRequest {
     pub kind: String,
     pub label: String,
     pub text: String,
+    pub retry_of_message_id: Option<String>,
+    pub supersedes_message_id: Option<String>,
+    pub context_cutoff_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -524,6 +527,13 @@ pub struct OutputResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct OutputsResponse {
     pub outputs: Vec<OutputRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SaveMessageOutputRequest {
+    pub title: String,
+    pub category: Option<String>,
+    pub output_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -816,6 +826,10 @@ where
         .route(
             "/v1/threads/{thread_id}/messages/{message_id}/feedback",
             put(upsert_response_feedback::<S>),
+        )
+        .route(
+            "/v1/threads/{thread_id}/messages/{message_id}/outputs",
+            post(save_message_output::<S>),
         )
         .route(
             "/v1/me/response-preferences",
@@ -2589,6 +2603,100 @@ where
         .into_response())
 }
 
+async fn save_message_output<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path((thread_id, message_id)): Path<(String, String)>,
+    Json(request): Json<SaveMessageOutputRequest>,
+) -> Result<(StatusCode, Json<OutputResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    let title = request.title.trim().to_string();
+    if title.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "output title is required",
+        ));
+    }
+    let session = state
+        .store
+        .get_session(&principal, &thread_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let message = state
+        .store
+        .get_session_message(&principal, &thread_id, &message_id)
+        .await
+        .map_err(ApiError::storage)?;
+    if message.kind != "assistant" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "only completed assistant messages can be saved as outputs",
+        ));
+    }
+    let category = parse_output_category(request.category.as_deref().unwrap_or("deliverable"))?;
+    let output_type = request
+        .output_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("markdown_report")
+        .to_string();
+    let artifact_path = generated_chat_output_artifact_path(&thread_id, &title);
+    let output = state
+        .store
+        .create_output(CreateOutputInput {
+            owner_user_id: principal.user_id.clone(),
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            worker_id: session.last_worker_id.clone(),
+            category,
+            output_type,
+            title: title.clone(),
+            artifact_path,
+            status: "completed".to_string(),
+            metadata_json: serde_json::json!({
+                "source": "chat_assistant_message",
+                "thread_id": thread_id,
+                "message_id": message_id,
+            }),
+        })
+        .await
+        .map_err(ApiError::storage)?;
+    let artifact_path = user_output_artifact_path(&state.config, &principal.user_id, &output)
+        .map_err(ApiError::storage)?;
+    if let Some(parent) = artifact_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+    tokio::fs::write(&artifact_path, message.text.as_bytes())
+        .await
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(session.workspace_id.clone())
+            .session(session.session_id.clone()),
+        "output.chat_message.save",
+        TraceResult::Completed,
+        serde_json::json!({
+            "output_id": output.output_id.clone(),
+            "category": output.category,
+            "output_type": output.output_type.clone(),
+            "artifact_path": output.artifact_path.clone(),
+            "message_id": message.message_id.clone(),
+        }),
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(OutputResponse { output })))
+}
+
 #[utoipa::path(
     get,
     path = "/v1/workers",
@@ -2881,6 +2989,9 @@ where
                 kind: request.kind,
                 label: request.label,
                 text: request.text,
+                retry_of_message_id: request.retry_of_message_id,
+                supersedes_message_id: request.supersedes_message_id,
+                context_cutoff_message_id: request.context_cutoff_message_id,
             },
         )
         .await
@@ -4547,6 +4658,11 @@ __CONTENT__
             this.handleWorkbenchFeedback(Number(feedbackButton.dataset.feedbackIndex), feedbackButton.dataset.feedbackRating);
             return;
           }
+          const saveOutputButton = event.target.closest('[data-save-output-index]');
+          if (saveOutputButton) {
+            this.saveWorkbenchMessageOutput(Number(saveOutputButton.dataset.saveOutputIndex));
+            return;
+          }
           const button = event.target.closest('[data-copy-index]');
           if (!button) return;
           this.copyWorkbenchMessage(Number(button.dataset.copyIndex), button);
@@ -4667,10 +4783,11 @@ __CONTENT__
         const copyButton = copyable ? '<button class="copyable-message" title="Copy turn" data-copy-index="'+String(index)+'">'+workbenchIcon('copy')+'</button>' : '';
         const resubmitButton = copyable && message.kind === 'user' ? '<button class="copyable-message" title="Resubmit turn" data-resubmit-index="'+String(index)+'">'+workbenchIcon('rotate-ccw')+'</button>' : '';
         const editResubmitButton = copyable && message.kind === 'user' ? '<button class="copyable-message" title="Edit turn" data-begin-edit-index="'+String(index)+'">'+workbenchIcon('pencil')+'</button>' : '';
+        const saveOutputButton = copyable && message.kind === 'assistant' ? '<button class="copyable-message" title="Save as output" data-save-output-index="'+String(index)+'">'+workbenchIcon('file-output')+'</button>' : '';
         const feedbackButtons = copyable && message.kind === 'assistant'
           ? '<button class="copyable-message'+(message.feedbackRating === 'good' ? ' feedback-selected' : '')+'" title="Good response" data-feedback-rating="good" data-feedback-index="'+String(index)+'">'+workbenchIcon('thumbs-up')+'</button><button class="copyable-message'+(message.feedbackRating === 'bad' ? ' feedback-selected' : '')+'" title="Bad response" data-feedback-rating="bad" data-feedback-index="'+String(index)+'">'+workbenchIcon('thumbs-down')+'</button>'
           : '';
-        const actions = copyable ? '<div class="message-actions"><div class="message-actions-left">'+copyButton+feedbackButtons+resubmitButton+editResubmitButton+'<span class="message-timestamp">'+workbenchEscape(formatWorkbenchTurnTime(message.createdAt))+'</span></div></div>' : '';
+        const actions = copyable ? '<div class="message-actions"><div class="message-actions-left">'+copyButton+saveOutputButton+feedbackButtons+resubmitButton+editResubmitButton+'<span class="message-timestamp">'+workbenchEscape(formatWorkbenchTurnTime(message.createdAt))+'</span></div></div>' : '';
         const body = index === this.editingIndex && message.kind === 'user'
           ? '<div class="inline-turn-editor"><textarea data-edit-value-index="'+String(index)+'">'+workbenchEscape(message.text || '')+'</textarea><div class="inline-turn-editor-actions"><button class="cancel-edit" data-cancel-edit-index="'+String(index)+'">Cancel</button><button class="submit-edit" data-submit-edit-index="'+String(index)+'">Submit</button></div></div>'
           : message.pending && message.kind === 'assistant' ? '<span class="thinking-dots">Thinking</span>' : formatAssistantMessage(message);
@@ -4710,6 +4827,25 @@ __CONTENT__
           workbenchMessage('system', 'Feedback failed', error.message || 'Could not save response feedback.');
         }
       }
+      async saveWorkbenchMessageOutput(index) {
+        const message = this.messages[index];
+        if (!message || message.kind !== 'assistant' || !message.message_id || !workbench.sessionId) {
+          workbenchMessage('system', 'Output', 'Save completed assistant turns after they are persisted.');
+          return;
+        }
+        const title = window.prompt('Output title', workbench.threadTitle || 'Saved output');
+        if (!title || !title.trim()) return;
+        try {
+          await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages/'+encodeURIComponent(message.message_id)+'/outputs', {
+            title:title.trim(),
+            category:'deliverable',
+            output_type:'markdown_report'
+          });
+          workbenchMessage('system', 'Output saved', 'Saved this assistant turn to My outputs.');
+        } catch (error) {
+          workbenchMessage('system', 'Output failed', error.message || 'Could not save this output.');
+        }
+      }
       async resubmitWorkbenchMessage(index) {
         const message = this.messages[index];
         if (!message || message.kind !== 'user' || message.pending || message.streaming) return;
@@ -4722,6 +4858,10 @@ __CONTENT__
         workbench.commandOutputChars = 0;
         try {
           await ensureWorkbenchConnected();
+          if (message.message_id) {
+            const saved = await recordWorkbenchThreadMessage('user', 'You', text, {retry_of_message_id:message.message_id, context_cutoff_message_id:message.message_id});
+            this.attachLastPersistedMessage('user', 'You', saved?.message);
+          }
           await sendWorkbenchRpcMessage(text, {recordUser:false, appendUser:false});
         } catch (error) {
           workbenchMessage('system', 'Resubmit failed', error.message || 'Could not resubmit this turn.');
@@ -4747,7 +4887,7 @@ __CONTENT__
         const text = String(input?.value || '').trim();
         if (!text) return;
         const nextMessages = this.messages.slice(0, index + 1);
-        nextMessages[index] = Object.assign({}, message, {text, createdAt:new Date().toISOString()});
+        nextMessages.push({kind:'user', label:'You', text, retry_of_message_id:message.message_id, context_cutoff_message_id:message.message_id, createdAt:new Date().toISOString()});
         this.editingIndex = null;
         this.setMessages(nextMessages);
         workbench.appThreadId = null;
@@ -4755,6 +4895,10 @@ __CONTENT__
         workbench.commandOutputChars = 0;
         try {
           await ensureWorkbenchConnected();
+          if (message.message_id) {
+            const saved = await recordWorkbenchThreadMessage('user', 'You', text, {retry_of_message_id:message.message_id, supersedes_message_id:message.message_id, context_cutoff_message_id:message.message_id});
+            this.attachLastPersistedMessage('user', 'You', saved?.message);
+          }
           await sendWorkbenchRpcMessage(text, {recordUser:false, appendUser:false});
         } catch (error) {
           workbenchMessage('system', 'Edit failed', error.message || 'Could not resubmit this edited turn.');
@@ -4764,7 +4908,7 @@ __CONTENT__
     if (!customElements.get('workbench-transcript')) {
       customElements.define('workbench-transcript', WorkbenchTranscript);
     }
-    const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], contextThreadId:null, pendingAssistantText:'', commandOutputChars:0, responsePreferences:null, feedbackMessageIndex:null };
+    const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], contextThreadId:null, activeThreadGeneration:0, pendingAssistantText:'', commandOutputChars:0, responsePreferences:null, feedbackMessageIndex:null };
     function workbenchEscape(value) {
       return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     }
@@ -4780,9 +4924,24 @@ __CONTENT__
     }
     function renderWorkbenchInlineMarkdown(value) {
       return workbenchEscape(value)
+        .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_match, text, href) => {
+          const safeHref = sanitizeWorkbenchLink(href);
+          if (!safeHref) return workbenchEscape(text);
+          return '<a href="'+safeHref+'" target="_blank" rel="noopener noreferrer">'+workbenchEscape(text)+'</a>';
+        })
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
         .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    }
+    function sanitizeWorkbenchLink(value) {
+      try {
+        const url = new URL(String(value || '').replace(/&amp;/g, '&'), window.location.origin);
+        if (url.protocol === 'javascript:') return '';
+        if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) return '';
+        return workbenchEscape(url.href);
+      } catch (_) {
+        return '';
+      }
     }
     function renderWorkbenchMarkdown(value) {
       const lines = String(value ?? '').replace(/\r\n/g, '\n').split('\n');
@@ -4854,6 +5013,9 @@ __CONTENT__
     }
     function formatAssistantMessage(message) {
       const text = message?.text || '';
+      if (message?.label === 'Tool output') {
+        return '<details class="tool-output-collapsed"><summary>Raw tool output collapsed</summary><pre><code>'+workbenchEscape(text)+'</code></pre></details>';
+      }
       if (message?.kind === 'assistant' || message?.kind === 'system') {
         return renderWorkbenchMarkdown(text);
       }
@@ -4864,6 +5026,7 @@ __CONTENT__
         'check': '<path d="M20 6 9 17l-5-5"/>',
         'message-circle': '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
         'copy': '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+        'file-output': '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M12 18v-6"/><path d="m9 15 3 3 3-3"/>',
         'more-horizontal': '<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
         'panel-left-close': '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/>',
         'pencil': '<path d="M21.2 6.8a2.8 2.8 0 0 0-4-4L4 16v4h4Z"/><path d="m14 5 5 5"/>',
@@ -4897,6 +5060,13 @@ __CONTENT__
       }
       workbench.pendingAssistantText = '';
     }
+    function bumpWorkbenchThreadGeneration() {
+      workbench.activeThreadGeneration += 1;
+      return workbench.activeThreadGeneration;
+    }
+    function isActiveWorkbenchGeneration(generation) {
+      return generation === workbench.activeThreadGeneration;
+    }
     function setWorkbenchTranscript(messages) {
       const chat = document.getElementById('workbench-chat');
       if (!chat || typeof chat.setMessages !== 'function') return;
@@ -4911,8 +5081,9 @@ __CONTENT__
       })));
       workbench.pendingAssistantText = '';
     }
-    async function loadWorkbenchThreadHistory(sessionId) {
+    async function loadWorkbenchThreadHistory(sessionId, generation) {
       const payload = await fetchJson('/v1/threads/'+encodeURIComponent(sessionId)+'/messages');
+      if (generation !== undefined && !isActiveWorkbenchGeneration(generation)) return;
       const messages = payload.messages || [];
       if (!messages.length) {
         showWorkbenchEmptyState('No messages yet in this thread.');
@@ -4920,9 +5091,9 @@ __CONTENT__
       }
       setWorkbenchTranscript(messages);
     }
-    async function recordWorkbenchThreadMessage(kind, label, text) {
+    async function recordWorkbenchThreadMessage(kind, label, text, metadata) {
       if (!workbench.sessionId || !text || !String(text).trim()) return;
-      return await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages', {kind, label, text});
+      return await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages', Object.assign({kind, label, text}, metadata || {}));
     }
     function openResponseFeedbackModal(index) {
       workbench.feedbackMessageIndex = index;
@@ -5313,8 +5484,9 @@ __CONTENT__
     }
     async function selectLastWorkbenchThread() {
       if (!workbench.sessions.length || workbench.sessionId) return false;
-      const latest = [...workbench.sessions].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))[0];
+      const latest = [...workbench.sessions].sort((a, b) => String(b.last_opened_at || b.updated_at || '').localeCompare(String(a.last_opened_at || a.updated_at || '')))[0];
       if (!latest) return false;
+      const generation = bumpWorkbenchThreadGeneration();
       workbench.sessionId = latest.session_id;
       workbench.projectId = latest.project_id || null;
       workbench.repositoryId = latest.repository_id || null;
@@ -5324,13 +5496,14 @@ __CONTENT__
       renderWorkbenchProjects();
       clearWorkbenchTranscript();
       try {
-        await loadWorkbenchThreadHistory(latest.session_id);
+        await loadWorkbenchThreadHistory(latest.session_id, generation);
       } catch (error) {
-        workbenchMessage('system', 'History', error.message);
+        if (isActiveWorkbenchGeneration(generation)) workbenchMessage('system', 'History', error.message);
       }
       return true;
     }
     function chooseWorkbenchProject(projectId) {
+      bumpWorkbenchThreadGeneration();
       resetWorkbenchConnection();
       const project = workbench.projects.find((item) => item.project_id === projectId);
       workbench.projectId = projectId;
@@ -5344,6 +5517,7 @@ __CONTENT__
       workbenchMessage('assistant', 'Project selected', 'Use the chat bubble on this project to start a new thread, or choose an existing thread below it.');
     }
     function newWorkbenchThread(projectId) {
+      bumpWorkbenchThreadGeneration();
       resetWorkbenchConnection();
       const project = workbench.projects.find((item) => item.project_id === projectId);
       workbench.projectId = projectId;
@@ -5465,7 +5639,7 @@ __CONTENT__
         list.innerHTML = outputs.map((output) =>
           '<article class="output-row"><strong>'+workbenchEscape(output.title || 'Untitled output')+'</strong>'+
           '<div class="hint">'+workbenchEscape(output.category || 'output')+' · '+workbenchEscape(output.output_type || 'asset')+' · '+workbenchEscape(output.status || 'unknown')+'</div>'+
-          '<code>'+workbenchEscape(output.artifact_path || '')+'</code></article>'
+          '<code>'+workbenchEscape(output.artifact_path || '')+'</code><div><a href="/v1/outputs/'+encodeURIComponent(output.output_id)+'/download" target="_blank" rel="noopener">Download</a></div></article>'
         ).join('');
       } catch (error) {
         list.innerHTML = '<p class="hint">Could not load outputs: '+workbenchEscape(error.message)+'</p>';
@@ -5474,6 +5648,7 @@ __CONTENT__
     async function selectWorkbenchThread(sessionId) {
       const session = workbench.sessions.find((item) => item.session_id === sessionId);
       if (!session) return;
+      const generation = bumpWorkbenchThreadGeneration();
       resetWorkbenchConnection();
       workbench.sessionId = session.session_id;
       workbench.projectId = session.project_id || null;
@@ -5485,12 +5660,13 @@ __CONTENT__
       clearWorkbenchTranscript();
       renderWorkbenchProjects();
       try {
-        await loadWorkbenchThreadHistory(session.session_id);
+        await loadWorkbenchThreadHistory(session.session_id, generation);
       } catch (error) {
-        workbenchMessage('system', 'History', error.message);
+        if (isActiveWorkbenchGeneration(generation)) workbenchMessage('system', 'History', error.message);
       }
     }
     async function startWorkbenchSession() {
+      const generation = workbench.activeThreadGeneration;
       try {
         const workspace = workbench.workspacePath;
         if (!workspace) {
@@ -5510,17 +5686,21 @@ __CONTENT__
           await refreshWorkbenchThreads();
           workbench.sessionId = session.session.session_id;
         }
+        if (!isActiveWorkbenchGeneration(generation)) return;
         setWorkbenchStatus('starting worker', false);
         const worker = await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/workers', {});
+        if (!isActiveWorkbenchGeneration(generation)) return;
         workbench.workerId = worker.worker.worker_id;
         const handoff = await postJsonPayload('/v1/workers/'+encodeURIComponent(workbench.workerId)+'/handoffs', {});
-        await connectWorkbenchSocket(handoff.handoff_token);
+        if (!isActiveWorkbenchGeneration(generation)) return;
+        await connectWorkbenchSocket(handoff.handoff_token, generation);
       } catch (error) {
+        if (!isActiveWorkbenchGeneration(generation)) return;
         setWorkbenchStatus('not connected', false);
         workbenchMessage('system', 'Start failed', error.message);
       }
     }
-    async function connectWorkbenchSocket(handoffToken) {
+    async function connectWorkbenchSocket(handoffToken, generation) {
       if (!workbench.workerId || !handoffToken) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const url = protocol+'//'+window.location.host+'/v1/workers/'+encodeURIComponent(workbench.workerId)+'/rpc?handoff_token='+encodeURIComponent(handoffToken);
@@ -5533,20 +5713,30 @@ __CONTENT__
       Object.values(workbench.pendingRpc).forEach((pending) => pending.reject(new Error('Worker websocket was replaced.')));
       workbench.pendingRpc = {};
       workbench.socket = new WebSocket(url);
+      const socket = workbench.socket;
       return new Promise((resolve, reject) => {
         let opened = false;
-        workbench.socket.onopen = () => {
+        socket.onopen = () => {
+          if (!isActiveWorkbenchGeneration(generation)) {
+            socket.close();
+            return;
+          }
           opened = true;
           setWorkbenchStatus('worker socket open', true);
-          resolve(workbench.socket);
+          resolve(socket);
         };
-        workbench.socket.onmessage = (event) => handleWorkbenchRpcMessage(event.data);
-        workbench.socket.onerror = () => {
+        socket.onmessage = (event) => {
+          if (!isActiveWorkbenchGeneration(generation) || socket !== workbench.socket) return;
+          handleWorkbenchRpcMessage(event.data);
+        };
+        socket.onerror = () => {
+          if (!isActiveWorkbenchGeneration(generation) || socket !== workbench.socket) return;
           setWorkbenchStatus('connection error', false);
           workbenchMessage('system', 'Websocket', 'The browser websocket reported an error.');
           if (!opened) reject(new Error('The browser websocket reported an error.'));
         };
-        workbench.socket.onclose = () => {
+        socket.onclose = () => {
+          if (!isActiveWorkbenchGeneration(generation) || socket !== workbench.socket) return;
           setWorkbenchStatus('disconnected', false);
           workbench.rpcReady = false;
           Object.values(workbench.pendingRpc).forEach((pending) => pending.reject(new Error('Worker websocket disconnected.')));
@@ -5607,7 +5797,7 @@ __CONTENT__
         clientInfo: {
           name: 'local-codex-enterprise-browser',
           title: 'Local Codex Enterprise Browser Chat',
-          version: '0.0.1-beta.5'
+          version: '0.0.1-beta.6'
         },
         capabilities: {
           experimentalApi: true,
@@ -5696,7 +5886,10 @@ __CONTENT__
       }
       const modelText = buildWorkbenchUserPrompt(text);
       if (settings.appendUser) workbenchMessage('user', 'You', text);
-      if (settings.recordUser) await recordWorkbenchThreadMessage('user', 'You', text);
+      if (settings.recordUser) {
+        const saved = await recordWorkbenchThreadMessage('user', 'You', text);
+        document.getElementById('workbench-chat')?.attachLastPersistedMessage?.('user', 'You', saved?.message);
+      }
       appendWorkbenchAssistantPending();
       await sendWorkbenchRpcRequest('turn/start', {
         threadId: workbench.appThreadId,
@@ -6650,6 +6843,31 @@ fn parse_output_category(value: &str) -> Result<OutputCategory, ApiError> {
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "unknown output category"))
 }
 
+fn generated_chat_output_artifact_path(thread_id: &str, title: &str) -> String {
+    let slug = slugify_output_title(title);
+    format!("chat/{thread_id}/{}-{slug}.md", Uuid::new_v4())
+}
+
+fn slugify_output_title(title: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for character in title.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "output".to_string()
+    } else {
+        slug.chars().take(64).collect()
+    }
+}
+
 async fn user_workspace_roots_from_request(
     config: &EnterpriseConfig,
     request: &CreateUserRequest,
@@ -6728,10 +6946,19 @@ fn user_output_artifact_path(
     let requested = user_root.join(&output.artifact_path);
     let parent = requested
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("output artifact path has no parent"))?
+        .ok_or_else(|| anyhow::anyhow!("output artifact path has no parent"))?;
+    if !requested.starts_with(&user_root) {
+        anyhow::bail!("output artifact path escapes user output root");
+    }
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create output artifact parent {}", parent.display()))?;
+    let canonical_user_root = user_root
+        .canonicalize()
+        .context("canonicalize output artifact user root")?;
+    let canonical_parent = parent
         .canonicalize()
         .context("canonicalize output artifact parent")?;
-    if !parent.starts_with(&user_root) {
+    if !canonical_parent.starts_with(&canonical_user_root) {
         anyhow::bail!("output artifact path escapes user output root");
     }
     Ok(requested)

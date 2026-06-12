@@ -4,7 +4,7 @@ Local Codex for Enterprise is a community fork and self-hosted enterprise extens
 
 This repository is not affiliated with, endorsed by, or supported by OpenAI. It is derived from the open-source OpenAI Codex project and preserves the upstream Apache-2.0 license and attribution.
 
-Current beta: `0.0.1-beta.5`.
+Current beta: `0.0.1-beta.6`.
 
 ## What This Is
 
@@ -24,7 +24,7 @@ Current beta: `0.0.1-beta.5`.
 
 ## Current Status
 
-The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Context Pack upload/assignment/receipts, thread/session records, workers, short-lived handoff tokens, initial websocket tunneling to worker sockets, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
+The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Context Pack upload/assignment/receipts, project-scoped chat threads, browser worker handoff, sanitized Markdown chat rendering, user response feedback, server-generated saved output artifacts, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
 
 The product domain contract is defined in [docs/enterprise-domain-contract.md](docs/enterprise-domain-contract.md). In short: workspace roots are server allowlist boundaries, user workspaces are per-user filesystem spaces, projects are human work containers, repositories are cloned checkouts inside projects, and threads are chat histories attached to projects/repositories.
 
@@ -518,10 +518,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled sessions are 
 ## Current Limitations
 
 - Browser UI is a functional server-served control-plane shell, not a polished IDE.
-- The public-ready browser-to-worker coding client is not complete.
+- Browser chat is usable for dogfooding, but it is still a lightweight workbench rather than a full desktop-app clone.
 - The app-server `model/list` response can still expose upstream model catalog text even when the worker runtime is configured for the local Docker model.
-- Project/repository domain tables are the next migration slice; current scaffold still has transitional workspace-path session fields.
 - Worker restart reconciliation is not implemented.
+- Saved chat outputs are Markdown snapshots generated under the server output artifact root; rich previews and artifact lifecycle workflows are deferred.
 - Custom RBAC policy editing is intentionally deferred.
 - SSO/SAML/OIDC is intentionally deferred.
 - Groups, teams, and org hierarchy are intentionally deferred.

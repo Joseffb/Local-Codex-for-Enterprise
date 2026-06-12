@@ -3286,6 +3286,295 @@ async fn admin_assigns_user_scoped_outputs_that_users_can_view_and_download_read
 }
 
 #[tokio::test]
+async fn thread_open_updates_recent_thread_order_and_retry_metadata_is_preserved() {
+    let router = api::build_test_router();
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp_dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        None,
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED, "{}", bootstrap.text);
+    let token = bootstrap.json["api_token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let first = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&token),
+        None,
+        serde_json::json!({
+            "workspace_path": workspace_root,
+            "title": "First thread"
+        }),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.text);
+    let first_id = first.json["session"]["session_id"]
+        .as_str()
+        .expect("first thread id")
+        .to_string();
+
+    let second = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&token),
+        None,
+        serde_json::json!({
+            "workspace_path": workspace_root,
+            "title": "Second thread"
+        }),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::CREATED, "{}", second.text);
+    let second_id = second.json["session"]["session_id"]
+        .as_str()
+        .expect("second thread id")
+        .to_string();
+
+    let opened_first = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/threads/{first_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(opened_first.status, StatusCode::OK, "{}", opened_first.text);
+    assert!(opened_first.json["session"]["last_opened_at"].is_string());
+
+    let listed = empty_request(router.clone(), "GET", "/v1/threads", Some(&token), None).await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text);
+    assert_eq!(listed.json["sessions"][0]["session_id"], first_id);
+
+    let user_message = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{second_id}/messages"),
+        Some(&token),
+        None,
+        serde_json::json!({
+            "kind": "user",
+            "label": "You",
+            "text": "Draft the first pass."
+        }),
+    )
+    .await;
+    assert_eq!(
+        user_message.status,
+        StatusCode::CREATED,
+        "{}",
+        user_message.text
+    );
+    let original_message_id = user_message.json["message"]["message_id"]
+        .as_str()
+        .expect("message id")
+        .to_string();
+
+    let retry = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{second_id}/messages"),
+        Some(&token),
+        None,
+        serde_json::json!({
+            "kind": "user",
+            "label": "You",
+            "text": "Draft the first pass as a concise markdown outline.",
+            "retry_of_message_id": original_message_id,
+            "context_cutoff_message_id": original_message_id
+        }),
+    )
+    .await;
+    assert_eq!(retry.status, StatusCode::CREATED, "{}", retry.text);
+    assert_eq!(
+        retry.json["message"]["retry_of_message_id"],
+        user_message.json["message"]["message_id"]
+    );
+    assert_eq!(
+        retry.json["message"]["context_cutoff_message_id"],
+        user_message.json["message"]["message_id"]
+    );
+
+    let messages = empty_request(
+        router,
+        "GET",
+        &format!("/v1/threads/{second_id}/messages"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(messages.status, StatusCode::OK, "{}", messages.text);
+    assert_eq!(messages.json["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        messages.json["messages"][0]["text"],
+        "Draft the first pass."
+    );
+    assert_eq!(
+        messages.json["messages"][1]["retry_of_message_id"],
+        messages.json["messages"][0]["message_id"]
+    );
+}
+
+#[tokio::test]
+async fn assistant_message_can_be_saved_as_server_generated_output_snapshot() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let output_root = temp_dir.path().join("output-artifacts");
+    std::fs::create_dir_all(&output_root).expect("output root");
+    let mut config = EnterpriseConfig::default();
+    config.output_artifact_root = output_root.to_string_lossy().to_string();
+    let router = api::build_router_with_store(InMemoryEnterpriseStore::default(), config);
+    let workspace_root = temp_dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        None,
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED, "{}", bootstrap.text);
+    let token = bootstrap.json["api_token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let thread = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&token),
+        None,
+        serde_json::json!({
+            "workspace_path": workspace_root,
+            "title": "Report thread"
+        }),
+    )
+    .await;
+    assert_eq!(thread.status, StatusCode::CREATED, "{}", thread.text);
+    let thread_id = thread.json["session"]["session_id"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    let user_message = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{thread_id}/messages"),
+        Some(&token),
+        None,
+        serde_json::json!({
+            "kind": "user",
+            "label": "You",
+            "text": "Create the report."
+        }),
+    )
+    .await;
+    assert_eq!(
+        user_message.status,
+        StatusCode::CREATED,
+        "{}",
+        user_message.text
+    );
+    let user_message_id = user_message.json["message"]["message_id"]
+        .as_str()
+        .expect("user message id");
+
+    let assistant = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{thread_id}/messages"),
+        Some(&token),
+        None,
+        serde_json::json!({
+            "kind": "assistant",
+            "label": "Codex",
+            "text": "# Weekly Report\n\n- Revenue reviewed\n- Inventory risk noted"
+        }),
+    )
+    .await;
+    assert_eq!(assistant.status, StatusCode::CREATED, "{}", assistant.text);
+    let assistant_message_id = assistant.json["message"]["message_id"]
+        .as_str()
+        .expect("assistant message id");
+
+    let cannot_save_user_message = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{thread_id}/messages/{user_message_id}/outputs"),
+        Some(&token),
+        None,
+        serde_json::json!({
+            "title": "Bad Save"
+        }),
+    )
+    .await;
+    assert_eq!(cannot_save_user_message.status, StatusCode::BAD_REQUEST);
+
+    let saved = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{thread_id}/messages/{assistant_message_id}/outputs"),
+        Some(&token),
+        None,
+        serde_json::json!({
+            "title": "Weekly Report",
+            "category": "deliverable",
+            "output_type": "markdown_report",
+            "artifact_path": "../evil.md"
+        }),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::CREATED, "{}", saved.text);
+    let output = &saved.json["output"];
+    assert_eq!(output["title"], "Weekly Report");
+    assert_eq!(output["category"], "deliverable");
+    assert_eq!(output["output_type"], "markdown_report");
+    assert_eq!(output["session_id"], thread_id);
+    let artifact_path = output["artifact_path"].as_str().expect("artifact path");
+    assert!(artifact_path.starts_with("chat/"));
+    assert!(!artifact_path.contains("evil"));
+    assert!(!saved.text.contains("Revenue reviewed"));
+
+    let outputs = empty_request(router.clone(), "GET", "/v1/outputs", Some(&token), None).await;
+    assert_eq!(outputs.status, StatusCode::OK, "{}", outputs.text);
+    assert_eq!(outputs.json["outputs"][0]["title"], "Weekly Report");
+
+    let output_id = output["output_id"].as_str().expect("output id");
+    let download = empty_request(
+        router,
+        "GET",
+        &format!("/v1/outputs/{output_id}/download"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(download.status, StatusCode::OK, "{}", download.text);
+    assert!(download.text.contains("# Weekly Report"));
+    assert!(download.text.contains("Inventory risk noted"));
+}
+
+#[tokio::test]
 async fn rbac_page_explains_permissions_and_exposes_assignment_crud() {
     let router = api::build_test_router();
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -3840,13 +4129,13 @@ async fn login_page_redirects_home_and_nav_says_home_when_authenticated() {
     assert!(
         chat_with_auth
             .text
-            .contains("Local Codex for Enterprise v0.0.1-beta.5")
+            .contains("Local Codex for Enterprise v0.0.1-beta.6")
     );
     assert!(chat_with_auth.text.contains("Made with Codex"));
     assert!(
         chat_with_auth
             .text
-            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.5</span></div></div>"#)
+            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.6</span></div></div>"#)
     );
     let footer_index = chat_with_auth
         .text
@@ -4161,6 +4450,7 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("item/agentMessage/delta"));
     assert!(chat.text.contains("handleWorkbenchCommandOutputDelta"));
     assert!(chat.text.contains("Raw tool output is collapsed"));
+    assert!(chat.text.contains("tool-output-collapsed"));
     assert!(
         !chat
             .text
@@ -4220,6 +4510,7 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("My outputs"));
     assert!(chat.text.contains("openWorkbenchOutputs"));
     assert!(chat.text.contains("workbench-output-list"));
+    assert!(chat.text.contains("Download"));
     assert!(chat.text.contains("chooseWorkbenchProject"));
     assert!(chat.text.contains("selectWorkbenchThread"));
     assert!(chat.text.contains("clearWorkbenchTranscript"));
@@ -4262,6 +4553,11 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("resubmitWorkbenchMessage"));
     assert!(chat.text.contains("beginEditResubmitWorkbenchMessage"));
     assert!(chat.text.contains("submitEditedWorkbenchMessage"));
+    assert!(chat.text.contains("saveWorkbenchMessageOutput"));
+    assert!(chat.text.contains("data-save-output-index"));
+    assert!(chat.text.contains("Save as output"));
+    assert!(chat.text.contains("sanitizeWorkbenchLink"));
+    assert!(chat.text.contains("javascript:"));
     assert!(chat.text.contains("data-resubmit-index"));
     assert!(chat.text.contains("data-begin-edit-index"));
     assert!(chat.text.contains("data-submit-edit-index"));
@@ -4269,6 +4565,9 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
     assert!(chat.text.contains("data-edit-value-index"));
     assert!(chat.text.contains("title=\"Resubmit turn\""));
     assert!(chat.text.contains("title=\"Edit turn\""));
+    assert!(chat.text.contains("retry_of_message_id"));
+    assert!(chat.text.contains("supersedes_message_id"));
+    assert!(chat.text.contains("context_cutoff_message_id"));
     assert!(chat.text.contains("message.kind === 'user'"));
     assert!(
         chat.text
@@ -4280,6 +4579,9 @@ async fn chat_rail_groups_threads_under_workspace_project_headers() {
             .contains("window.prompt('Edit and resubmit this turn', text)")
     );
     assert!(chat.text.contains("workbench.appThreadId = null"));
+    assert!(chat.text.contains("activeThreadGeneration"));
+    assert!(chat.text.contains("bumpWorkbenchThreadGeneration"));
+    assert!(chat.text.contains("isActiveWorkbenchGeneration"));
     assert!(
         chat.text
             .contains("await sendWorkbenchRpcMessage(text, {recordUser:false, appendUser:false})")

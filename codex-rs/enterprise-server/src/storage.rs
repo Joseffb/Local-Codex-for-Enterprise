@@ -389,6 +389,8 @@ pub struct SessionRecord {
     pub title: Option<String>,
     pub last_worker_id: Option<String>,
     #[schema(value_type = String)]
+    pub last_opened_at: Option<DateTime<Utc>>,
+    #[schema(value_type = String)]
     pub deleted_at: Option<DateTime<Utc>>,
     #[schema(value_type = String)]
     pub created_at: DateTime<Utc>,
@@ -405,6 +407,12 @@ pub struct SessionMessageRecord {
     pub label: String,
     pub text: String,
     pub sequence: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_of_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_cutoff_message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feedback_rating: Option<String>,
     #[schema(value_type = String)]
@@ -442,6 +450,9 @@ pub struct CreateSessionMessageInput {
     pub kind: String,
     pub label: String,
     pub text: String,
+    pub retry_of_message_id: Option<String>,
+    pub supersedes_message_id: Option<String>,
+    pub context_cutoff_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -559,6 +570,12 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
         principal: &AuthPrincipal,
         session_id: &str,
     ) -> Result<Vec<SessionMessageRecord>>;
+    async fn get_session_message(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<SessionMessageRecord>;
     async fn upsert_response_feedback(
         &self,
         principal: &AuthPrincipal,
@@ -1137,7 +1154,12 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             })
             .cloned()
             .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        sessions.sort_by(|left, right| {
+            right
+                .last_opened_at
+                .unwrap_or(right.updated_at)
+                .cmp(&left.last_opened_at.unwrap_or(left.updated_at))
+        });
         Ok(sessions)
     }
 
@@ -1146,15 +1168,16 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         principal: &AuthPrincipal,
         session_id: &str,
     ) -> Result<SessionRecord> {
-        let state = self.state.lock().await;
-        state
+        let mut state = self.state.lock().await;
+        let session = state
             .sessions
-            .get(session_id)
+            .get_mut(session_id)
             .filter(|session| {
                 session.owner_user_id == principal.user_id && session.deleted_at.is_none()
             })
-            .cloned()
-            .context("session not found")
+            .context("session not found")?;
+        session.last_opened_at = Some(Utc::now());
+        Ok(session.clone())
     }
 
     async fn update_session_title(
@@ -1213,6 +1236,13 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             .session_messages
             .entry(session_id.to_string())
             .or_default();
+        validate_in_memory_message_link(messages, input.retry_of_message_id.as_deref(), true)?;
+        validate_in_memory_message_link(messages, input.supersedes_message_id.as_deref(), true)?;
+        validate_in_memory_message_link(
+            messages,
+            input.context_cutoff_message_id.as_deref(),
+            false,
+        )?;
         let message = SessionMessageRecord {
             message_id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -1221,6 +1251,9 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             label: input.label,
             text: input.text,
             sequence: messages.len() as i64 + 1,
+            retry_of_message_id: input.retry_of_message_id,
+            supersedes_message_id: input.supersedes_message_id,
+            context_cutoff_message_id: input.context_cutoff_message_id,
             feedback_rating: None,
             created_at: Utc::now(),
         };
@@ -1261,6 +1294,19 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
                 message
             })
             .collect())
+    }
+
+    async fn get_session_message(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<SessionMessageRecord> {
+        self.list_session_messages(principal, session_id)
+            .await?
+            .into_iter()
+            .find(|message| message.message_id == message_id)
+            .context("session message not found")
     }
 
     async fn upsert_response_feedback(
@@ -2500,9 +2546,9 @@ impl EnterpriseStore for PostgresEnterpriseStore {
             .await?;
         let row = sqlx::query(
             "INSERT INTO enterprise_sessions
-             (session_id, owner_user_id, workspace_id, workspace_path, title)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, title, last_worker_id::text, deleted_at, created_at, updated_at",
+             (session_id, owner_user_id, workspace_id, workspace_path, title, last_opened_at)
+             VALUES ($1, $2, $3, $4, $5, now())
+             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, last_opened_at, deleted_at, created_at, updated_at",
         )
         .bind(&session_id)
         .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
@@ -2518,10 +2564,10 @@ impl EnterpriseStore for PostgresEnterpriseStore {
 
     async fn list_sessions(&self, principal: &AuthPrincipal) -> Result<Vec<SessionRecord>> {
         let rows = sqlx::query(
-            "SELECT session_id, owner_user_id::text, workspace_id, workspace_path, title, last_worker_id::text, deleted_at, created_at, updated_at
+            "SELECT session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, last_opened_at, deleted_at, created_at, updated_at
              FROM enterprise_sessions
              WHERE owner_user_id = $1 AND deleted_at IS NULL
-             ORDER BY updated_at DESC",
+             ORDER BY COALESCE(last_opened_at, updated_at, created_at) DESC",
         )
         .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
         .fetch_all(&self.pool)
@@ -2537,9 +2583,10 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         session_id: &str,
     ) -> Result<SessionRecord> {
         let row = sqlx::query(
-            "SELECT session_id, owner_user_id::text, workspace_id, workspace_path, title, last_worker_id::text, deleted_at, created_at, updated_at
-             FROM enterprise_sessions
-             WHERE session_id = $1 AND owner_user_id = $2 AND deleted_at IS NULL",
+            "UPDATE enterprise_sessions
+             SET last_opened_at = now()
+             WHERE session_id = $1 AND owner_user_id = $2 AND deleted_at IS NULL
+             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, last_opened_at, deleted_at, created_at, updated_at",
         )
         .bind(session_id)
         .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
@@ -2561,7 +2608,7 @@ impl EnterpriseStore for PostgresEnterpriseStore {
             "UPDATE enterprise_sessions
              SET title = $3, updated_at = now()
              WHERE session_id = $1 AND owner_user_id = $2 AND deleted_at IS NULL
-             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, deleted_at, created_at, updated_at",
+             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, last_opened_at, deleted_at, created_at, updated_at",
         )
         .bind(session_id)
         .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
@@ -2583,7 +2630,7 @@ impl EnterpriseStore for PostgresEnterpriseStore {
             "UPDATE enterprise_sessions
              SET deleted_at = now(), updated_at = now()
              WHERE session_id = $1 AND owner_user_id = $2 AND deleted_at IS NULL
-             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, deleted_at, created_at, updated_at",
+             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, last_opened_at, deleted_at, created_at, updated_at",
         )
         .bind(session_id)
         .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
@@ -2603,6 +2650,42 @@ impl EnterpriseStore for PostgresEnterpriseStore {
     ) -> Result<SessionMessageRecord> {
         let principal_user_id =
             Uuid::parse_str(&principal.user_id).context("parse principal user id")?;
+        let retry_of_message_id = parse_optional_uuid(
+            input.retry_of_message_id.as_deref(),
+            "parse retry message id",
+        )?;
+        let supersedes_message_id = parse_optional_uuid(
+            input.supersedes_message_id.as_deref(),
+            "parse superseded message id",
+        )?;
+        let context_cutoff_message_id = parse_optional_uuid(
+            input.context_cutoff_message_id.as_deref(),
+            "parse context cutoff message id",
+        )?;
+        validate_pg_message_link(
+            &self.pool,
+            session_id,
+            principal_user_id,
+            retry_of_message_id,
+            true,
+        )
+        .await?;
+        validate_pg_message_link(
+            &self.pool,
+            session_id,
+            principal_user_id,
+            supersedes_message_id,
+            true,
+        )
+        .await?;
+        validate_pg_message_link(
+            &self.pool,
+            session_id,
+            principal_user_id,
+            context_cutoff_message_id,
+            false,
+        )
+        .await?;
         let row = sqlx::query(
             "WITH owned_session AS (
                  SELECT session_id, owner_user_id
@@ -2616,10 +2699,10 @@ impl EnterpriseStore for PostgresEnterpriseStore {
              ),
              inserted AS (
                  INSERT INTO enterprise_session_messages
-                 (message_id, session_id, owner_user_id, kind, label, text, sequence)
-                 SELECT $3, owned_session.session_id, owned_session.owner_user_id, $4, $5, $6, next_sequence.sequence
+                 (message_id, session_id, owner_user_id, kind, label, text, sequence, retry_of_message_id, supersedes_message_id, context_cutoff_message_id)
+                 SELECT $3, owned_session.session_id, owned_session.owner_user_id, $4, $5, $6, next_sequence.sequence, $7, $8, $9
                  FROM owned_session, next_sequence
-                 RETURNING message_id::text, session_id, owner_user_id::text, kind, label, text, sequence, created_at
+                 RETURNING message_id::text, session_id, owner_user_id::text, kind, label, text, sequence, retry_of_message_id::text, supersedes_message_id::text, context_cutoff_message_id::text, created_at
              )
              UPDATE enterprise_sessions
              SET updated_at = now()
@@ -2646,6 +2729,15 @@ impl EnterpriseStore for PostgresEnterpriseStore {
                  SELECT sequence FROM inserted
              ) AS sequence,
              (
+                 SELECT retry_of_message_id FROM inserted
+             ) AS retry_of_message_id,
+             (
+                 SELECT supersedes_message_id FROM inserted
+             ) AS supersedes_message_id,
+             (
+                 SELECT context_cutoff_message_id FROM inserted
+             ) AS context_cutoff_message_id,
+             (
                  SELECT created_at FROM inserted
              ) AS created_at",
         )
@@ -2655,6 +2747,9 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .bind(input.kind)
         .bind(input.label)
         .bind(input.text)
+        .bind(retry_of_message_id)
+        .bind(supersedes_message_id)
+        .bind(context_cutoff_message_id)
         .fetch_optional(&self.pool)
         .await
         .context("insert session message")?
@@ -2676,6 +2771,9 @@ impl EnterpriseStore for PostgresEnterpriseStore {
                     messages.label,
                     messages.text,
                     messages.sequence,
+                    messages.retry_of_message_id::text,
+                    messages.supersedes_message_id::text,
+                    messages.context_cutoff_message_id::text,
                     feedback.rating AS feedback_rating,
                     messages.created_at
              FROM enterprise_session_messages messages
@@ -2692,6 +2790,42 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .context("list session messages")?;
 
         rows.into_iter().map(session_message_from_row).collect()
+    }
+
+    async fn get_session_message(
+        &self,
+        principal: &AuthPrincipal,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<SessionMessageRecord> {
+        self.get_session(principal, session_id).await?;
+        let row = sqlx::query(
+            "SELECT messages.message_id::text,
+                    messages.session_id,
+                    messages.owner_user_id::text,
+                    messages.kind,
+                    messages.label,
+                    messages.text,
+                    messages.sequence,
+                    messages.retry_of_message_id::text,
+                    messages.supersedes_message_id::text,
+                    messages.context_cutoff_message_id::text,
+                    feedback.rating AS feedback_rating,
+                    messages.created_at
+             FROM enterprise_session_messages messages
+             LEFT JOIN enterprise_response_feedback feedback
+               ON feedback.owner_user_id = messages.owner_user_id
+              AND feedback.message_id = messages.message_id
+             WHERE messages.session_id = $1 AND messages.owner_user_id = $2 AND messages.message_id = $3",
+        )
+        .bind(session_id)
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .bind(Uuid::parse_str(message_id).context("parse session message id")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("get session message")?
+        .context("session message not found")?;
+        session_message_from_row(row)
     }
 
     async fn upsert_response_feedback(
@@ -3227,9 +3361,9 @@ impl EnterpriseStore for PostgresEnterpriseStore {
             .await?;
         let row = sqlx::query(
             "INSERT INTO enterprise_sessions
-             (session_id, owner_user_id, workspace_id, workspace_path, project_id, repository_id, title)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, deleted_at, created_at, updated_at",
+             (session_id, owner_user_id, workspace_id, workspace_path, project_id, repository_id, title, last_opened_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, last_opened_at, deleted_at, created_at, updated_at",
         )
         .bind(&session_id)
         .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
@@ -4148,10 +4282,10 @@ impl PostgresEnterpriseStore {
         project_id: &str,
     ) -> Result<Vec<SessionRecord>> {
         let rows = sqlx::query(
-            "SELECT session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, deleted_at, created_at, updated_at
+            "SELECT session_id, owner_user_id::text, workspace_id, workspace_path, project_id::text, repository_id::text, title, last_worker_id::text, last_opened_at, deleted_at, created_at, updated_at
              FROM enterprise_sessions
              WHERE project_id = $1 AND owner_user_id = $2 AND deleted_at IS NULL
-             ORDER BY updated_at DESC",
+             ORDER BY COALESCE(last_opened_at, updated_at, created_at) DESC",
         )
         .bind(Uuid::parse_str(project_id).context("parse project id")?)
         .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
@@ -4316,10 +4450,64 @@ fn create_session_record(
         repository_id: None,
         title,
         last_worker_id: None,
+        last_opened_at: Some(now),
         deleted_at: None,
         created_at: now,
         updated_at: now,
     })
+}
+
+fn validate_in_memory_message_link(
+    messages: &[SessionMessageRecord],
+    message_id: Option<&str>,
+    require_user_message: bool,
+) -> Result<()> {
+    let Some(message_id) = message_id else {
+        return Ok(());
+    };
+    let message = messages
+        .iter()
+        .find(|message| message.message_id == message_id)
+        .context("linked session message not found")?;
+    if require_user_message && message.kind != "user" {
+        anyhow::bail!("retry and supersede links must point to user messages");
+    }
+    Ok(())
+}
+
+fn parse_optional_uuid(value: Option<&str>, context: &'static str) -> Result<Option<Uuid>> {
+    value
+        .map(|value| Uuid::parse_str(value).context(context))
+        .transpose()
+}
+
+async fn validate_pg_message_link(
+    pool: &PgPool,
+    session_id: &str,
+    principal_user_id: Uuid,
+    message_id: Option<Uuid>,
+    require_user_message: bool,
+) -> Result<()> {
+    let Some(message_id) = message_id else {
+        return Ok(());
+    };
+    let row = sqlx::query(
+        "SELECT kind
+         FROM enterprise_session_messages
+         WHERE session_id = $1 AND owner_user_id = $2 AND message_id = $3",
+    )
+    .bind(session_id)
+    .bind(principal_user_id)
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await
+    .context("find linked session message")?
+    .context("linked session message not found")?;
+    let kind: String = row.try_get("kind")?;
+    if require_user_message && kind != "user" {
+        anyhow::bail!("retry and supersede links must point to user messages");
+    }
+    Ok(())
 }
 
 fn attach_worker_to_session(
@@ -4566,6 +4754,7 @@ fn session_from_row(row: sqlx::postgres::PgRow) -> Result<SessionRecord> {
         repository_id: row.try_get("repository_id").ok(),
         title: row.try_get("title")?,
         last_worker_id: row.try_get("last_worker_id")?,
+        last_opened_at: row.try_get("last_opened_at").ok(),
         deleted_at: row.try_get("deleted_at").ok(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -4581,6 +4770,9 @@ fn session_message_from_row(row: sqlx::postgres::PgRow) -> Result<SessionMessage
         label: row.try_get("label")?,
         text: row.try_get("text")?,
         sequence: row.try_get("sequence")?,
+        retry_of_message_id: row.try_get("retry_of_message_id").ok(),
+        supersedes_message_id: row.try_get("supersedes_message_id").ok(),
+        context_cutoff_message_id: row.try_get("context_cutoff_message_id").ok(),
         feedback_rating: row.try_get("feedback_rating").ok(),
         created_at: row.try_get("created_at")?,
     })
