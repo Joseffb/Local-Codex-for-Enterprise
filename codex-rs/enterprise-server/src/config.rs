@@ -22,6 +22,10 @@ pub struct EnterpriseConfig {
     pub handoff_token_ttl_seconds: u64,
     pub default_workspace_root: Option<String>,
     pub output_artifact_root: String,
+    pub scheduler_enabled: bool,
+    pub scheduler_poll_seconds: u64,
+    pub scheduler_run_timeout_seconds: u64,
+    pub scheduled_runner_mode: String,
 }
 
 impl Default for EnterpriseConfig {
@@ -41,6 +45,14 @@ impl Default for EnterpriseConfig {
             default_workspace_root: env::var("LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT").ok(),
             output_artifact_root: env::var("LOCAL_CODEX_ENTERPRISE_OUTPUT_ARTIFACT_ROOT")
                 .unwrap_or_else(|_| "/tmp/local-codex-enterprise/outputs".to_string()),
+            scheduler_enabled: env_bool("LOCAL_CODEX_ENTERPRISE_SCHEDULER_ENABLED", true),
+            scheduler_poll_seconds: env_u64("LOCAL_CODEX_ENTERPRISE_SCHEDULER_POLL_SECONDS", 30),
+            scheduler_run_timeout_seconds: env_u64(
+                "LOCAL_CODEX_ENTERPRISE_SCHEDULER_RUN_TIMEOUT_SECONDS",
+                1800,
+            ),
+            scheduled_runner_mode: env::var("LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE")
+                .unwrap_or_else(|_| "smoke".to_string()),
         }
     }
 }
@@ -64,4 +76,22 @@ impl EnterpriseConfig {
             env::var("DATABASE_URL").ok(),
         )
     }
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
 }

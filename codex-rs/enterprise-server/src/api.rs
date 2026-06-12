@@ -5,8 +5,10 @@ use crate::rbac::EnterpriseAction;
 use crate::rbac::EnterpriseRole;
 use crate::repo_clone;
 use crate::storage::AssignContextPackInput;
+use crate::storage::AuthPrincipal;
 use crate::storage::BootstrapInput;
 use crate::storage::CloneProjectRepositoryInput;
+use crate::storage::CompleteScheduleRunInput;
 use crate::storage::ContextDocumentRecord;
 use crate::storage::ContextLoadInput;
 use crate::storage::ContextPackAssignmentRecord;
@@ -17,6 +19,8 @@ use crate::storage::CreateContextPackInput;
 use crate::storage::CreateOutputInput;
 use crate::storage::CreateProjectInput;
 use crate::storage::CreateProjectThreadInput;
+use crate::storage::CreateScheduleInput;
+use crate::storage::CreateScheduleRunInput;
 use crate::storage::CreateSessionMessageInput;
 use crate::storage::CreateThreadReferenceInput;
 use crate::storage::CreateUserInput;
@@ -30,11 +34,14 @@ use crate::storage::OutputRecord;
 use crate::storage::ProjectRecord;
 use crate::storage::RepositoryRecord;
 use crate::storage::ResponseFeedbackRecord;
+use crate::storage::ScheduleRecord;
+use crate::storage::ScheduleRunRecord;
 use crate::storage::SessionMessageRecord;
 use crate::storage::SessionRecord;
 use crate::storage::ThreadReferenceRecord;
 use crate::storage::UpdateContextPackFileInput;
 use crate::storage::UpdateProjectInput;
+use crate::storage::UpdateScheduleInput;
 use crate::storage::UpdateSessionTitleInput;
 use crate::storage::UpdateThreadReferenceInput;
 use crate::storage::UpsertResponseFeedbackInput;
@@ -78,11 +85,13 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_uds::UnixStream;
+use croner::Cron;
 use futures::SinkExt;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::Path as FsPath;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
@@ -123,6 +132,9 @@ pub struct ConfigResponse {
     pub mode: &'static str,
     pub default_model_provider: String,
     pub default_model: String,
+    pub scheduler_enabled: bool,
+    pub scheduler_runner_mode: String,
+    pub scheduler_runner_mode_label: String,
     pub turn_guidance: TurnGuidanceResponse,
 }
 
@@ -540,6 +552,56 @@ pub struct SaveMessageOutputRequest {
     pub output_type: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CreateScheduleRequest {
+    pub owner_user_id: String,
+    pub project_id: String,
+    pub repository_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub cron_expression: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub task_prompt: String,
+    pub prompt_template_ref: Option<String>,
+    #[serde(default)]
+    pub context_pack_ids: Vec<String>,
+    pub runner_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UpdateScheduleRequest {
+    pub name: Option<String>,
+    pub description: Option<Option<String>>,
+    pub cron_expression: Option<String>,
+    pub enabled: Option<bool>,
+    pub task_prompt: Option<String>,
+    pub prompt_template_ref: Option<Option<String>>,
+    pub runner_mode: Option<String>,
+    pub context_pack_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ScheduleResponse {
+    pub schedule: ScheduleRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulesResponse {
+    pub schedules: Vec<ScheduleRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ScheduleRunResponse {
+    pub run: ScheduleRunRecord,
+    pub output: Option<OutputRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ScheduleRunsResponse {
+    pub runs: Vec<ScheduleRunRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ThreadReferenceResponse {
     pub reference: ThreadReferenceRecord,
@@ -836,6 +898,7 @@ where
         .route("/admin/context-packs/import", get(page::<S>))
         .route("/admin/context-packs/files", get(page::<S>))
         .route("/admin/context-packs/assignments", get(page::<S>))
+        .route("/admin/schedules", get(page::<S>))
         .route("/admin/outputs", get(page::<S>))
         .route("/chat", get(page::<S>))
         .route("/app", get(page::<S>))
@@ -898,6 +961,20 @@ where
         .route(
             "/v1/thread-references/{reference_id}",
             patch(update_thread_reference::<S>),
+        )
+        .route(
+            "/v1/schedules",
+            get(list_schedules::<S>).post(create_schedule::<S>),
+        )
+        .route(
+            "/v1/schedules/{schedule_id}",
+            get(get_schedule::<S>)
+                .patch(update_schedule::<S>)
+                .delete(delete_schedule::<S>),
+        )
+        .route(
+            "/v1/schedules/{schedule_id}/runs",
+            get(list_schedule_runs::<S>).post(run_schedule_now::<S>),
         )
         .route(
             "/v1/threads/{thread_id}/exports",
@@ -1016,6 +1093,122 @@ where
         ))
 }
 
+pub fn spawn_scheduler<S>(store: S, config: EnterpriseConfig)
+where
+    S: EnterpriseStore + Clone + Send + Sync + 'static,
+{
+    if !config.scheduler_enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        let poll_seconds = config.scheduler_poll_seconds.max(1);
+        loop {
+            let state = AppState::new(
+                store.clone(),
+                config.clone(),
+                WorkerRuntimeSupervisor::default(),
+            );
+            if let Err(error) = run_scheduler_tick(state).await {
+                eprintln!("scheduled sessions tick failed: {error:#}");
+            }
+            tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
+        }
+    });
+}
+
+pub async fn run_scheduler_tick<S>(state: AppState<S>) -> anyhow::Result<usize>
+where
+    S: EnterpriseStore + Clone,
+{
+    if !state.config.scheduler_enabled {
+        return Ok(0);
+    }
+    let scheduler_principal = AuthPrincipal {
+        user_id: Uuid::nil().to_string(),
+        email: "scheduler@local-codex.invalid".to_string(),
+        role: EnterpriseRole::Admin,
+    };
+    let now = Utc::now();
+    let users = state.store.list_users(&scheduler_principal).await?;
+    let schedules = state.store.list_schedules(&scheduler_principal).await?;
+    let mut executed = 0usize;
+    for schedule in schedules {
+        if !schedule.enabled || schedule.deleted_at.is_some() || schedule.next_run_at > now {
+            continue;
+        }
+        let runs = state
+            .store
+            .list_schedule_runs(&scheduler_principal, &schedule.schedule_id)
+            .await?;
+        let active_runs = runs
+            .iter()
+            .filter(|run| run.status == "running")
+            .collect::<Vec<_>>();
+        let mut has_fresh_active_run = false;
+        for run in active_runs {
+            let age = now.signed_duration_since(run.started_at).num_seconds();
+            if age < state.config.scheduler_run_timeout_seconds as i64 {
+                has_fresh_active_run = true;
+                continue;
+            }
+            state
+                .store
+                .complete_schedule_run(
+                    &scheduler_principal,
+                    &run.run_id,
+                    CompleteScheduleRunInput {
+                        session_id: run.session_id.clone(),
+                        worker_id: run.worker_id.clone(),
+                        output_id: run.output_id.clone(),
+                        status: "failed".to_string(),
+                        metadata_json: serde_json::json!({
+                            "schedule_id": schedule.schedule_id,
+                            "runner_mode": run.runner_mode,
+                            "result": "timeout",
+                        }),
+                        completed_at: now,
+                        next_run_at: None,
+                    },
+                )
+                .await?;
+        }
+        if has_fresh_active_run {
+            continue;
+        }
+        let Some(owner) = users.iter().find(|user| {
+            user.user_id == schedule.owner_user_id && user.status == UserStatus::Active
+        }) else {
+            continue;
+        };
+        let owner_role =
+            EnterpriseRole::from_storage(&owner.role).unwrap_or(EnterpriseRole::Viewer);
+        let owner_principal = AuthPrincipal {
+            user_id: owner.user_id.clone(),
+            email: owner.email.clone(),
+            role: owner_role,
+        };
+        let trace = TraceContext {
+            trace_id: Uuid::new_v4().to_string(),
+        };
+        if let Err(error) = execute_schedule_run(
+            state.clone(),
+            trace,
+            owner_principal,
+            schedule.schedule_id.clone(),
+        )
+        .await
+        {
+            eprintln!(
+                "scheduled session run failed for {}: {}",
+                schedule.schedule_id, error.message
+            );
+            continue;
+        }
+        executed += 1;
+    }
+    Ok(executed)
+}
+
 #[utoipa::path(
     get,
     path = "/v1/config",
@@ -1030,6 +1223,12 @@ where
         mode: "enterprise",
         default_model_provider: state.config.default_model_provider,
         default_model: state.config.default_model,
+        scheduler_enabled: state.config.scheduler_enabled,
+        scheduler_runner_mode: state.config.scheduled_runner_mode.clone(),
+        scheduler_runner_mode_label: scheduled_runner_mode_label(
+            &state.config.scheduled_runner_mode,
+        )
+        .to_string(),
         turn_guidance: turn_guidance_response(),
     })
 }
@@ -3066,6 +3265,548 @@ where
     ))
 }
 
+async fn create_schedule<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Json(request): Json<CreateScheduleRequest>,
+) -> Result<(StatusCode, Json<ScheduleResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageSchedules,
+    )
+    .await?;
+    let cron_expression = normalized_utc_five_field_cron(&request.cron_expression)?;
+    let next_run_at = next_cron_run_at(&cron_expression, Utc::now())?;
+    let task_prompt = request.task_prompt.trim().to_string();
+    if task_prompt.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "task_prompt is required",
+        ));
+    }
+    let runner_mode = validate_scheduled_runner_mode(
+        request
+            .runner_mode
+            .as_deref()
+            .unwrap_or(&state.config.scheduled_runner_mode),
+    )?;
+    let schedule = state
+        .store
+        .create_schedule(
+            &principal,
+            CreateScheduleInput {
+                owner_user_id: request.owner_user_id,
+                project_id: request.project_id,
+                repository_id: request.repository_id,
+                name: request.name.trim().to_string(),
+                description: request.description.and_then(|value| {
+                    let value = value.trim().to_string();
+                    (!value.is_empty()).then_some(value)
+                }),
+                cron_expression,
+                enabled: request.enabled,
+                task_prompt,
+                prompt_template_ref: request.prompt_template_ref,
+                runner_mode,
+                context_pack_ids: request.context_pack_ids,
+                next_run_at,
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
+        "schedule.create",
+        TraceResult::Completed,
+        serde_json::json!({
+            "schedule_id": schedule.schedule_id.clone(),
+            "owner_user_id": schedule.owner_user_id.clone(),
+            "project_id": schedule.project_id.clone(),
+            "repository_id": schedule.repository_id.clone(),
+            "cron_expression": schedule.cron_expression.clone(),
+            "enabled": schedule.enabled,
+            "runner_mode": schedule.runner_mode.clone(),
+            "context_pack_count": schedule.context_pack_ids.len(),
+            "prompt_length": schedule.task_prompt.chars().count(),
+        }),
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(ScheduleResponse { schedule })))
+}
+
+async fn list_schedules<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+) -> Result<Json<SchedulesResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageSchedules,
+    )
+    .await?;
+    let schedules = state
+        .store
+        .list_schedules(&principal)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(SchedulesResponse { schedules }))
+}
+
+async fn get_schedule<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(schedule_id): Path<String>,
+) -> Result<Json<ScheduleResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageSchedules,
+    )
+    .await?;
+    let schedule = state
+        .store
+        .get_schedule(&principal, &schedule_id)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(ScheduleResponse { schedule }))
+}
+
+async fn update_schedule<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(schedule_id): Path<String>,
+    Json(request): Json<UpdateScheduleRequest>,
+) -> Result<Json<ScheduleResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageSchedules,
+    )
+    .await?;
+    let cron_expression = request
+        .cron_expression
+        .as_deref()
+        .map(normalized_utc_five_field_cron)
+        .transpose()?;
+    let next_run_at = cron_expression
+        .as_deref()
+        .map(|expression| next_cron_run_at(expression, Utc::now()))
+        .transpose()?;
+    let runner_mode = request
+        .runner_mode
+        .as_deref()
+        .map(validate_scheduled_runner_mode)
+        .transpose()?;
+    let schedule = state
+        .store
+        .update_schedule(
+            &principal,
+            &schedule_id,
+            UpdateScheduleInput {
+                name: request.name.map(|value| value.trim().to_string()),
+                description: request.description,
+                cron_expression,
+                enabled: request.enabled,
+                task_prompt: request.task_prompt,
+                prompt_template_ref: request.prompt_template_ref,
+                runner_mode,
+                context_pack_ids: request.context_pack_ids,
+                next_run_at,
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
+        "schedule.update",
+        TraceResult::Completed,
+        serde_json::json!({
+            "schedule_id": schedule.schedule_id.clone(),
+            "enabled": schedule.enabled,
+            "runner_mode": schedule.runner_mode.clone(),
+            "context_pack_count": schedule.context_pack_ids.len(),
+        }),
+    )
+    .await?;
+    Ok(Json(ScheduleResponse { schedule }))
+}
+
+async fn delete_schedule<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(schedule_id): Path<String>,
+) -> Result<Json<ScheduleResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageSchedules,
+    )
+    .await?;
+    let schedule = state
+        .store
+        .delete_schedule(&principal, &schedule_id)
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace).actor(principal.user_id.clone()),
+        "schedule.delete",
+        TraceResult::Completed,
+        serde_json::json!({ "schedule_id": schedule.schedule_id.clone() }),
+    )
+    .await?;
+    Ok(Json(ScheduleResponse { schedule }))
+}
+
+async fn list_schedule_runs<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(schedule_id): Path<String>,
+) -> Result<Json<ScheduleRunsResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageSchedules,
+    )
+    .await?;
+    let runs = state
+        .store
+        .list_schedule_runs(&principal, &schedule_id)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(ScheduleRunsResponse { runs }))
+}
+
+async fn run_schedule_now<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(schedule_id): Path<String>,
+) -> Result<(StatusCode, Json<ScheduleRunResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(
+        &state,
+        &trace,
+        &principal,
+        EnterpriseAction::ManageSchedules,
+    )
+    .await?;
+    let (run, output) = execute_schedule_run(state, trace, principal, schedule_id).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ScheduleRunResponse { run, output }),
+    ))
+}
+
+async fn execute_schedule_run<S>(
+    state: AppState<S>,
+    trace: TraceContext,
+    principal: AuthPrincipal,
+    schedule_id: String,
+) -> Result<(ScheduleRunRecord, Option<OutputRecord>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let schedule = state
+        .store
+        .get_schedule(&principal, &schedule_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let execution_principal = schedule_owner_principal(&state, &principal, &schedule).await?;
+    let run = state
+        .store
+        .create_schedule_run(
+            &execution_principal,
+            CreateScheduleRunInput {
+                schedule_id: schedule.schedule_id.clone(),
+                trace_id: trace.trace_id.clone(),
+                runner_mode: schedule.runner_mode.clone(),
+                metadata_json: serde_json::json!({
+                    "schedule_id": schedule.schedule_id.clone(),
+                    "runner_mode": schedule.runner_mode.clone(),
+                    "triggered_by_user_id": principal.user_id.clone(),
+                }),
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace).actor(execution_principal.user_id.clone()),
+        "schedule.run.start",
+        TraceResult::Completed,
+        serde_json::json!({
+            "schedule_id": schedule.schedule_id.clone(),
+            "run_id": run.run_id.clone(),
+            "runner_mode": schedule.runner_mode.clone(),
+            "triggered_by_user_id": principal.user_id.clone(),
+        }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace).actor(execution_principal.user_id.clone()),
+        "schedule.run.start",
+        TraceResult::Completed,
+        serde_json::json!({
+            "schedule_id": schedule.schedule_id.clone(),
+            "run_id": run.run_id.clone(),
+            "runner_mode": schedule.runner_mode.clone(),
+            "triggered_by_user_id": principal.user_id.clone(),
+        }),
+    )
+    .await?;
+
+    match schedule.runner_mode.as_str() {
+        "smoke" => {
+            execute_smoke_schedule_run(state, trace, execution_principal, schedule, run).await
+        }
+        "app_server_rpc" => Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "app_server_rpc scheduled runner is configured but not implemented in this beta slice",
+        )),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unknown scheduled runner mode",
+        )),
+    }
+}
+
+async fn schedule_owner_principal<S>(
+    state: &AppState<S>,
+    actor: &AuthPrincipal,
+    schedule: &ScheduleRecord,
+) -> Result<AuthPrincipal, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let users = state
+        .store
+        .list_users(actor)
+        .await
+        .map_err(ApiError::storage)?;
+    let owner = users
+        .into_iter()
+        .find(|user| user.user_id == schedule.owner_user_id && user.status == UserStatus::Active)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "schedule owner user not found or inactive",
+            )
+        })?;
+    Ok(AuthPrincipal {
+        user_id: owner.user_id,
+        email: owner.email,
+        role: EnterpriseRole::from_storage(&owner.role).unwrap_or(EnterpriseRole::Viewer),
+    })
+}
+
+async fn execute_smoke_schedule_run<S>(
+    state: AppState<S>,
+    trace: TraceContext,
+    principal: AuthPrincipal,
+    schedule: ScheduleRecord,
+    run: ScheduleRunRecord,
+) -> Result<(ScheduleRunRecord, Option<OutputRecord>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let session = state
+        .store
+        .create_scheduled_session(
+            &principal,
+            &schedule.project_id,
+            schedule.repository_id.clone(),
+            Some(format!("Scheduled: {}", schedule.name)),
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    state
+        .store
+        .create_session_message(
+            &principal,
+            &session.session_id,
+            CreateSessionMessageInput {
+                kind: "user".to_string(),
+                label: "Scheduled task".to_string(),
+                text: schedule.task_prompt.clone(),
+                retry_of_message_id: None,
+                supersedes_message_id: None,
+                context_cutoff_message_id: None,
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    let assistant_text = format!(
+        "# Scheduled smoke run completed\n\nSchedule `{}` ran in beta smoke mode. This deterministic output proves schedule, session, context, output, audit, and receipt wiring without launching a real Codex model turn.\n",
+        schedule.name
+    );
+    state
+        .store
+        .create_session_message(
+            &principal,
+            &session.session_id,
+            CreateSessionMessageInput {
+                kind: "assistant".to_string(),
+                label: "Codex".to_string(),
+                text: assistant_text.clone(),
+                retry_of_message_id: None,
+                supersedes_message_id: None,
+                context_cutoff_message_id: None,
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    if !schedule.context_pack_ids.is_empty() {
+        record_execution_receipt(
+            &state,
+            EvidenceRecordContext::new(&trace)
+                .actor(principal.user_id.clone())
+                .workspace(session.workspace_id.clone())
+                .session(session.session_id.clone()),
+            "context_pack.schedule_load",
+            TraceResult::Completed,
+            serde_json::json!({
+                "schedule_id": schedule.schedule_id.clone(),
+                "context_pack_count": schedule.context_pack_ids.len(),
+                "context_pack_ids": schedule.context_pack_ids.clone(),
+            }),
+        )
+        .await?;
+    }
+    let artifact_path =
+        generated_scheduled_output_artifact_path(&schedule.schedule_id, &run.run_id);
+    let output = state
+        .store
+        .create_output(CreateOutputInput {
+            owner_user_id: schedule.owner_user_id.clone(),
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            worker_id: None,
+            category: OutputCategory::Deliverable,
+            output_type: "markdown_report".to_string(),
+            title: format!("Scheduled output: {}", schedule.name),
+            artifact_path,
+            status: "completed".to_string(),
+            metadata_json: serde_json::json!({
+                "source": "scheduled_session",
+                "schedule_id": schedule.schedule_id.clone(),
+                "run_id": run.run_id.clone(),
+                "runner_mode": schedule.runner_mode.clone(),
+            }),
+        })
+        .await
+        .map_err(ApiError::storage)?;
+    let output_path = user_output_artifact_path(&state.config, &schedule.owner_user_id, &output)
+        .map_err(ApiError::storage)?;
+    tokio::fs::write(&output_path, assistant_text)
+        .await
+        .map_err(|error| ApiError::internal(error.into()))?;
+    let completed_at = Utc::now();
+    let next_run_at = next_cron_run_at(&schedule.cron_expression, completed_at)?;
+    let completed = state
+        .store
+        .complete_schedule_run(
+            &principal,
+            &run.run_id,
+            CompleteScheduleRunInput {
+                session_id: Some(session.session_id.clone()),
+                worker_id: None,
+                output_id: Some(output.output_id.clone()),
+                status: "completed".to_string(),
+                metadata_json: serde_json::json!({
+                    "schedule_id": schedule.schedule_id.clone(),
+                    "session_id": session.session_id.clone(),
+                    "output_id": output.output_id.clone(),
+                    "runner_mode": schedule.runner_mode.clone(),
+                    "context_pack_count": schedule.context_pack_ids.len(),
+                }),
+                completed_at,
+                next_run_at: Some(next_run_at),
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(session.workspace_id.clone())
+            .session(session.session_id.clone()),
+        "schedule.run.complete",
+        TraceResult::Completed,
+        serde_json::json!({
+            "schedule_id": schedule.schedule_id.clone(),
+            "run_id": run.run_id.clone(),
+            "session_id": session.session_id.clone(),
+            "output_id": output.output_id.clone(),
+            "runner_mode": schedule.runner_mode.clone(),
+            "context_pack_count": schedule.context_pack_ids.len(),
+        }),
+    )
+    .await?;
+    record_execution_receipt(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(session.workspace_id.clone())
+            .session(session.session_id.clone()),
+        "schedule.run.complete",
+        TraceResult::Completed,
+        serde_json::json!({
+            "schedule_id": schedule.schedule_id.clone(),
+            "run_id": run.run_id.clone(),
+            "session_id": session.session_id.clone(),
+            "output_id": output.output_id.clone(),
+            "runner_mode": schedule.runner_mode.clone(),
+        }),
+    )
+    .await?;
+    Ok((completed, Some(output)))
+}
+
 #[utoipa::path(
     get,
     path = "/v1/workers",
@@ -4307,6 +5048,13 @@ where
         "/admin/context-packs/assignments" => {
             ("Context Pack Assignments", context_pack_assignments_page())
         }
+        "/admin/schedules" => (
+            "Scheduled Sessions",
+            admin_console_page_for(
+                principal.as_ref().map(|principal| principal.role),
+                &schedules_page(&state.config),
+            ),
+        ),
         "/admin/outputs" => (
             "Reports And Outputs",
             admin_console_page_for(
@@ -4356,6 +5104,7 @@ fn admin_page_allowed(role: EnterpriseRole, path: &str) -> bool {
     matches!(
         (role, path),
         (EnterpriseRole::Manager, "/admin")
+            | (EnterpriseRole::Manager, "/admin/schedules")
             | (EnterpriseRole::Manager, "/admin/outputs")
             | (EnterpriseRole::Manager, "/admin/audit")
     )
@@ -4639,6 +5388,7 @@ __CONTENT__
     let adminUsers = [];
     let adminUserWorkspaces = [];
     let adminProjects = [];
+    let adminSchedules = [];
     function renderUserProjectControls() {
       const userSelect = document.getElementById('project-user-select');
       if (!userSelect) return;
@@ -4762,14 +5512,15 @@ __CONTENT__
     }
     async function refreshAdminChoices() {
       try {
-        const [usersPayload, workspacesPayload, userWorkspacesPayload, projectsPayload, packsPayload, assignmentsPayload, outputsPayload] = await Promise.all([
+        const [usersPayload, workspacesPayload, userWorkspacesPayload, projectsPayload, packsPayload, assignmentsPayload, outputsPayload, schedulesPayload] = await Promise.all([
           fetchJson('/v1/users').catch(() => ({users: []})),
           fetchJson('/v1/workspace-roots').catch(() => ({workspaces: []})),
           fetchJson('/v1/user-workspaces').catch(() => ({user_workspaces: []})),
           fetchJson('/v1/projects?include_deleted=true').catch(() => ({projects: []})),
           fetchJson('/v1/context-packs').catch(() => ({packs: []})),
           fetchJson('/v1/context-pack-assignments').catch(() => ({assignments: []})),
-          fetchJson('/v1/outputs').catch(() => ({outputs: []}))
+          fetchJson('/v1/outputs').catch(() => ({outputs: []})),
+          fetchJson('/v1/schedules').catch(() => ({schedules: []}))
         ]);
         const users = usersPayload.users || [];
         const workspaces = workspacesPayload.workspaces || [];
@@ -4778,9 +5529,11 @@ __CONTENT__
         const packs = packsPayload.packs || [];
         const assignments = assignmentsPayload.assignments || [];
         const outputs = outputsPayload.outputs || [];
+        const schedules = schedulesPayload.schedules || [];
         adminUsers = users;
         adminUserWorkspaces = userWorkspaces;
         adminProjects = projects;
+        adminSchedules = schedules;
         renderTable('user-index', [
           {label:'Email', value:(user) => user.email},
           {label:'Role', value:(user) => user.role},
@@ -4796,6 +5549,7 @@ __CONTENT__
           {label:'Created', value:(pack) => pack.created_at}
         ], packs, {message:'No context packs exist yet. Add or import a Context Pack before assigning governed operating packages.', href:'/admin/context-packs/new', label:'Add Context Pack'});
         renderAssignments('assignment-index', assignments, packs, users);
+        renderSchedules(schedules, users, projects);
         renderTable('output-index', [
           {label:'Category', value:(output) => output.category},
           {label:'Type', value:(output) => output.output_type},
@@ -4812,14 +5566,20 @@ __CONTENT__
         fillSelect('pack-file-pack-select', packs, (pack) => pack.name, (pack) => pack.pack_id, 'No context packs available');
         fillSelect('pack-user-select', users, (user) => user.email, (user) => user.user_id, 'No users available');
         fillSelect('output-user-select', users, (user) => user.email+' ('+user.role+')', (user) => user.user_id, 'No users available');
+        fillSelect('schedule-owner-select', users.filter((user) => user.status === 'active'), (user) => user.email+' ('+user.role+')', (user) => user.user_id, 'No active users available');
+        fillSelect('schedule-project-select', projects.filter((project) => !project.deleted_at), (project) => project.name, (project) => project.project_id, 'No active projects available');
+        fillSelect('schedule-context-pack-select', packs, (pack) => pack.name, (pack) => pack.pack_id, 'No context packs available');
+        fillSelect('schedule-run-select', schedules, (schedule) => schedule.name, (schedule) => schedule.schedule_id, 'No scheduled sessions available');
         fillSelect('user-workspace-select', workspaces, (workspace) => workspace.root_path, (workspace) => workspace.root_path, 'No registered workspaces available');
         fillSelect('pack-workspace-select', workspaces, (workspace) => workspace.root_path, (workspace) => workspace.root_path, 'No registered workspaces available');
+        fillOptionalRepositorySelect(document.getElementById('schedule-project-select')?.value || '');
         setEmptyState('user-empty-state', users.length === 0, 'No users exist yet. Add a user before assigning roles, account status, or user-scoped context.', '/admin/users/new', 'Add user');
         setEmptyState('pack-empty-state', packs.length === 0, 'No context packs exist yet. Create a Context Pack before assigning it to a user.', '/admin/context-packs/new', 'Add Context Pack');
         setEmptyState('pack-file-empty-state', packs.length === 0, 'No context packs exist yet. Create or import a Context Pack before registering package files.', '/admin/context-packs/new', 'Add Context Pack');
         setEmptyState('context-pack-empty-state', packs.length === 0, 'No context packs exist yet. Create a Context Pack before assigning it.', '/admin/context-packs/new', 'Add Context Pack');
         setEmptyState('workspace-empty-state', workspaces.length === 0, 'No registered workspaces are available. Add a workspace before assigning workspace-scoped context.', '/admin/workspaces/register', 'Add workspace');
         setEmptyState('pack-workspace-empty-state', workspaces.length === 0, 'No registered workspaces are available. Add a workspace before assigning this context pack.', '/admin/workspaces/register', 'Add workspace');
+        setEmptyState('schedule-dependency-empty-state', users.length === 0 || projects.filter((project) => !project.deleted_at).length === 0, 'Scheduled sessions need at least one active user and one active project. Create those first, then return here.', '/admin/users', 'Review users');
         let disabled = packs.length === 0 || users.length === 0 || workspaces.length === 0;
         setButtonDisabled('user-pack-assign-submit', disabled);
         disabled = packs.length === 0 || workspaces.length === 0;
@@ -4828,6 +5588,8 @@ __CONTENT__
         setButtonDisabled('role-assign-submit', users.length === 0);
         setButtonDisabled('role-remove-submit', users.length === 0);
         setButtonDisabled('output-create-submit', users.length === 0);
+        setButtonDisabled('schedule-create-submit', users.length === 0 || projects.filter((project) => !project.deleted_at).length === 0);
+        setButtonDisabled('schedule-run-refresh-submit', schedules.length === 0);
         setButtonDisabled('user-status-deactivate-submit', users.length === 0);
         setButtonDisabled('user-status-reactivate-submit', users.length === 0);
         renderUserProjectControls();
@@ -4873,6 +5635,91 @@ __CONTENT__
       }
       await postJson('/v1/projects/'+encodeURIComponent(projectId)+'/restorations', {});
       await refreshAdminChoices();
+    }
+    function fillOptionalRepositorySelect(projectId) {
+      const element = document.getElementById('schedule-repository-select');
+      if (!element) return;
+      const project = adminProjects.find((project) => project.project_id === projectId);
+      const repositories = project?.repositories || [];
+      element.innerHTML = '<option value="">Project root (no repository)</option>';
+      for (const repository of repositories) {
+        const option = document.createElement('option');
+        option.value = repository.repository_id;
+        option.textContent = repository.name + ' · ' + repository.repository_path;
+        element.appendChild(option);
+      }
+    }
+    function renderSchedules(schedules, users, projects) {
+      const target = document.getElementById('schedule-index');
+      if (!target) return;
+      if (!schedules.length) {
+        target.innerHTML = emptyStateHtml('No scheduled sessions exist yet. Create one to prove recurring work through the existing session and receipt lifecycle.', null, null);
+        return;
+      }
+      const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+      const userName = new Map(users.map((user) => [user.user_id, user.email]));
+      const projectName = new Map(projects.map((project) => [project.project_id, project.name]));
+      target.innerHTML = '<table class="resource-table"><thead><tr><th>Name</th><th>Owner</th><th>Project</th><th>Cron UTC</th><th>Mode</th><th>Enabled</th><th>Next run</th><th>Actions</th></tr></thead><tbody>'+
+        schedules.map((schedule) => '<tr><td>'+escape(schedule.name)+'</td><td>'+escape(userName.get(schedule.owner_user_id) || schedule.owner_user_id)+'</td><td>'+escape(projectName.get(schedule.project_id) || schedule.project_id)+'</td><td><code>'+escape(schedule.cron_expression)+'</code></td><td>'+escape(schedule.runner_mode)+'</td><td>'+escape(schedule.enabled ? 'yes' : 'no')+'</td><td>'+escape(schedule.next_run_at)+'</td><td><button onclick="runScheduleNow(&quot;'+escape(schedule.schedule_id)+'&quot;)">Run now</button> <button class="secondary" onclick="toggleSchedule(&quot;'+escape(schedule.schedule_id)+'&quot;,'+(!schedule.enabled)+')">'+(schedule.enabled ? 'Disable' : 'Enable')+'</button> <button class="secondary" onclick="refreshScheduleRuns(&quot;'+escape(schedule.schedule_id)+'&quot;)">Runs</button> <button class="danger" onclick="deleteSchedule(&quot;'+escape(schedule.schedule_id)+'&quot;)">Remove</button></td></tr>').join('')+
+        '</tbody></table>';
+    }
+    async function createScheduleFromForm() {
+      const ownerUserId = v('schedule-owner-select');
+      const projectId = v('schedule-project-select');
+      const repositoryId = v('schedule-repository-select');
+      const name = v('schedule-name').trim();
+      const cronExpression = v('schedule-cron').trim();
+      const taskPrompt = v('schedule-task-prompt').trim();
+      if (!ownerUserId || !projectId || !name || !cronExpression || !taskPrompt) {
+        document.getElementById('result').textContent = 'Choose an owner and project, then enter a name, UTC 5-field cron, and task prompt.';
+        return;
+      }
+      await postJsonPayload('/v1/schedules', {
+        owner_user_id: ownerUserId,
+        project_id: projectId,
+        repository_id: repositoryId || undefined,
+        name,
+        description: v('schedule-description') || undefined,
+        cron_expression: cronExpression,
+        enabled: document.getElementById('schedule-enabled')?.checked !== false,
+        task_prompt: taskPrompt,
+        runner_mode: v('schedule-runner-mode') || 'smoke',
+        context_pack_ids: selectedValues('schedule-context-pack-select')
+      });
+      await refreshAdminChoices();
+    }
+    async function runScheduleNow(scheduleId) {
+      await postJsonPayload('/v1/schedules/'+encodeURIComponent(scheduleId)+'/runs', {});
+      await refreshAdminChoices();
+      await refreshScheduleRuns(scheduleId);
+    }
+    async function toggleSchedule(scheduleId, enabled) {
+      await patchJsonPayload('/v1/schedules/'+encodeURIComponent(scheduleId), {enabled});
+      await refreshAdminChoices();
+    }
+    async function deleteSchedule(scheduleId) {
+      if (!confirm('Remove this scheduled session? Existing run records remain queryable.')) return;
+      await deleteJsonPayload('/v1/schedules/'+encodeURIComponent(scheduleId));
+      await refreshAdminChoices();
+    }
+    async function refreshScheduleRuns(scheduleId) {
+      const target = document.getElementById('schedule-run-index');
+      if (!target) return;
+      const id = scheduleId || v('schedule-run-select');
+      if (!id) {
+        target.innerHTML = emptyStateHtml('No scheduled session is selected.', null, null);
+        return;
+      }
+      const payload = await fetchJson('/v1/schedules/'+encodeURIComponent(id)+'/runs');
+      renderTable('schedule-run-index', [
+        {label:'Status', value:(run) => run.status},
+        {label:'Mode', value:(run) => run.runner_mode},
+        {label:'Trace', value:(run) => run.trace_id},
+        {label:'Session', value:(run) => run.session_id || ''},
+        {label:'Output', value:(run) => run.output_id || ''},
+        {label:'Started', value:(run) => run.started_at},
+        {label:'Completed', value:(run) => run.completed_at || ''}
+      ], payload.runs || [], {message:'No runs exist for this scheduled session yet. Use Run now to validate the schedule path.', href:null, label:null});
     }
     async function assignPacksFromUserPage() {
       if (document.getElementById('user-pack-assign-submit')?.disabled) {
@@ -6330,7 +7177,7 @@ __CONTENT__
         clientInfo: {
           name: 'local-codex-enterprise-browser',
           title: 'Local Codex Enterprise Browser Chat',
-          version: '0.0.1-beta.7'
+          version: '0.0.1-beta.8'
         },
         capabilities: {
           experimentalApi: true,
@@ -6889,6 +7736,41 @@ fn context_pack_assignments_page() -> String {
     )
 }
 
+fn schedules_page(config: &EnterpriseConfig) -> String {
+    let runner_label = html_escape(&scheduled_runner_mode_label(&config.scheduled_runner_mode));
+    format!(
+        r#"
+      <section>
+        <h2>Scheduled Sessions</h2>
+        <p class="hint">Automation is implemented as scheduled sessions: schedule -> session -> Context Pack loading -> worker path -> output -> receipts. Context Packs are loaded as operating context; they are not executed as workflows.</p>
+        <p class="hint"><strong>Current runner mode:</strong> {runner_label}. Set <code>LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE=app_server_rpc</code> only when you want scheduled sessions to use the real Codex worker RPC path.</p>
+        <div id="schedule-dependency-empty-state" hidden></div>
+        <label>Owner user<select id="schedule-owner-select"></select></label>
+        <label>Project<select id="schedule-project-select" onchange="fillOptionalRepositorySelect(this.value)"></select></label>
+        <label>Repository<select id="schedule-repository-select"><option value="">Project root (no repository)</option></select></label>
+        <label>Name<input id="schedule-name" placeholder="Weekly architecture review"></label>
+        <label>Description<input id="schedule-description" placeholder="Optional schedule description"></label>
+        <label>UTC cron expression<input id="schedule-cron" value="0 13 * * 1"></label>
+        <p class="hint">Use standard 5-field UTC cron only: minute hour day-of-month month day-of-week.</p>
+        <label>Context packs <span class="muted">(select multiple)</span><select id="schedule-context-pack-select" multiple></select></label>
+        <label>Runner mode<select id="schedule-runner-mode"><option value="smoke">smoke beta/default: deterministic validation output</option><option value="app_server_rpc">app_server_rpc: real Codex worker execution</option></select></label>
+        <label><input id="schedule-enabled" type="checkbox" checked> Enabled</label>
+        <label>Task prompt<textarea id="schedule-task-prompt" placeholder="Review this project and produce a short markdown report."></textarea></label>
+        <button id="schedule-create-submit" onclick="createScheduleFromForm()">Create Scheduled Session</button>
+      </section>
+      <section>
+        <h2>Schedule Index</h2>
+        <div id="schedule-index"></div>
+      </section>
+      <section>
+        <h2>Run History</h2>
+        <label>Scheduled session<select id="schedule-run-select" onchange="refreshScheduleRuns()"></select></label>
+        <button id="schedule-run-refresh-submit" class="secondary" onclick="refreshScheduleRuns()">Refresh Runs</button>
+        <div id="schedule-run-index"></div>
+      </section>"#,
+    )
+}
+
 fn admin_console_page(content: &str) -> String {
     admin_console_page_for(Some(EnterpriseRole::Admin), content)
 }
@@ -6913,6 +7795,7 @@ fn admin_tree(role: Option<EnterpriseRole>) -> String {
         <h3>Permitted sections</h3>
         <div class="tree-group">
           <strong>Evidence</strong>
+          <a href="/admin/schedules">Scheduled sessions</a>
           <a href="/admin/outputs">Reports and outputs</a>
           <a href="/admin/audit">Audit</a>
         </div>
@@ -6949,6 +7832,10 @@ fn admin_tree(role: Option<EnterpriseRole>) -> String {
           <a href="/admin/context-packs/import">Import pack</a>
           <a href="/admin/users/context-packs">Assign packs by user</a>
           <a href="/admin/context-packs/assignments">Assign users by pack</a>
+        </div>
+        <div class="tree-group">
+          <strong>Runtime</strong>
+          <a href="/admin/schedules">Scheduled sessions</a>
         </div>
         <div class="tree-group">
           <strong>Evidence</strong>
@@ -7343,6 +8230,7 @@ fn rbac_permission_matrix_html() -> String {
         EnterpriseAction::ManageContextPacks,
         EnterpriseAction::ManageOutputs,
         EnterpriseAction::ManageOwnContextPacks,
+        EnterpriseAction::ManageSchedules,
         EnterpriseAction::StartWorker,
         EnterpriseAction::ReadThreads,
         EnterpriseAction::ReadAudit,
@@ -7377,6 +8265,7 @@ fn action_label(action: EnterpriseAction) -> &'static str {
         EnterpriseAction::ManageContextPacks => "manage_context_packs",
         EnterpriseAction::ManageOutputs => "manage_outputs",
         EnterpriseAction::ManageOwnContextPacks => "manage_own_context_packs",
+        EnterpriseAction::ManageSchedules => "manage_schedules",
         EnterpriseAction::StartWorker => "start_worker",
         EnterpriseAction::ReadThreads => "read_threads",
         EnterpriseAction::ReadAudit => "read_audit",
@@ -7637,6 +8526,68 @@ fn parse_output_category(value: &str) -> Result<OutputCategory, ApiError> {
 fn generated_chat_output_artifact_path(thread_id: &str, title: &str) -> String {
     let slug = slugify_output_title(title);
     format!("chat/{thread_id}/{}-{slug}.md", Uuid::new_v4())
+}
+
+fn generated_scheduled_output_artifact_path(schedule_id: &str, run_id: &str) -> String {
+    format!("scheduled/{schedule_id}/{run_id}.md")
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn scheduled_runner_mode_label(value: &str) -> &'static str {
+    match value {
+        "smoke" => "smoke beta/default: deterministic validation output, no real Codex model turn",
+        "app_server_rpc" => "app_server_rpc: real Codex worker execution",
+        _ => "unknown scheduled runner mode",
+    }
+}
+
+fn validate_scheduled_runner_mode(value: &str) -> Result<String, ApiError> {
+    match value {
+        "smoke" | "app_server_rpc" => Ok(value.to_string()),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unknown scheduled runner mode",
+        )),
+    }
+}
+
+fn normalized_utc_five_field_cron(value: &str) -> Result<String, ApiError> {
+    let expression = value
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if expression.split_whitespace().count() != 5 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "scheduled sessions use standard 5-field UTC cron",
+        ));
+    }
+    Cron::from_str(&expression).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "scheduled sessions use standard 5-field UTC cron",
+        )
+    })?;
+    Ok(expression)
+}
+
+fn next_cron_run_at(expression: &str, after: DateTime<Utc>) -> Result<DateTime<Utc>, ApiError> {
+    let cron = Cron::from_str(expression).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "scheduled sessions use standard 5-field UTC cron",
+        )
+    })?;
+    cron.find_next_occurrence(&after, false).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "scheduled sessions use standard 5-field UTC cron",
+        )
+    })
 }
 
 fn slugify_output_title(title: &str) -> String {

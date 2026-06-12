@@ -27,6 +27,7 @@ pub enum EnterpriseAction {
     ManageContextPacks,
     ManageOutputs,
     ManageOwnContextPacks,
+    ManageSchedules,
     StartWorker,
     ReadThreads,
     ReadAudit,
@@ -65,6 +66,7 @@ impl EnterpriseAction {
             Self::ManageContextPacks => "manage_context_packs",
             Self::ManageOutputs => "manage_outputs",
             Self::ManageOwnContextPacks => "manage_own_context_packs",
+            Self::ManageSchedules => "manage_schedules",
             Self::StartWorker => "start_worker",
             Self::ReadThreads => "read_threads",
             Self::ReadAudit => "read_audit",
@@ -85,13 +87,21 @@ pub fn role_allows(role: EnterpriseRole, action: EnterpriseAction) -> bool {
                 | ManageWorkspaces
                 | GrantWorkspaceAccess
                 | ManageContextPacks
+                | ManageOutputs
+                | ManageOwnContextPacks
+                | ManageSchedules
                 | StartWorker
                 | ReadThreads
                 | ReadAudit
         ),
         Manager => matches!(
             action,
-            GrantWorkspaceAccess | ManageOutputs | StartWorker | ReadThreads | ReadAudit
+            GrantWorkspaceAccess
+                | ManageOutputs
+                | ManageSchedules
+                | StartWorker
+                | ReadThreads
+                | ReadAudit
         ),
         Developer => matches!(
             action,
@@ -153,11 +163,15 @@ fn policy_matrix() -> Vec<(&'static str, &'static str)> {
         ("admin", "manage_workspaces"),
         ("admin", "grant_workspace_access"),
         ("admin", "manage_context_packs"),
+        ("admin", "manage_outputs"),
+        ("admin", "manage_own_context_packs"),
+        ("admin", "manage_schedules"),
         ("admin", "start_worker"),
         ("admin", "read_threads"),
         ("admin", "read_audit"),
         ("manager", "grant_workspace_access"),
         ("manager", "manage_outputs"),
+        ("manager", "manage_schedules"),
         ("manager", "start_worker"),
         ("manager", "read_threads"),
         ("manager", "read_audit"),

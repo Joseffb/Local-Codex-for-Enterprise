@@ -384,6 +384,7 @@ pub struct SessionRecord {
     pub owner_user_id: String,
     pub workspace_id: String,
     pub workspace_path: String,
+    pub session_type: String,
     pub project_id: Option<String>,
     pub repository_id: Option<String>,
     pub title: Option<String>,
@@ -465,6 +466,55 @@ pub struct ThreadReferenceRecord {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ScheduleRecord {
+    pub schedule_id: String,
+    pub owner_user_id: String,
+    pub created_by_user_id: String,
+    pub project_id: String,
+    pub repository_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub cron_expression: String,
+    pub enabled: bool,
+    pub task_prompt: String,
+    pub prompt_template_ref: Option<String>,
+    pub runner_mode: String,
+    pub context_pack_ids: Vec<String>,
+    #[schema(value_type = String)]
+    pub next_run_at: DateTime<Utc>,
+    #[schema(value_type = Option<String>)]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[schema(value_type = String)]
+    pub created_at: DateTime<Utc>,
+    #[schema(value_type = String)]
+    pub updated_at: DateTime<Utc>,
+    #[schema(value_type = Option<String>)]
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ScheduleRunRecord {
+    pub run_id: String,
+    pub schedule_id: String,
+    pub owner_user_id: String,
+    pub session_id: Option<String>,
+    pub worker_id: Option<String>,
+    pub output_id: Option<String>,
+    pub trace_id: String,
+    pub status: String,
+    pub runner_mode: String,
+    pub metadata_json: serde_json::Value,
+    #[schema(value_type = String)]
+    pub started_at: DateTime<Utc>,
+    #[schema(value_type = Option<String>)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[schema(value_type = String)]
+    pub created_at: DateTime<Utc>,
+    #[schema(value_type = String)]
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSessionMessageInput {
     pub kind: String,
@@ -504,6 +554,54 @@ pub struct UpdateThreadReferenceInput {
     pub output_id: Option<String>,
     pub status: String,
     pub metadata_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateScheduleInput {
+    pub owner_user_id: String,
+    pub project_id: String,
+    pub repository_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub cron_expression: String,
+    pub enabled: bool,
+    pub task_prompt: String,
+    pub prompt_template_ref: Option<String>,
+    pub runner_mode: String,
+    pub context_pack_ids: Vec<String>,
+    pub next_run_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateScheduleInput {
+    pub name: Option<String>,
+    pub description: Option<Option<String>>,
+    pub cron_expression: Option<String>,
+    pub enabled: Option<bool>,
+    pub task_prompt: Option<String>,
+    pub prompt_template_ref: Option<Option<String>>,
+    pub runner_mode: Option<String>,
+    pub context_pack_ids: Option<Vec<String>>,
+    pub next_run_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateScheduleRunInput {
+    pub schedule_id: String,
+    pub trace_id: String,
+    pub runner_mode: String,
+    pub metadata_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompleteScheduleRunInput {
+    pub session_id: Option<String>,
+    pub worker_id: Option<String>,
+    pub output_id: Option<String>,
+    pub status: String,
+    pub metadata_json: serde_json::Value,
+    pub completed_at: DateTime<Utc>,
+    pub next_run_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -643,6 +741,44 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
         reference_id: &str,
         input: UpdateThreadReferenceInput,
     ) -> Result<ThreadReferenceRecord>;
+    async fn create_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateScheduleInput,
+    ) -> Result<ScheduleRecord>;
+    async fn list_schedules(&self, principal: &AuthPrincipal) -> Result<Vec<ScheduleRecord>>;
+    async fn get_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<ScheduleRecord>;
+    async fn update_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+        input: UpdateScheduleInput,
+    ) -> Result<ScheduleRecord>;
+    async fn delete_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<ScheduleRecord>;
+    async fn create_schedule_run(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateScheduleRunInput,
+    ) -> Result<ScheduleRunRecord>;
+    async fn complete_schedule_run(
+        &self,
+        principal: &AuthPrincipal,
+        run_id: &str,
+        input: CompleteScheduleRunInput,
+    ) -> Result<ScheduleRunRecord>;
+    async fn list_schedule_runs(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<Vec<ScheduleRunRecord>>;
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -700,6 +836,13 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
         &self,
         principal: &AuthPrincipal,
         input: CreateProjectThreadInput,
+    ) -> Result<SessionRecord>;
+    async fn create_scheduled_session(
+        &self,
+        principal: &AuthPrincipal,
+        project_id: &str,
+        repository_id: Option<String>,
+        title: Option<String>,
     ) -> Result<SessionRecord>;
     async fn clone_project_repository(
         &self,
@@ -798,6 +941,8 @@ struct MemoryState {
     sessions: HashMap<String, SessionRecord>,
     session_messages: HashMap<String, Vec<SessionMessageRecord>>,
     thread_references: Vec<ThreadReferenceRecord>,
+    schedules: Vec<ScheduleRecord>,
+    schedule_runs: Vec<ScheduleRunRecord>,
     response_feedback: HashMap<String, ResponseFeedbackRecord>,
     response_preferences: HashMap<String, UserResponsePreferencesRecord>,
     audit_events: Vec<AuditEventRecord>,
@@ -1569,6 +1714,264 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         Ok(reference.clone())
     }
 
+    async fn create_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateScheduleInput,
+    ) -> Result<ScheduleRecord> {
+        let mut state = self.state.lock().await;
+        if !matches!(
+            principal.role,
+            EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+        ) {
+            anyhow::bail!("schedule not found");
+        }
+        if state.user_statuses.get(&input.owner_user_id) != Some(&UserStatus::Active) {
+            anyhow::bail!("schedule owner user not found or inactive");
+        }
+        let project = state
+            .projects
+            .iter()
+            .find(|project| project.project_id == input.project_id)
+            .filter(|project| project.deleted_at.is_none())
+            .cloned()
+            .context("project not found")?;
+        if let Some(repository_id) = input.repository_id.as_deref() {
+            state
+                .repositories
+                .iter()
+                .find(|repository| {
+                    repository.project_id == project.project_id
+                        && repository.repository_id == repository_id
+                })
+                .context("repository not found")?;
+        }
+        for pack_id in &input.context_pack_ids {
+            state
+                .context_packs
+                .get(pack_id)
+                .context("context pack not found")?;
+        }
+        let now = Utc::now();
+        let schedule = ScheduleRecord {
+            schedule_id: Uuid::new_v4().to_string(),
+            owner_user_id: input.owner_user_id,
+            created_by_user_id: principal.user_id.clone(),
+            project_id: input.project_id,
+            repository_id: input.repository_id,
+            name: input.name,
+            description: input.description,
+            cron_expression: input.cron_expression,
+            enabled: input.enabled,
+            task_prompt: input.task_prompt,
+            prompt_template_ref: input.prompt_template_ref,
+            runner_mode: input.runner_mode,
+            context_pack_ids: input.context_pack_ids,
+            next_run_at: input.next_run_at,
+            last_run_at: None,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        state.schedules.push(schedule.clone());
+        Ok(schedule)
+    }
+
+    async fn list_schedules(&self, principal: &AuthPrincipal) -> Result<Vec<ScheduleRecord>> {
+        let state = self.state.lock().await;
+        let mut schedules = state
+            .schedules
+            .iter()
+            .filter(|schedule| schedule.deleted_at.is_none())
+            .filter(|schedule| {
+                matches!(
+                    principal.role,
+                    EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+                ) || schedule.owner_user_id == principal.user_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        schedules.sort_by_key(|schedule| std::cmp::Reverse(schedule.updated_at));
+        Ok(schedules)
+    }
+
+    async fn get_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<ScheduleRecord> {
+        let state = self.state.lock().await;
+        state
+            .schedules
+            .iter()
+            .find(|schedule| schedule.schedule_id == schedule_id && schedule.deleted_at.is_none())
+            .filter(|schedule| {
+                matches!(
+                    principal.role,
+                    EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+                ) || schedule.owner_user_id == principal.user_id
+            })
+            .cloned()
+            .context("schedule not found")
+    }
+
+    async fn update_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+        input: UpdateScheduleInput,
+    ) -> Result<ScheduleRecord> {
+        let mut state = self.state.lock().await;
+        let schedule = state
+            .schedules
+            .iter_mut()
+            .find(|schedule| schedule.schedule_id == schedule_id && schedule.deleted_at.is_none())
+            .filter(|schedule| {
+                matches!(
+                    principal.role,
+                    EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+                ) || schedule.owner_user_id == principal.user_id
+            })
+            .context("schedule not found")?;
+        if let Some(name) = input.name {
+            schedule.name = name;
+        }
+        if let Some(description) = input.description {
+            schedule.description = description;
+        }
+        if let Some(cron_expression) = input.cron_expression {
+            schedule.cron_expression = cron_expression;
+        }
+        if let Some(enabled) = input.enabled {
+            schedule.enabled = enabled;
+        }
+        if let Some(task_prompt) = input.task_prompt {
+            schedule.task_prompt = task_prompt;
+        }
+        if let Some(prompt_template_ref) = input.prompt_template_ref {
+            schedule.prompt_template_ref = prompt_template_ref;
+        }
+        if let Some(runner_mode) = input.runner_mode {
+            schedule.runner_mode = runner_mode;
+        }
+        if let Some(context_pack_ids) = input.context_pack_ids {
+            schedule.context_pack_ids = context_pack_ids;
+        }
+        if let Some(next_run_at) = input.next_run_at {
+            schedule.next_run_at = next_run_at;
+        }
+        schedule.updated_at = Utc::now();
+        Ok(schedule.clone())
+    }
+
+    async fn delete_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<ScheduleRecord> {
+        let mut state = self.state.lock().await;
+        let schedule = state
+            .schedules
+            .iter_mut()
+            .find(|schedule| schedule.schedule_id == schedule_id && schedule.deleted_at.is_none())
+            .filter(|schedule| {
+                matches!(
+                    principal.role,
+                    EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+                ) || schedule.owner_user_id == principal.user_id
+            })
+            .context("schedule not found")?;
+        let now = Utc::now();
+        schedule.deleted_at = Some(now);
+        schedule.updated_at = now;
+        Ok(schedule.clone())
+    }
+
+    async fn create_schedule_run(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateScheduleRunInput,
+    ) -> Result<ScheduleRunRecord> {
+        let schedule = self.get_schedule(principal, &input.schedule_id).await?;
+        let now = Utc::now();
+        let run = ScheduleRunRecord {
+            run_id: Uuid::new_v4().to_string(),
+            schedule_id: schedule.schedule_id,
+            owner_user_id: schedule.owner_user_id,
+            session_id: None,
+            worker_id: None,
+            output_id: None,
+            trace_id: input.trace_id,
+            status: "running".to_string(),
+            runner_mode: input.runner_mode,
+            metadata_json: input.metadata_json,
+            started_at: now,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.state.lock().await.schedule_runs.push(run.clone());
+        Ok(run)
+    }
+
+    async fn complete_schedule_run(
+        &self,
+        principal: &AuthPrincipal,
+        run_id: &str,
+        input: CompleteScheduleRunInput,
+    ) -> Result<ScheduleRunRecord> {
+        let mut state = self.state.lock().await;
+        let run = state
+            .schedule_runs
+            .iter_mut()
+            .find(|run| run.run_id == run_id)
+            .filter(|run| {
+                matches!(
+                    principal.role,
+                    EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+                ) || run.owner_user_id == principal.user_id
+            })
+            .context("schedule run not found")?;
+        run.session_id = input.session_id;
+        run.worker_id = input.worker_id;
+        run.output_id = input.output_id;
+        run.status = input.status;
+        run.metadata_json = input.metadata_json;
+        run.completed_at = Some(input.completed_at);
+        run.updated_at = input.completed_at;
+        let schedule_id = run.schedule_id.clone();
+        let completed = run.clone();
+        if let Some(schedule) = state
+            .schedules
+            .iter_mut()
+            .find(|schedule| schedule.schedule_id == schedule_id)
+        {
+            schedule.last_run_at = Some(input.completed_at);
+            if let Some(next_run_at) = input.next_run_at {
+                schedule.next_run_at = next_run_at;
+            }
+            schedule.updated_at = input.completed_at;
+        }
+        Ok(completed)
+    }
+
+    async fn list_schedule_runs(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<Vec<ScheduleRunRecord>> {
+        self.get_schedule(principal, schedule_id).await?;
+        let state = self.state.lock().await;
+        let mut runs = state
+            .schedule_runs
+            .iter()
+            .filter(|run| run.schedule_id == schedule_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
+        Ok(runs)
+    }
+
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -1879,6 +2282,49 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         {
             project.updated_at = Utc::now();
         }
+        Ok(session)
+    }
+
+    async fn create_scheduled_session(
+        &self,
+        principal: &AuthPrincipal,
+        project_id: &str,
+        repository_id: Option<String>,
+        title: Option<String>,
+    ) -> Result<SessionRecord> {
+        let mut state = self.state.lock().await;
+        let project = state
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .filter(|project| project.deleted_at.is_none())
+            .cloned()
+            .context("project not found")?;
+        let workspace_path = match repository_id.as_ref() {
+            Some(repository_id) => state
+                .repositories
+                .iter()
+                .find(|repository| {
+                    repository.repository_id == *repository_id
+                        && repository.project_id == project.project_id
+                })
+                .map(|repository| repository.repository_path.clone())
+                .context("repository not found")?,
+            None => project.project_path.clone(),
+        };
+        let mut session = create_session_record(
+            &authorized_roots_for_user(&state, principal),
+            principal,
+            None,
+            workspace_path,
+            title,
+        )?;
+        session.session_type = "scheduled".to_string();
+        session.project_id = Some(project.project_id);
+        session.repository_id = repository_id;
+        state
+            .sessions
+            .insert(session.session_id.clone(), session.clone());
         Ok(session)
     }
 
@@ -3258,6 +3704,360 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         thread_reference_from_row(row)
     }
 
+    async fn create_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateScheduleInput,
+    ) -> Result<ScheduleRecord> {
+        if !matches!(
+            principal.role,
+            EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+        ) {
+            anyhow::bail!("schedule not found");
+        }
+        let owner_user_id =
+            Uuid::parse_str(&input.owner_user_id).context("parse schedule owner user id")?;
+        let created_by_user_id =
+            Uuid::parse_str(&principal.user_id).context("parse schedule creator user id")?;
+        let project_id = Uuid::parse_str(&input.project_id).context("parse schedule project id")?;
+        let repository_id = input
+            .repository_id
+            .as_deref()
+            .map(|repository_id| Uuid::parse_str(repository_id).context("parse repository id"))
+            .transpose()?;
+        let pack_ids = input
+            .context_pack_ids
+            .iter()
+            .map(|pack_id| Uuid::parse_str(pack_id).context("parse context pack id"))
+            .collect::<Result<Vec<_>>>()?;
+
+        sqlx::query("SELECT 1 FROM enterprise_users WHERE user_id = $1 AND status = 'active'")
+            .bind(owner_user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("load schedule owner")?
+            .context("schedule owner user not found or inactive")?;
+
+        self.get_project_for_user(principal, &input.project_id)
+            .await?;
+        if let Some(repository_id) = input.repository_id.as_deref() {
+            self.get_repository_for_project(&input.project_id, repository_id)
+                .await?;
+        }
+        for pack_id in &pack_ids {
+            sqlx::query("SELECT 1 FROM enterprise_context_packs WHERE pack_id = $1")
+                .bind(pack_id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("load schedule context pack")?
+                .context("context pack not found")?;
+        }
+
+        let schedule_id = Uuid::new_v4();
+        let mut tx = self.pool.begin().await.context("begin schedule tx")?;
+        let row = sqlx::query(
+            "INSERT INTO enterprise_schedules
+             (schedule_id, owner_user_id, created_by_user_id, project_id, repository_id, name, description, cron_expression, enabled, task_prompt, prompt_template_ref, runner_mode, next_run_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             RETURNING schedule_id::text, owner_user_id::text, created_by_user_id::text, project_id::text, repository_id::text, name, description, cron_expression, enabled, task_prompt, prompt_template_ref, runner_mode, next_run_at, last_run_at, created_at, updated_at, deleted_at",
+        )
+        .bind(schedule_id)
+        .bind(owner_user_id)
+        .bind(created_by_user_id)
+        .bind(project_id)
+        .bind(repository_id)
+        .bind(input.name)
+        .bind(input.description)
+        .bind(input.cron_expression)
+        .bind(input.enabled)
+        .bind(input.task_prompt)
+        .bind(input.prompt_template_ref)
+        .bind(input.runner_mode)
+        .bind(input.next_run_at)
+        .fetch_one(&mut *tx)
+        .await
+        .context("insert schedule")?;
+        for pack_id in &pack_ids {
+            sqlx::query(
+                "INSERT INTO enterprise_schedule_context_packs (schedule_id, pack_id)
+                 VALUES ($1, $2)",
+            )
+            .bind(schedule_id)
+            .bind(pack_id)
+            .execute(&mut *tx)
+            .await
+            .context("insert schedule context pack")?;
+        }
+        tx.commit().await.context("commit schedule tx")?;
+        schedule_from_row(row, input.context_pack_ids)
+    }
+
+    async fn list_schedules(&self, principal: &AuthPrincipal) -> Result<Vec<ScheduleRecord>> {
+        let rows = if matches!(
+            principal.role,
+            EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+        ) {
+            sqlx::query(
+                "SELECT schedule_id::text, owner_user_id::text, created_by_user_id::text, project_id::text, repository_id::text, name, description, cron_expression, enabled, task_prompt, prompt_template_ref, runner_mode, next_run_at, last_run_at, created_at, updated_at, deleted_at
+                 FROM enterprise_schedules
+                 WHERE deleted_at IS NULL
+                 ORDER BY updated_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .context("list schedules")?
+        } else {
+            sqlx::query(
+                "SELECT schedule_id::text, owner_user_id::text, created_by_user_id::text, project_id::text, repository_id::text, name, description, cron_expression, enabled, task_prompt, prompt_template_ref, runner_mode, next_run_at, last_run_at, created_at, updated_at, deleted_at
+                 FROM enterprise_schedules
+                 WHERE owner_user_id = $1 AND deleted_at IS NULL
+                 ORDER BY updated_at DESC",
+            )
+            .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+            .fetch_all(&self.pool)
+            .await
+            .context("list schedules")?
+        };
+        let mut schedules = Vec::with_capacity(rows.len());
+        for row in rows {
+            let schedule_id: String = row.try_get("schedule_id")?;
+            let context_pack_ids = self.schedule_context_pack_ids(&schedule_id).await?;
+            schedules.push(schedule_from_row(row, context_pack_ids)?);
+        }
+        Ok(schedules)
+    }
+
+    async fn get_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<ScheduleRecord> {
+        let schedule_uuid = Uuid::parse_str(schedule_id).context("parse schedule id")?;
+        let row = if matches!(
+            principal.role,
+            EnterpriseRole::Admin | EnterpriseRole::Owner | EnterpriseRole::Manager
+        ) {
+            sqlx::query(
+                "SELECT schedule_id::text, owner_user_id::text, created_by_user_id::text, project_id::text, repository_id::text, name, description, cron_expression, enabled, task_prompt, prompt_template_ref, runner_mode, next_run_at, last_run_at, created_at, updated_at, deleted_at
+                 FROM enterprise_schedules
+                 WHERE schedule_id = $1 AND deleted_at IS NULL",
+            )
+            .bind(schedule_uuid)
+            .fetch_optional(&self.pool)
+            .await
+            .context("get schedule")?
+        } else {
+            sqlx::query(
+                "SELECT schedule_id::text, owner_user_id::text, created_by_user_id::text, project_id::text, repository_id::text, name, description, cron_expression, enabled, task_prompt, prompt_template_ref, runner_mode, next_run_at, last_run_at, created_at, updated_at, deleted_at
+                 FROM enterprise_schedules
+                 WHERE schedule_id = $1 AND owner_user_id = $2 AND deleted_at IS NULL",
+            )
+            .bind(schedule_uuid)
+            .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+            .fetch_optional(&self.pool)
+            .await
+            .context("get schedule")?
+        }
+        .context("schedule not found")?;
+        let context_pack_ids = self.schedule_context_pack_ids(schedule_id).await?;
+        schedule_from_row(row, context_pack_ids)
+    }
+
+    async fn update_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+        input: UpdateScheduleInput,
+    ) -> Result<ScheduleRecord> {
+        let existing = self.get_schedule(principal, schedule_id).await?;
+        let schedule_uuid = Uuid::parse_str(schedule_id).context("parse schedule id")?;
+        let context_pack_ids = input.context_pack_ids.clone();
+        if let Some(pack_ids) = context_pack_ids.as_ref() {
+            for pack_id in pack_ids {
+                sqlx::query("SELECT 1 FROM enterprise_context_packs WHERE pack_id = $1")
+                    .bind(Uuid::parse_str(pack_id).context("parse context pack id")?)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .context("load schedule context pack")?
+                    .context("context pack not found")?;
+            }
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin schedule update tx")?;
+        let row = sqlx::query(
+            "UPDATE enterprise_schedules
+             SET name = $2,
+                 description = $3,
+                 cron_expression = $4,
+                 enabled = $5,
+                 task_prompt = $6,
+                 prompt_template_ref = $7,
+                 runner_mode = $8,
+                 next_run_at = $9,
+                 updated_at = now()
+             WHERE schedule_id = $1 AND deleted_at IS NULL
+             RETURNING schedule_id::text, owner_user_id::text, created_by_user_id::text, project_id::text, repository_id::text, name, description, cron_expression, enabled, task_prompt, prompt_template_ref, runner_mode, next_run_at, last_run_at, created_at, updated_at, deleted_at",
+        )
+        .bind(schedule_uuid)
+        .bind(input.name.unwrap_or(existing.name))
+        .bind(input.description.unwrap_or(existing.description))
+        .bind(input.cron_expression.unwrap_or(existing.cron_expression))
+        .bind(input.enabled.unwrap_or(existing.enabled))
+        .bind(input.task_prompt.unwrap_or(existing.task_prompt))
+        .bind(input.prompt_template_ref.unwrap_or(existing.prompt_template_ref))
+        .bind(input.runner_mode.unwrap_or(existing.runner_mode))
+        .bind(input.next_run_at.unwrap_or(existing.next_run_at))
+        .fetch_one(&mut *tx)
+        .await
+        .context("update schedule")?;
+        let final_context_pack_ids = if let Some(pack_ids) = context_pack_ids {
+            sqlx::query("DELETE FROM enterprise_schedule_context_packs WHERE schedule_id = $1")
+                .bind(schedule_uuid)
+                .execute(&mut *tx)
+                .await
+                .context("clear schedule context packs")?;
+            for pack_id in &pack_ids {
+                sqlx::query(
+                    "INSERT INTO enterprise_schedule_context_packs (schedule_id, pack_id)
+                     VALUES ($1, $2)",
+                )
+                .bind(schedule_uuid)
+                .bind(Uuid::parse_str(pack_id).context("parse context pack id")?)
+                .execute(&mut *tx)
+                .await
+                .context("insert schedule context pack")?;
+            }
+            pack_ids
+        } else {
+            existing.context_pack_ids
+        };
+        tx.commit().await.context("commit schedule update tx")?;
+        schedule_from_row(row, final_context_pack_ids)
+    }
+
+    async fn delete_schedule(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<ScheduleRecord> {
+        self.get_schedule(principal, schedule_id).await?;
+        let row = sqlx::query(
+            "UPDATE enterprise_schedules
+             SET deleted_at = now(), updated_at = now()
+             WHERE schedule_id = $1 AND deleted_at IS NULL
+             RETURNING schedule_id::text, owner_user_id::text, created_by_user_id::text, project_id::text, repository_id::text, name, description, cron_expression, enabled, task_prompt, prompt_template_ref, runner_mode, next_run_at, last_run_at, created_at, updated_at, deleted_at",
+        )
+        .bind(Uuid::parse_str(schedule_id).context("parse schedule id")?)
+        .fetch_one(&self.pool)
+        .await
+        .context("delete schedule")?;
+        let context_pack_ids = self.schedule_context_pack_ids(schedule_id).await?;
+        schedule_from_row(row, context_pack_ids)
+    }
+
+    async fn create_schedule_run(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateScheduleRunInput,
+    ) -> Result<ScheduleRunRecord> {
+        let schedule = self.get_schedule(principal, &input.schedule_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO enterprise_schedule_runs
+             (run_id, schedule_id, owner_user_id, trace_id, status, runner_mode, metadata_json)
+             VALUES ($1, $2, $3, $4, 'running', $5, $6)
+             RETURNING run_id::text, schedule_id::text, owner_user_id::text, session_id, worker_id::text, output_id::text, trace_id::text, status, runner_mode, metadata_json, started_at, completed_at, created_at, updated_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::parse_str(&schedule.schedule_id).context("parse schedule id")?)
+        .bind(Uuid::parse_str(&schedule.owner_user_id).context("parse schedule owner user id")?)
+        .bind(Uuid::parse_str(&input.trace_id).context("parse schedule run trace id")?)
+        .bind(input.runner_mode)
+        .bind(input.metadata_json)
+        .fetch_one(&self.pool)
+        .await
+        .context("insert schedule run")?;
+        schedule_run_from_row(row)
+    }
+
+    async fn complete_schedule_run(
+        &self,
+        principal: &AuthPrincipal,
+        run_id: &str,
+        input: CompleteScheduleRunInput,
+    ) -> Result<ScheduleRunRecord> {
+        let run_uuid = Uuid::parse_str(run_id).context("parse schedule run id")?;
+        let existing = sqlx::query(
+            "SELECT run_id::text, schedule_id::text, owner_user_id::text, session_id, worker_id::text, output_id::text, trace_id::text, status, runner_mode, metadata_json, started_at, completed_at, created_at, updated_at
+             FROM enterprise_schedule_runs
+             WHERE run_id = $1",
+        )
+        .bind(run_uuid)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load schedule run")?
+        .context("schedule run not found")?;
+        let existing = schedule_run_from_row(existing)?;
+        self.get_schedule(principal, &existing.schedule_id).await?;
+        let row = sqlx::query(
+            "UPDATE enterprise_schedule_runs
+             SET session_id = $2,
+                 worker_id = $3,
+                 output_id = $4,
+                 status = $5,
+                 metadata_json = $6,
+                 completed_at = $7,
+                 updated_at = $7
+             WHERE run_id = $1
+             RETURNING run_id::text, schedule_id::text, owner_user_id::text, session_id, worker_id::text, output_id::text, trace_id::text, status, runner_mode, metadata_json, started_at, completed_at, created_at, updated_at",
+        )
+        .bind(run_uuid)
+        .bind(input.session_id.as_deref())
+        .bind(input.worker_id.as_deref().map(Uuid::parse_str).transpose().context("parse schedule worker id")?)
+        .bind(input.output_id.as_deref().map(Uuid::parse_str).transpose().context("parse schedule output id")?)
+        .bind(input.status)
+        .bind(input.metadata_json)
+        .bind(input.completed_at)
+        .fetch_one(&self.pool)
+        .await
+        .context("complete schedule run")?;
+        sqlx::query(
+            "UPDATE enterprise_schedules
+             SET last_run_at = $2,
+                 next_run_at = COALESCE($3, next_run_at),
+                 updated_at = $2
+             WHERE schedule_id = $1",
+        )
+        .bind(Uuid::parse_str(&existing.schedule_id).context("parse schedule id")?)
+        .bind(input.completed_at)
+        .bind(input.next_run_at)
+        .execute(&self.pool)
+        .await
+        .context("update schedule run timestamps")?;
+        schedule_run_from_row(row)
+    }
+
+    async fn list_schedule_runs(
+        &self,
+        principal: &AuthPrincipal,
+        schedule_id: &str,
+    ) -> Result<Vec<ScheduleRunRecord>> {
+        self.get_schedule(principal, schedule_id).await?;
+        let rows = sqlx::query(
+            "SELECT run_id::text, schedule_id::text, owner_user_id::text, session_id, worker_id::text, output_id::text, trace_id::text, status, runner_mode, metadata_json, started_at, completed_at, created_at, updated_at
+             FROM enterprise_schedule_runs
+             WHERE schedule_id = $1
+             ORDER BY started_at DESC",
+        )
+        .bind(Uuid::parse_str(schedule_id).context("parse schedule id")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("list schedule runs")?;
+        rows.into_iter().map(schedule_run_from_row).collect()
+    }
+
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -3675,6 +4475,44 @@ impl EnterpriseStore for PostgresEnterpriseStore {
         .fetch_one(&self.pool)
         .await
         .context("insert project thread")?;
+        session_from_row(row)
+    }
+
+    async fn create_scheduled_session(
+        &self,
+        principal: &AuthPrincipal,
+        project_id: &str,
+        repository_id: Option<String>,
+        title: Option<String>,
+    ) -> Result<SessionRecord> {
+        let project = self.get_project_for_user(principal, project_id).await?;
+        let workspace_path = match repository_id.as_ref() {
+            Some(repository_id) => {
+                self.get_repository_for_project(&project.project_id, repository_id)
+                    .await?
+                    .repository_path
+            }
+            None => project.project_path.clone(),
+        };
+        let resolved_workspace_path = self
+            .authorize_workspace_path(principal, workspace_path)
+            .await?;
+        let row = sqlx::query(
+            "INSERT INTO enterprise_sessions
+             (session_id, owner_user_id, workspace_id, workspace_path, session_type, project_id, repository_id, title, last_opened_at)
+             VALUES ($1, $2, $3, $4, 'scheduled', $5, $6, $7, now())
+             RETURNING session_id, owner_user_id::text, workspace_id, workspace_path, session_type, project_id::text, repository_id::text, title, last_worker_id::text, last_opened_at, deleted_at, created_at, updated_at",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(Uuid::parse_str(&principal.user_id).context("parse principal user id")?)
+        .bind(&resolved_workspace_path)
+        .bind(&resolved_workspace_path)
+        .bind(Uuid::parse_str(&project.project_id).context("parse project id")?)
+        .bind(repository_id.as_deref().map(Uuid::parse_str).transpose().context("parse repository id")?)
+        .bind(title)
+        .fetch_one(&self.pool)
+        .await
+        .context("insert scheduled session")?;
         session_from_row(row)
     }
 
@@ -4402,6 +5240,23 @@ impl EnterpriseStore for PostgresEnterpriseStore {
 }
 
 impl PostgresEnterpriseStore {
+    async fn schedule_context_pack_ids(&self, schedule_id: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT pack_id::text
+             FROM enterprise_schedule_context_packs
+             WHERE schedule_id = $1
+             ORDER BY created_at ASC",
+        )
+        .bind(Uuid::parse_str(schedule_id).context("parse schedule id")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("load schedule context packs")?;
+        rows.into_iter()
+            .map(|row| row.try_get("pack_id"))
+            .collect::<Result<Vec<String>, sqlx::Error>>()
+            .context("read schedule context packs")
+    }
+
     async fn admin_workspace_roots(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT root_path FROM enterprise_workspaces ORDER BY created_at")
             .fetch_all(&self.pool)
@@ -4746,6 +5601,7 @@ fn create_session_record(
         owner_user_id: principal.user_id.clone(),
         workspace_id: resolved_workspace_path.clone(),
         workspace_path: resolved_workspace_path,
+        session_type: "interactive".to_string(),
         project_id: None,
         repository_id: None,
         title,
@@ -5062,12 +5918,60 @@ fn thread_reference_from_row(row: sqlx::postgres::PgRow) -> Result<ThreadReferen
     })
 }
 
+fn schedule_from_row(
+    row: sqlx::postgres::PgRow,
+    context_pack_ids: Vec<String>,
+) -> Result<ScheduleRecord> {
+    Ok(ScheduleRecord {
+        schedule_id: row.try_get("schedule_id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        created_by_user_id: row.try_get("created_by_user_id")?,
+        project_id: row.try_get("project_id")?,
+        repository_id: row.try_get("repository_id")?,
+        name: row.try_get("name")?,
+        description: row.try_get("description")?,
+        cron_expression: row.try_get("cron_expression")?,
+        enabled: row.try_get("enabled")?,
+        task_prompt: row.try_get("task_prompt")?,
+        prompt_template_ref: row.try_get("prompt_template_ref")?,
+        runner_mode: row.try_get("runner_mode")?,
+        context_pack_ids,
+        next_run_at: row.try_get("next_run_at")?,
+        last_run_at: row.try_get("last_run_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        deleted_at: row.try_get("deleted_at")?,
+    })
+}
+
+fn schedule_run_from_row(row: sqlx::postgres::PgRow) -> Result<ScheduleRunRecord> {
+    Ok(ScheduleRunRecord {
+        run_id: row.try_get("run_id")?,
+        schedule_id: row.try_get("schedule_id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        session_id: row.try_get("session_id")?,
+        worker_id: row.try_get("worker_id")?,
+        output_id: row.try_get("output_id")?,
+        trace_id: row.try_get("trace_id")?,
+        status: row.try_get("status")?,
+        runner_mode: row.try_get("runner_mode")?,
+        metadata_json: row.try_get("metadata_json")?,
+        started_at: row.try_get("started_at")?,
+        completed_at: row.try_get("completed_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn session_from_row(row: sqlx::postgres::PgRow) -> Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.try_get("session_id")?,
         owner_user_id: row.try_get("owner_user_id")?,
         workspace_id: row.try_get("workspace_id")?,
         workspace_path: row.try_get("workspace_path")?,
+        session_type: row
+            .try_get("session_type")
+            .unwrap_or_else(|_| "interactive".to_string()),
         project_id: row.try_get("project_id").ok(),
         repository_id: row.try_get("repository_id").ok(),
         title: row.try_get("title")?,

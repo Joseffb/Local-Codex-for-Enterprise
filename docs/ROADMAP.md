@@ -50,9 +50,9 @@ Remaining follow-up:
 - Expand demo data to cover user workspace, project, repository, thread, context pack, output, and audit use cases.
 - Validate the full Compose-based enterprise demo with Postgres and Docker Model Runner.
 
-## Planned: Scheduled Sessions
+## Implemented Beta: Scheduled Sessions
 
-Scheduled sessions are planned, but they are not part of the current project/thread cleanup run.
+Scheduled Sessions are implemented as a beta control-plane capability. The default runner mode is `smoke`, which creates deterministic Markdown outputs and evidence records to validate schedule, session, Context Pack, output, audit, and receipt wiring without launching a real Codex model turn. The `app_server_rpc` runner mode is explicitly configurable for future real Codex worker execution validation, but it is not the beta/default promise.
 
 The architectural decision is that automation is implemented as scheduled sessions. A scheduler creates sessions on behalf of a user according to a schedule definition. The scheduler does not execute Context Packs directly. Context Packs are loaded into the scheduled session, and the session executes work through the existing worker lifecycle.
 
@@ -79,16 +79,18 @@ Responsibility split:
 
 Example uses include weekly executive reports, daily job application runs, weekly architecture review, security audit, documentation refresh, inventory analysis, sales reporting, dependency/security review, Power BI analysis, Salesforce analysis, and RAG maintenance jobs.
 
-Minimal design direction:
+Implemented beta surface:
 
-- Extend sessions with a narrow session type: `interactive` or `scheduled`.
-- Add `enterprise_schedules` with `schedule_id`, `owner_user_id`, `name`, `description`, `cron_expression`, `enabled`, `workspace_id`, `task_prompt`, optional `prompt_template_ref`, `created_at`, and `updated_at`.
-- Add `enterprise_schedule_context_packs` with `schedule_id` and `context_pack_id`.
-- Add `enterprise_schedule_runs` with `run_id`, `schedule_id`, `session_id`, `trace_id`, `started_at`, `completed_at`, and `result`.
-- Support cron-style schedules through a small scheduler that only creates sessions.
-- Enforce RBAC before creating, editing, pausing, resuming, or deleting schedules.
-- Scope every run to a user workspace, project, repository, thread, and Context Pack assignment where applicable.
-- Record audit events and execution receipts for schedule creation, update, pause, resume, run start, completion, failure, and cancellation.
+- Sessions have a narrow session type: `interactive` or `scheduled`.
+- `enterprise_schedules` stores owner, creator, target project, optional repository, name, description, UTC 5-field cron expression, enabled state, task prompt, optional prompt template reference, runner mode, next run, last run, timestamps, and soft delete.
+- `enterprise_schedule_context_packs` attaches Context Packs to schedules.
+- `enterprise_schedule_runs` stores run status, trace ID, session ID, worker ID, output ID, runner mode, redacted metadata, and run timestamps.
+- The admin UI supports create, list, enable/disable, soft delete, run-now, run history, and Context Pack attachment.
+- RBAC allows admins and managers to manage schedules; developers and viewers are denied.
+- Cron uses standard 5-field UTC expressions only.
+- Run-now and cron due paths share the same execution helper.
+- The scheduler skips disabled/deleted schedules, avoids overlapping fresh runs, and marks stale running runs failed after timeout.
+- `smoke` mode creates a scheduled session, stores the task prompt as the user message, loads assigned Context Pack IDs into receipt evidence, creates a deterministic assistant response, saves a server-generated Markdown output, and records audit/execution receipts.
 - Allow Context Packs to offer optional reusable prompt templates only as inert text templates. A schedule may reference one, but the schedule still decides what runs.
 - Store only redacted metadata in scheduled-session receipts.
 - Never store prompts, model outputs, auth headers, handoff tokens, passwords, API tokens, repo credentials, private examples, or local machine paths in schedule logs, receipts, or audit metadata.
@@ -108,13 +110,14 @@ Hard boundary:
 
 Acceptance criteria:
 
-- Scheduled automation is implemented as scheduled sessions.
+- Scheduled automation is implemented as scheduled sessions. Beta default is `smoke`; real app-server RPC execution remains explicitly configured and still maturing.
 - Context Packs are loaded by sessions and never executed directly.
 - Interactive and scheduled sessions use the same worker, context loading, audit, trace, and receipt architecture.
 - No workflow engine, governance runtime, or agent orchestration framework is introduced.
 
 Deferred scheduled-session details:
 
+- Full `app_server_rpc` scheduled worker execution hardening.
 - Multi-node scheduler coordination.
 - Retry backoff UI.
 - Calendar UI.

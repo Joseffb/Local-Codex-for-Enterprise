@@ -5,6 +5,8 @@ use axum::http::StatusCode;
 use axum::http::header;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use chrono::Duration as ChronoDuration;
+use chrono::Utc;
 use codex_enterprise_server::api;
 use codex_enterprise_server::auth;
 use codex_enterprise_server::config::EnterpriseConfig;
@@ -15,7 +17,10 @@ use codex_enterprise_server::rbac::EnterpriseRole;
 use codex_enterprise_server::repo_clone;
 use codex_enterprise_server::setup::BootstrapReceipt;
 use codex_enterprise_server::setup::SetupMode;
+use codex_enterprise_server::storage::AuthPrincipal;
+use codex_enterprise_server::storage::EnterpriseStore;
 use codex_enterprise_server::storage::InMemoryEnterpriseStore;
+use codex_enterprise_server::storage::UpdateScheduleInput;
 use codex_enterprise_server::worker::WorkerRuntimeSupervisor;
 use codex_enterprise_server::worker::WorkerState;
 use codex_enterprise_server::worker::WorkerSupervisor;
@@ -32,6 +37,10 @@ fn default_config_selects_enterprise_mode_and_local_model_defaults() {
     assert_eq!(config.mode, ServerMode::Enterprise);
     assert_eq!(config.default_model_provider, "docker-model-runner");
     assert_eq!(config.default_model, "ai/qwen3-coder");
+    assert!(config.scheduler_enabled);
+    assert_eq!(config.scheduler_poll_seconds, 30);
+    assert_eq!(config.scheduler_run_timeout_seconds, 1800);
+    assert_eq!(config.scheduled_runner_mode, "smoke");
 }
 
 #[test]
@@ -56,9 +65,21 @@ fn admin_can_administer_but_viewer_cannot() {
         EnterpriseRole::Admin,
         EnterpriseAction::StartWorker
     ));
+    assert!(rbac::role_allows(
+        EnterpriseRole::Admin,
+        EnterpriseAction::ManageSchedules
+    ));
+    assert!(rbac::role_allows(
+        EnterpriseRole::Manager,
+        EnterpriseAction::ManageSchedules
+    ));
     assert!(!rbac::role_allows(
         EnterpriseRole::Viewer,
         EnterpriseAction::AdministerUsers
+    ));
+    assert!(!rbac::role_allows(
+        EnterpriseRole::Developer,
+        EnterpriseAction::ManageSchedules
     ));
 }
 
@@ -90,9 +111,19 @@ async fn casbin_policy_allows_admin_but_rejects_viewer_admin() {
             .expect("admin start worker policy")
     );
     assert!(
+        rbac::casbin_role_allows(EnterpriseRole::Manager, EnterpriseAction::ManageSchedules)
+            .await
+            .expect("manager schedule policy")
+    );
+    assert!(
         !rbac::casbin_role_allows(EnterpriseRole::Viewer, EnterpriseAction::AdministerUsers)
             .await
             .expect("viewer policy")
+    );
+    assert!(
+        !rbac::casbin_role_allows(EnterpriseRole::Developer, EnterpriseAction::ManageSchedules)
+            .await
+            .expect("developer schedule policy")
     );
 }
 
@@ -4018,6 +4049,447 @@ async fn cross_thread_references_reject_inaccessible_threads_and_chat_exposes_kn
 }
 
 #[tokio::test]
+async fn scheduled_sessions_smoke_runner_creates_scheduled_thread_output_and_redacted_evidence() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp_dir.path().join("enterprise-workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let output_root = temp_dir.path().join("outputs");
+    std::fs::create_dir_all(&output_root).expect("output root");
+    let mut config = EnterpriseConfig::default();
+    config.default_workspace_root = Some(workspace_root.to_string_lossy().to_string());
+    config.output_artifact_root = output_root.to_string_lossy().to_string();
+    config.scheduled_runner_mode = "smoke".to_string();
+    let router = api::build_router_with_store(InMemoryEnterpriseStore::default(), config);
+
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        None,
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED, "{}", bootstrap.text);
+    let admin_token = bootstrap.json["api_token"]
+        .as_str()
+        .expect("admin token")
+        .to_string();
+    let admin_user_id = bootstrap.json["owner_user_id"]
+        .as_str()
+        .expect("admin user id")
+        .to_string();
+
+    let workspaces = empty_request(
+        router.clone(),
+        "GET",
+        "/v1/user-workspaces",
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(workspaces.status, StatusCode::OK, "{}", workspaces.text);
+    let user_workspace_id = workspaces.json["user_workspaces"][0]["user_workspace_id"]
+        .as_str()
+        .expect("user workspace id");
+
+    let project = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/user-workspaces/{user_workspace_id}/projects"),
+        Some(&admin_token),
+        None,
+        serde_json::json!({ "name": "Weekly Reports" }),
+    )
+    .await;
+    assert_eq!(project.status, StatusCode::CREATED, "{}", project.text);
+    let project_id = project.json["project"]["project_id"]
+        .as_str()
+        .expect("project id")
+        .to_string();
+
+    let pack_id = create_minimal_context_pack(
+        router.clone(),
+        &admin_token,
+        "11111111-1111-4111-8111-111111111111",
+        "Scheduled Reports Pack",
+    )
+    .await;
+    let private_prompt = "PRIVATE_SCHEDULE_PROMPT_SHOULD_NOT_APPEAR_IN_AUDIT";
+    let create_trace_id = "22222222-2222-4222-8222-222222222222";
+    let created = json_request(
+        router.clone(),
+        "POST",
+        "/v1/schedules",
+        Some(&admin_token),
+        Some(create_trace_id),
+        serde_json::json!({
+            "owner_user_id": admin_user_id,
+            "project_id": project_id,
+            "name": "Weekly report",
+            "description": "Runs a deterministic beta smoke report.",
+            "cron_expression": "*/5 * * * *",
+            "enabled": true,
+            "task_prompt": private_prompt,
+            "context_pack_ids": [pack_id],
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+    assert_eq!(created.json["schedule"]["name"], "Weekly report");
+    assert_eq!(created.json["schedule"]["cron_expression"], "*/5 * * * *");
+    assert_eq!(created.json["schedule"]["runner_mode"], "smoke");
+    assert_eq!(created.json["schedule"]["context_pack_ids"][0], pack_id);
+    assert!(created.json["schedule"]["next_run_at"].is_string());
+
+    let schedule_id = created.json["schedule"]["schedule_id"]
+        .as_str()
+        .expect("schedule id");
+    let run_trace_id = "33333333-3333-4333-8333-333333333333";
+    let run = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/schedules/{schedule_id}/runs"),
+        Some(&admin_token),
+        Some(run_trace_id),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::CREATED, "{}", run.text);
+    assert_eq!(run.json["run"]["status"], "completed");
+    assert_eq!(run.json["run"]["runner_mode"], "smoke");
+    assert!(run.json["run"]["session_id"].is_string());
+    assert!(run.json["run"]["output_id"].is_string());
+    assert!(
+        run.json["output"]["artifact_path"]
+            .as_str()
+            .expect("artifact path")
+            .contains("scheduled")
+    );
+
+    let session_id = run.json["run"]["session_id"].as_str().expect("session id");
+    let thread = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/threads/{session_id}"),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(thread.status, StatusCode::OK, "{}", thread.text);
+    assert_eq!(thread.json["session"]["session_type"], "scheduled");
+
+    let messages = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/threads/{session_id}/messages"),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(messages.status, StatusCode::OK, "{}", messages.text);
+    assert!(messages.text.contains(private_prompt));
+    assert!(messages.text.contains("Scheduled smoke run completed"));
+
+    let runs = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/schedules/{schedule_id}/runs"),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(runs.status, StatusCode::OK, "{}", runs.text);
+    assert_eq!(runs.json["runs"][0]["run_id"], run.json["run"]["run_id"]);
+
+    let audit = empty_request(
+        router,
+        "GET",
+        &format!("/v1/evidence-records?trace_id={run_trace_id}"),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(audit.status, StatusCode::OK, "{}", audit.text);
+    assert!(audit.text.contains("schedule.run.start"));
+    assert!(audit.text.contains("schedule.run.complete"));
+    assert!(audit.text.contains("context_pack.schedule_load"));
+    assert!(!audit.text.contains(private_prompt));
+}
+
+#[tokio::test]
+async fn scheduler_tick_runs_due_smoke_schedule_once_and_advances_next_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp_dir.path().join("enterprise-workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let output_root = temp_dir.path().join("outputs");
+    std::fs::create_dir_all(&output_root).expect("output root");
+    let store = InMemoryEnterpriseStore::default();
+    let mut config = EnterpriseConfig::default();
+    config.default_workspace_root = Some(workspace_root.to_string_lossy().to_string());
+    config.output_artifact_root = output_root.to_string_lossy().to_string();
+    config.scheduled_runner_mode = "smoke".to_string();
+    let router = api::build_router_with_store(store.clone(), config.clone());
+
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        None,
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED, "{}", bootstrap.text);
+    let admin_token = bootstrap.json["api_token"]
+        .as_str()
+        .expect("admin token")
+        .to_string();
+    let admin_user_id = bootstrap.json["owner_user_id"]
+        .as_str()
+        .expect("admin user id")
+        .to_string();
+    let admin_principal = AuthPrincipal {
+        user_id: admin_user_id.clone(),
+        email: "owner@example.com".to_string(),
+        role: EnterpriseRole::Admin,
+    };
+
+    let workspaces = empty_request(
+        router.clone(),
+        "GET",
+        "/v1/user-workspaces",
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    let user_workspace_id = workspaces.json["user_workspaces"][0]["user_workspace_id"]
+        .as_str()
+        .expect("user workspace id");
+
+    let project = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/user-workspaces/{user_workspace_id}/projects"),
+        Some(&admin_token),
+        None,
+        serde_json::json!({ "name": "Scheduler Tick" }),
+    )
+    .await;
+    assert_eq!(project.status, StatusCode::CREATED, "{}", project.text);
+    let project_id = project.json["project"]["project_id"]
+        .as_str()
+        .expect("project id")
+        .to_string();
+
+    let created = json_request(
+        router.clone(),
+        "POST",
+        "/v1/schedules",
+        Some(&admin_token),
+        None,
+        serde_json::json!({
+            "owner_user_id": admin_user_id,
+            "project_id": project_id,
+            "name": "Due smoke run",
+            "cron_expression": "*/5 * * * *",
+            "enabled": true,
+            "task_prompt": "SCHEDULER_TICK_PRIVATE_PROMPT",
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+    let schedule_id = created.json["schedule"]["schedule_id"]
+        .as_str()
+        .expect("schedule id")
+        .to_string();
+    store
+        .update_schedule(
+            &admin_principal,
+            &schedule_id,
+            UpdateScheduleInput {
+                name: None,
+                description: None,
+                cron_expression: None,
+                enabled: None,
+                task_prompt: None,
+                prompt_template_ref: None,
+                runner_mode: None,
+                context_pack_ids: None,
+                next_run_at: Some(Utc::now() - ChronoDuration::minutes(1)),
+            },
+        )
+        .await
+        .expect("force schedule due");
+
+    let executed = api::run_scheduler_tick(api::AppState::new(
+        store.clone(),
+        config.clone(),
+        WorkerRuntimeSupervisor::default(),
+    ))
+    .await
+    .expect("scheduler tick");
+    assert_eq!(executed, 1);
+
+    let runs = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/schedules/{schedule_id}/runs"),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(runs.status, StatusCode::OK, "{}", runs.text);
+    assert_eq!(runs.json["runs"].as_array().expect("runs").len(), 1);
+    assert_eq!(runs.json["runs"][0]["status"], "completed");
+    assert_eq!(runs.json["runs"][0]["runner_mode"], "smoke");
+
+    let executed_again = api::run_scheduler_tick(api::AppState::new(
+        store,
+        config,
+        WorkerRuntimeSupervisor::default(),
+    ))
+    .await
+    .expect("second scheduler tick");
+    assert_eq!(executed_again, 0);
+}
+
+#[tokio::test]
+async fn scheduled_sessions_require_manager_role_and_valid_utc_five_field_cron() {
+    let router = api::build_test_router();
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp_dir.path().join("enterprise-workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        None,
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED, "{}", bootstrap.text);
+    let admin_token = bootstrap.json["api_token"]
+        .as_str()
+        .expect("admin token")
+        .to_string();
+
+    let (manager_token, _) = create_and_login_user(
+        router.clone(),
+        &admin_token,
+        "manager@example.com",
+        "manager-password",
+        "manager",
+    )
+    .await;
+    let (developer_token, _) = create_and_login_user(
+        router.clone(),
+        &admin_token,
+        "developer@example.com",
+        "developer-password",
+        "developer",
+    )
+    .await;
+
+    let workspaces = empty_request(
+        router.clone(),
+        "GET",
+        "/v1/user-workspaces",
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(workspaces.status, StatusCode::OK, "{}", workspaces.text);
+    let admin_workspace_id = workspaces.json["user_workspaces"][0]["user_workspace_id"]
+        .as_str()
+        .expect("admin workspace id");
+    let project = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/user-workspaces/{admin_workspace_id}/projects"),
+        Some(&admin_token),
+        None,
+        serde_json::json!({ "name": "Cron Validation" }),
+    )
+    .await;
+    assert_eq!(project.status, StatusCode::CREATED, "{}", project.text);
+    let project_id = project.json["project"]["project_id"]
+        .as_str()
+        .expect("project id");
+    let owner_user_id = bootstrap.json["owner_user_id"].as_str().unwrap();
+
+    let invalid = json_request(
+        router.clone(),
+        "POST",
+        "/v1/schedules",
+        Some(&admin_token),
+        None,
+        serde_json::json!({
+            "owner_user_id": owner_user_id,
+            "project_id": project_id,
+            "name": "Invalid cron",
+            "cron_expression": "0 0 1 * * *",
+            "task_prompt": "safe prompt",
+        }),
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST, "{}", invalid.text);
+    assert!(invalid.text.contains("standard 5-field UTC cron"));
+
+    let manager_schedule = json_request(
+        router.clone(),
+        "POST",
+        "/v1/schedules",
+        Some(&manager_token),
+        None,
+        serde_json::json!({
+            "owner_user_id": owner_user_id,
+            "project_id": project_id,
+            "name": "Manager-created schedule",
+            "cron_expression": "15 13 * * 1",
+            "task_prompt": "safe prompt",
+        }),
+    )
+    .await;
+    assert_eq!(
+        manager_schedule.status,
+        StatusCode::CREATED,
+        "{}",
+        manager_schedule.text
+    );
+
+    let denied = json_request(
+        router,
+        "POST",
+        "/v1/schedules",
+        Some(&developer_token),
+        None,
+        serde_json::json!({
+            "owner_user_id": owner_user_id,
+            "project_id": project_id,
+            "name": "Developer schedule",
+            "cron_expression": "15 13 * * 1",
+            "task_prompt": "safe prompt",
+        }),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn rbac_page_explains_permissions_and_exposes_assignment_crud() {
     let router = api::build_test_router();
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -4572,13 +5044,13 @@ async fn login_page_redirects_home_and_nav_says_home_when_authenticated() {
     assert!(
         chat_with_auth
             .text
-            .contains("Local Codex for Enterprise v0.0.1-beta.7")
+            .contains("Local Codex for Enterprise v0.0.1-beta.8")
     );
     assert!(chat_with_auth.text.contains("Made with Codex"));
     assert!(
         chat_with_auth
             .text
-            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.7</span></div></div>"#)
+            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.8</span></div></div>"#)
     );
     let footer_index = chat_with_auth
         .text

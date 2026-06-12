@@ -6,6 +6,20 @@ This project is a community fork and is not affiliated with, endorsed by, or sup
 
 ## [Unreleased]
 
+## [0.0.1-beta.8] - 2026-06-12
+
+### Added
+
+- Added beta Scheduled Sessions as ordinary `scheduled` sessions created on behalf of a user.
+- Added Postgres schedule, schedule Context Pack, and schedule run storage.
+- Added UTC 5-field cron validation, scheduler polling config, run-now, run history, stale-run timeout handling, and scheduled-session admin UI.
+- Added `smoke` scheduled runner mode as the visible beta/default deterministic validation path.
+
+### Security
+
+- Schedule metadata and receipts record IDs, status, type, runner mode, and provenance only; prompts, model outputs, tokens, credentials, and private examples are not stored in audit metadata.
+- Context Packs are loaded by scheduled sessions but are not executed as workflows, schedulers, governance runtimes, or automatic skill activations.
+
 ## [0.0.1-beta.7] - 2026-06-12
 
 ### Added

@@ -84,7 +84,9 @@ async fn main() -> anyhow::Result<()> {
         .context("run enterprise migrations")?;
 
     let bind_addr = config.bind_addr.clone();
-    let router = api::build_router_with_store(PostgresEnterpriseStore::new(pool), config);
+    let store = PostgresEnterpriseStore::new(pool);
+    api::spawn_scheduler(store.clone(), config.clone());
+    let router = api::build_router_with_store(store, config);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("bind enterprise server on {bind_addr}"))?;

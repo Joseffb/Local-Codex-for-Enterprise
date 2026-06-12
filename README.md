@@ -4,7 +4,7 @@ Local Codex for Enterprise is a community fork and self-hosted enterprise extens
 
 This repository is not affiliated with, endorsed by, or supported by OpenAI. It is derived from the open-source OpenAI Codex project and preserves the upstream Apache-2.0 license and attribution.
 
-Current beta: `0.0.1-beta.7`.
+Current beta: `0.0.1-beta.8`.
 
 ## What This Is
 
@@ -12,6 +12,7 @@ Current beta: `0.0.1-beta.7`.
 - A self-hosted enterprise control plane with Postgres-backed state.
 - A managed path for users, seeded RBAC roles, workspace root allowlisting, user workspaces, projects, repositories, threads, workers, handoff tokens, trace-aware audit events, and execution receipts.
 - A Context Pack system for versioned Markdown operating packages.
+- A beta Scheduled Sessions system that creates ordinary Codex sessions on a UTC cron schedule and records outputs, audit events, and receipts.
 - A release candidate foundation for a public community project.
 
 ## What This Is Not
@@ -19,12 +20,14 @@ Current beta: `0.0.1-beta.7`.
 - It is not an official OpenAI product.
 - It is not a cloud-hosted Codex service.
 - It is not a governance reasoning engine.
+- It is not a workflow engine or Context Pack execution runtime.
+- Scheduled Sessions do not mean real background Codex model execution is enabled by default; the beta default runner is deterministic `smoke` mode unless `app_server_rpc` is explicitly configured.
 - It does not include SSO, custom RBAC policy editing, approval workflows, Fernain integration, or full browser IDE polish.
 - It does not store prompts, model outputs, auth headers, handoff tokens, passwords, API tokens, repo credentials, or private real-life examples in receipts or audit metadata.
 
 ## Current Status
 
-The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Context Pack upload/assignment/receipts, project-scoped chat threads, browser worker handoff, sanitized Markdown chat rendering, user response feedback, server-generated saved output artifacts, cross-thread knowledge references, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
+The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Context Pack upload/assignment/receipts, project-scoped chat threads, browser worker handoff, sanitized Markdown chat rendering, user response feedback, server-generated saved output artifacts, cross-thread knowledge references, beta Scheduled Sessions with smoke-mode outputs, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
 
 The product domain contract is defined in [docs/enterprise-domain-contract.md](docs/enterprise-domain-contract.md). In short: workspace roots are server allowlist boundaries, user workspaces are per-user filesystem spaces, projects are human work containers, repositories are cloned checkouts inside projects, and threads are chat histories attached to projects/repositories.
 
@@ -210,6 +213,10 @@ Required inputs:
 - `DATABASE_URL`: Postgres connection string reachable from the enterprise container.
 - `LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET`: long random secret used to sign short-lived worker handoff tokens.
 - `LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT`: the path users should enter during setup, as seen by the container.
+- `LOCAL_CODEX_ENTERPRISE_SCHEDULER_ENABLED`: enables scheduled-session polling. Default: `true`.
+- `LOCAL_CODEX_ENTERPRISE_SCHEDULER_POLL_SECONDS`: scheduler poll interval. Default: `30`.
+- `LOCAL_CODEX_ENTERPRISE_SCHEDULER_RUN_TIMEOUT_SECONDS`: marks stale running scheduled runs failed after this many seconds. Default: `1800`.
+- `LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE`: scheduled-session runner mode. Default beta mode is `smoke`, which creates deterministic validation outputs without running a real Codex model turn. Set `app_server_rpc` only when intentionally validating real scheduled Codex worker execution.
 - Workspace bind mount: the host or volume path mounted into the container at the same runtime-visible workspace root.
 - Docker Model Runner or Docker Model Gateway endpoint reachable from the container.
 
@@ -513,7 +520,87 @@ The demo covers Compose startup, `/healthz`, browser login, session creation, wo
 
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled sessions are listed there as deferred functionality that reuses the existing session, worker, trace, audit, receipt, and Context Pack loading lifecycle. Context Packs remain lifecycle packages; they are not executable workflow definitions, schedulers, governance runtimes, or automatic skill execution.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled Sessions are now implemented as a beta control-plane capability. The default runner is `smoke`, which validates schedule, session, Context Pack, output, audit, and receipt wiring without promising a real Codex model turn. `app_server_rpc` is explicitly configurable for future real worker execution validation.
+
+## Scheduled Sessions
+
+Scheduled Sessions implement automation as ordinary sessions created by the scheduler on behalf of a user. The current beta supports schedule CRUD, UTC 5-field cron validation, enable/disable, soft delete, run-now, run history, schedule Context Pack attachments, scheduled session records, deterministic Markdown outputs, trace-aware audit, and execution receipts.
+
+Administration lives at `/admin/schedules`. Users with the seeded `admin` or `manager` role can create and manage schedules. `developer` and `viewer` users cannot manage schedules.
+
+The default runner mode is visibly beta:
+
+- `LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE=smoke`: default beta mode. Creates a deterministic output proving the schedule/session/context/output/evidence path without launching a real Codex model turn.
+- `LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE=app_server_rpc`: reserved real Codex worker RPC path. Configure it only when intentionally validating scheduled worker execution.
+
+Context Packs remain lifecycle packages and are loaded as operating context. They are not executable workflow definitions, schedulers, governance runtimes, or automatic skill execution.
+
+Scheduled Sessions reuse the existing enterprise spine:
+
+```text
+Schedule
+  -> scheduled session
+  -> assigned Context Packs loaded as context
+  -> worker or smoke runner
+  -> Markdown output artifact
+  -> audit events and execution receipts
+```
+
+The schedule stores the task prompt because the schedule decides what should run. Context Packs provide operating guidance and package context; they are never executed directly.
+
+### Enabling Real Scheduled Codex Runs
+
+Use `app_server_rpc` when you intentionally want scheduled sessions to launch a worker and send the scheduled task through the Codex app-server path. This is not the beta default.
+
+Docker Compose example:
+
+```sh
+LOCAL_CODEX_ENTERPRISE_WORKSPACES="$PWD" \
+LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET="change-me-for-real-use" \
+LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE="app_server_rpc" \
+  docker compose -f compose.enterprise.yaml up --build
+```
+
+Container with external Postgres example:
+
+```sh
+docker run --rm \
+  --name local-codex-enterprise \
+  --entrypoint codex-enterprise-server \
+  -p 8787:8787 \
+  -e DATABASE_URL="postgres://codex:REPLACE_ME@postgres.internal:5432/codex_enterprise" \
+  -e LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET="REPLACE_WITH_LONG_RANDOM_SECRET" \
+  -e LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT="/enterprise-workspaces" \
+  -e LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE="app_server_rpc" \
+  -e CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG=1 \
+  -e CODEX_MODEL="ai/qwen3-coder" \
+  -e CODEX_MODEL_PROVIDER_ID="docker-model-runner-container" \
+  -e CODEX_MODEL_PROVIDER_NAME="Docker Model Runner" \
+  -e CODEX_MODEL_PROVIDER_BASE_URL="http://host.docker.internal:12434/engines/v1" \
+  -v "/srv/engineering-workspaces:/enterprise-workspaces" \
+  -v "$HOME/.docker/run/docker.sock:/docker.sock" \
+  local-codex-enterprise:dev \
+  --bind-addr 0.0.0.0:8787 \
+  --worker-command /usr/local/bin/codex-container-entrypoint \
+  --worker-arg app-server \
+  --worker-arg --listen \
+  --worker-arg 'unix://{socket_path}'
+```
+
+Local/server install example:
+
+```sh
+export LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE="app_server_rpc"
+
+codex-enterprise-server \
+  --database-url "$DATABASE_URL" \
+  --bind-addr "$LOCAL_CODEX_ENTERPRISE_BIND" \
+  --worker-command /absolute/path/to/codex-app-server \
+  --worker-arg --listen \
+  --worker-arg 'unix://{socket_path}'
+```
+
+Before using `app_server_rpc`, confirm the same server can already run an interactive browser thread against the intended model provider. If interactive worker handoff or model routing is not healthy, scheduled real-worker runs will fail for the same reason.
 
 ## Cross-Thread Knowledge Transfer
 
