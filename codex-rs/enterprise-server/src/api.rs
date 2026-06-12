@@ -18,6 +18,7 @@ use crate::storage::CreateOutputInput;
 use crate::storage::CreateProjectInput;
 use crate::storage::CreateProjectThreadInput;
 use crate::storage::CreateSessionMessageInput;
+use crate::storage::CreateThreadReferenceInput;
 use crate::storage::CreateUserInput;
 use crate::storage::EnterpriseStore;
 use crate::storage::EvidenceQuery;
@@ -31,9 +32,11 @@ use crate::storage::RepositoryRecord;
 use crate::storage::ResponseFeedbackRecord;
 use crate::storage::SessionMessageRecord;
 use crate::storage::SessionRecord;
+use crate::storage::ThreadReferenceRecord;
 use crate::storage::UpdateContextPackFileInput;
 use crate::storage::UpdateProjectInput;
 use crate::storage::UpdateSessionTitleInput;
+use crate::storage::UpdateThreadReferenceInput;
 use crate::storage::UpsertResponseFeedbackInput;
 use crate::storage::UserRecord;
 use crate::storage::UserResponsePreferencesRecord;
@@ -67,6 +70,7 @@ use axum::response::IntoResponse;
 use axum::response::Redirect;
 use axum::response::Response;
 use axum::routing::get;
+use axum::routing::patch;
 use axum::routing::post;
 use axum::routing::put;
 use base64::Engine;
@@ -536,6 +540,62 @@ pub struct SaveMessageOutputRequest {
     pub output_type: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ThreadReferenceResponse {
+    pub reference: ThreadReferenceRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ThreadReferencesResponse {
+    pub references: Vec<ThreadReferenceRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ThreadReferenceOutputResponse {
+    pub reference: ThreadReferenceRecord,
+    pub output: OutputRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+pub struct CreateThreadReferenceRequest {
+    pub source_thread_id: String,
+    pub reference_type: String,
+    pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+pub struct UpdateThreadReferenceRequest {
+    pub status: String,
+    pub output_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+pub struct CreateThreadArtifactRequest {
+    pub target_thread_id: Option<String>,
+    pub title: Option<String>,
+    pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+pub struct ImportThreadArtifactRequest {
+    pub source_output_id: String,
+    pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ThreadSummaryPromptResponse {
+    pub reference: ThreadReferenceRecord,
+    pub summary_prompt: String,
+    pub source_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ArtifactImportResponse {
+    pub reference: ThreadReferenceRecord,
+    pub excerpt: String,
+    pub excerpt_truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WorkerRpcQuery {
     pub handoff_token: String,
@@ -830,6 +890,26 @@ where
         .route(
             "/v1/threads/{thread_id}/messages/{message_id}/outputs",
             post(save_message_output::<S>),
+        )
+        .route(
+            "/v1/threads/{thread_id}/references",
+            get(list_thread_references::<S>).post(create_thread_reference::<S>),
+        )
+        .route(
+            "/v1/thread-references/{reference_id}",
+            patch(update_thread_reference::<S>),
+        )
+        .route(
+            "/v1/threads/{thread_id}/exports",
+            post(export_thread_transcript::<S>),
+        )
+        .route(
+            "/v1/threads/{thread_id}/handoffs",
+            post(create_thread_handoff::<S>),
+        )
+        .route(
+            "/v1/threads/{thread_id}/artifact-imports",
+            post(import_thread_artifact::<S>),
         )
         .route(
             "/v1/me/response-preferences",
@@ -2697,6 +2777,295 @@ where
     Ok((StatusCode::CREATED, Json(OutputResponse { output })))
 }
 
+async fn list_thread_references<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(thread_id): Path<String>,
+) -> Result<Json<ThreadReferencesResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    let references = state
+        .store
+        .list_thread_references(&principal, &thread_id)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(ThreadReferencesResponse { references }))
+}
+
+async fn create_thread_reference<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(target_thread_id): Path<String>,
+    Json(request): Json<CreateThreadReferenceRequest>,
+) -> Result<(StatusCode, Json<ThreadSummaryPromptResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    if request.reference_type != "ai_summary" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "POST /v1/threads/{thread_id}/references currently creates ai_summary references",
+        ));
+    }
+    let source_session = state
+        .store
+        .get_session(&principal, &request.source_thread_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let target_session = state
+        .store
+        .get_session(&principal, &target_thread_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let messages = state
+        .store
+        .list_session_messages(&principal, &source_session.session_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let bounded = bounded_thread_markdown(&source_session, &messages, request.max_chars);
+    let reference = state
+        .store
+        .create_thread_reference(
+            &principal,
+            CreateThreadReferenceInput {
+                source_thread_id: source_session.session_id.clone(),
+                target_thread_id: target_session.session_id.clone(),
+                source_output_id: None,
+                output_id: None,
+                reference_type: "ai_summary".to_string(),
+                knowledge_origin: "ai_generated".to_string(),
+                status: "pending".to_string(),
+                metadata_json: serde_json::json!({
+                    "source_thread_id": source_session.session_id,
+                    "target_thread_id": target_session.session_id,
+                    "source_truncated": bounded.truncated,
+                    "message_count": messages.len(),
+                }),
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(target_session.workspace_id.clone())
+            .session(target_session.session_id.clone()),
+        "thread_reference.create",
+        TraceResult::Completed,
+        serde_json::json!({
+            "reference_id": reference.reference_id.clone(),
+            "source_thread_id": reference.source_thread_id.clone(),
+            "target_thread_id": reference.target_thread_id.clone(),
+            "reference_type": reference.reference_type.clone(),
+            "knowledge_origin": reference.knowledge_origin.clone(),
+            "status": reference.status.clone(),
+            "source_truncated": bounded.truncated,
+        }),
+    )
+    .await?;
+    let summary_prompt = format!(
+        "Summarize the referenced source thread for use in the current thread.\n\nReturn Markdown with exactly these sections:\n\n1. Decisions\n2. Findings\n3. Action Items\n4. Open Questions\n5. Handoff Notes\n\nDo not execute tasks, call tools, inspect repositories, or message another thread. Use only this bounded source-thread content:\n\n{}",
+        bounded.content
+    );
+    Ok((
+        StatusCode::CREATED,
+        Json(ThreadSummaryPromptResponse {
+            reference,
+            summary_prompt,
+            source_truncated: bounded.truncated,
+        }),
+    ))
+}
+
+async fn update_thread_reference<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(reference_id): Path<String>,
+    Json(request): Json<UpdateThreadReferenceRequest>,
+) -> Result<Json<ThreadReferenceResponse>, ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    let reference = state
+        .store
+        .update_thread_reference(
+            &principal,
+            &reference_id,
+            UpdateThreadReferenceInput {
+                output_id: request.output_id,
+                status: request.status,
+                metadata_json: None,
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .session(reference.target_thread_id.clone()),
+        "thread_reference.update",
+        TraceResult::Completed,
+        serde_json::json!({
+            "reference_id": reference.reference_id.clone(),
+            "source_thread_id": reference.source_thread_id.clone(),
+            "target_thread_id": reference.target_thread_id.clone(),
+            "output_id": reference.output_id.clone(),
+            "reference_type": reference.reference_type.clone(),
+            "knowledge_origin": reference.knowledge_origin.clone(),
+            "status": reference.status.clone(),
+        }),
+    )
+    .await?;
+    Ok(Json(ThreadReferenceResponse { reference }))
+}
+
+async fn export_thread_transcript<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(source_thread_id): Path<String>,
+    Json(request): Json<CreateThreadArtifactRequest>,
+) -> Result<(StatusCode, Json<ThreadReferenceOutputResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    create_thread_knowledge_output(
+        state,
+        trace,
+        headers,
+        source_thread_id,
+        request,
+        "transcript_export",
+        "thread_transcript",
+    )
+    .await
+}
+
+async fn create_thread_handoff<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(source_thread_id): Path<String>,
+    Json(request): Json<CreateThreadArtifactRequest>,
+) -> Result<(StatusCode, Json<ThreadReferenceOutputResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    create_thread_knowledge_output(
+        state,
+        trace,
+        headers,
+        source_thread_id,
+        request,
+        "handoff",
+        "thread_handoff",
+    )
+    .await
+}
+
+async fn import_thread_artifact<S>(
+    State(state): State<AppState<S>>,
+    Extension(trace): Extension<TraceContext>,
+    headers: HeaderMap,
+    Path(target_thread_id): Path<String>,
+    Json(request): Json<ImportThreadArtifactRequest>,
+) -> Result<(StatusCode, Json<ArtifactImportResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    let target_session = state
+        .store
+        .get_session(&principal, &target_thread_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let source_output = state
+        .store
+        .get_output(&principal, &request.source_output_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let output_path = user_output_artifact_path(&state.config, &principal.user_id, &source_output)
+        .map_err(ApiError::storage)?;
+    let content = tokio::fs::read_to_string(&output_path)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::NOT_FOUND, error.to_string()))?;
+    let bounded = bounded_text(content, request.max_chars);
+    let source_thread_id = source_output
+        .session_id
+        .clone()
+        .unwrap_or_else(|| target_session.session_id.clone());
+    if source_output.session_id.is_some() {
+        state
+            .store
+            .get_session(&principal, &source_thread_id)
+            .await
+            .map_err(ApiError::storage)?;
+    }
+    let reference = state
+        .store
+        .create_thread_reference(
+            &principal,
+            CreateThreadReferenceInput {
+                source_thread_id,
+                target_thread_id: target_session.session_id.clone(),
+                source_output_id: Some(source_output.output_id.clone()),
+                output_id: Some(source_output.output_id.clone()),
+                reference_type: "artifact_import".to_string(),
+                knowledge_origin: "user_generated".to_string(),
+                status: "completed".to_string(),
+                metadata_json: serde_json::json!({
+                    "source_output_id": source_output.output_id,
+                    "target_thread_id": target_session.session_id,
+                    "excerpt_truncated": bounded.truncated,
+                }),
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(target_session.workspace_id.clone())
+            .session(target_session.session_id.clone()),
+        "thread_reference.create",
+        TraceResult::Completed,
+        serde_json::json!({
+            "reference_id": reference.reference_id.clone(),
+            "source_thread_id": reference.source_thread_id.clone(),
+            "target_thread_id": reference.target_thread_id.clone(),
+            "source_output_id": reference.source_output_id.clone(),
+            "output_id": reference.output_id.clone(),
+            "reference_type": reference.reference_type.clone(),
+            "knowledge_origin": reference.knowledge_origin.clone(),
+            "status": reference.status.clone(),
+            "excerpt_truncated": bounded.truncated,
+        }),
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ArtifactImportResponse {
+            reference,
+            excerpt: bounded.content,
+            excerpt_truncated: bounded.truncated,
+        }),
+    ))
+}
+
 #[utoipa::path(
     get,
     path = "/v1/workers",
@@ -3959,7 +4328,7 @@ where
         ),
         _ => (
             "Local Codex for Enterprise",
-            admin_overview_page(principal.as_ref().map(|principal| principal.role)).to_string(),
+            admin_overview_page(principal.as_ref().map(|principal| principal.role)),
         ),
     };
 
@@ -4013,7 +4382,7 @@ fn render_shell(
                 } else {
                     "Admin"
                 };
-                format!(r#"<a href="/admin">{}</a>"#, label)
+                format!(r#"<a href="/admin">{label}</a>"#)
             } else {
                 String::new()
             };
@@ -4836,11 +5205,17 @@ __CONTENT__
         const title = window.prompt('Output title', workbench.threadTitle || 'Saved output');
         if (!title || !title.trim()) return;
         try {
-          await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages/'+encodeURIComponent(message.message_id)+'/outputs', {
+          const savedOutput = await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/messages/'+encodeURIComponent(message.message_id)+'/outputs', {
             title:title.trim(),
             category:'deliverable',
             output_type:'markdown_report'
           });
+          if (message.threadReferenceId && savedOutput.output?.output_id) {
+            await patchJsonPayload('/v1/thread-references/'+encodeURIComponent(message.threadReferenceId), {
+              status:'completed',
+              output_id:savedOutput.output.output_id
+            });
+          }
           workbenchMessage('system', 'Output saved', 'Saved this assistant turn to My outputs.');
         } catch (error) {
           workbenchMessage('system', 'Output failed', error.message || 'Could not save this output.');
@@ -4908,7 +5283,7 @@ __CONTENT__
     if (!customElements.get('workbench-transcript')) {
       customElements.define('workbench-transcript', WorkbenchTranscript);
     }
-    const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], contextThreadId:null, activeThreadGeneration:0, pendingAssistantText:'', commandOutputChars:0, responsePreferences:null, feedbackMessageIndex:null };
+    const workbench = { socket:null, connecting:null, rpcReady:false, appThreadId:null, rpcCounter:0, pendingRpc:{}, sessionId:null, workerId:null, workspacePath:null, projectId:null, repositoryId:null, threadTitle:'Local Codex Chat', sessions:[], userWorkspaces:[], projects:[], outputs:[], contextThreadId:null, activeThreadGeneration:0, pendingAssistantText:'', commandOutputChars:0, responsePreferences:null, feedbackMessageIndex:null, pendingKnowledgeReferenceId:null };
     function workbenchEscape(value) {
       return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     }
@@ -5632,6 +6007,7 @@ __CONTENT__
       try {
         const payload = await fetchJson('/v1/outputs');
         const outputs = payload.outputs || [];
+        workbench.outputs = outputs;
         if (!outputs.length) {
           list.innerHTML = '<p class="hint">No outputs are assigned to your user yet.</p>';
           return;
@@ -5643,6 +6019,163 @@ __CONTENT__
         ).join('');
       } catch (error) {
         list.innerHTML = '<p class="hint">Could not load outputs: '+workbenchEscape(error.message)+'</p>';
+      }
+    }
+    function currentKnowledgeThreadOptions() {
+      return workbench.projects.flatMap((project) => (project.threads || []).map((thread) => ({
+        id: thread.session_id,
+        label: (project.name || 'Project')+' / '+(thread.title || 'Untitled thread')
+      })));
+    }
+    function fillWorkbenchSelect(id, items, label, value, emptyLabel) {
+      const element = document.getElementById(id);
+      if (!element) return;
+      element.innerHTML = '';
+      element.disabled = items.length === 0;
+      if (!items.length) {
+        const option = document.createElement('option');
+        option.textContent = emptyLabel || 'No options available';
+        option.disabled = true;
+        option.selected = true;
+        element.appendChild(option);
+        return;
+      }
+      for (const item of items) {
+        const option = document.createElement('option');
+        option.value = value(item);
+        option.textContent = label(item);
+        element.appendChild(option);
+      }
+    }
+    async function openKnowledgeTransferModal() {
+      const modal = document.getElementById('knowledge-transfer-modal');
+      const status = document.getElementById('knowledge-transfer-status');
+      if (!modal) return;
+      if (status) status.textContent = workbench.sessionId ? '' : 'Select or create a target thread before using thread knowledge.';
+      fillWorkbenchSelect('knowledge-source-thread', currentKnowledgeThreadOptions(), (thread) => thread.label, (thread) => thread.id, 'No accessible threads');
+      try {
+        const payload = await fetchJson('/v1/outputs');
+        workbench.outputs = payload.outputs || [];
+      } catch (_) {
+        workbench.outputs = [];
+      }
+      fillWorkbenchSelect('knowledge-source-output', workbench.outputs, (output) => (output.title || 'Untitled output')+' · '+(output.output_type || 'output'), (output) => output.output_id, 'No outputs available');
+      modal.showModal();
+    }
+    function selectedKnowledgeSourceThreadId() {
+      return document.getElementById('knowledge-source-thread')?.value || '';
+    }
+    function selectedKnowledgeOutputId() {
+      return document.getElementById('knowledge-source-output')?.value || '';
+    }
+    function knowledgeMaxChars() {
+      const value = Number(document.getElementById('knowledge-max-chars')?.value || 12000);
+      if (!Number.isFinite(value)) return 12000;
+      return Math.max(64, Math.min(20000, Math.floor(value)));
+    }
+    function setKnowledgeTransferStatus(text) {
+      const status = document.getElementById('knowledge-transfer-status');
+      if (status) status.textContent = text || '';
+    }
+    async function sendWorkbenchGeneratedPrompt(text, label) {
+      const generation = workbench.activeThreadGeneration;
+      try {
+        await ensureWorkbenchConnected();
+        if (!isActiveWorkbenchGeneration(generation)) return;
+        workbenchMessage('system', label || 'Thread knowledge', 'Sending bounded reference prompt through this thread worker.');
+        await sendWorkbenchRpcMessage(text, {recordUser:false, appendUser:false, rawPrompt:true});
+      } catch (firstError) {
+        try {
+          resetWorkbenchConnection();
+          await ensureWorkbenchConnected();
+          if (!isActiveWorkbenchGeneration(generation)) return;
+          await sendWorkbenchRpcMessage(text, {recordUser:false, appendUser:false, rawPrompt:true});
+        } catch (error) {
+          workbenchMessage('system', 'Knowledge transfer failed', error.message || firstError.message || 'Could not send thread knowledge.');
+        }
+      }
+    }
+    async function summarizeKnowledgeThread() {
+      if (!workbench.sessionId) {
+        setKnowledgeTransferStatus('Select or create a target thread first.');
+        return;
+      }
+      const sourceThreadId = selectedKnowledgeSourceThreadId();
+      if (!sourceThreadId) {
+        setKnowledgeTransferStatus('Choose a source thread.');
+        return;
+      }
+      try {
+        const payload = await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/references', {
+          source_thread_id: sourceThreadId,
+          reference_type: 'ai_summary',
+          max_chars: knowledgeMaxChars()
+        });
+        document.getElementById('knowledge-transfer-modal')?.close();
+        workbench.pendingKnowledgeReferenceId = payload.reference.reference_id;
+        workbenchMessage('system', 'Thread reference', 'AI summary reference '+payload.reference.reference_id+' is pending in this thread.');
+        await sendWorkbenchGeneratedPrompt(payload.summary_prompt, 'Summarize into this thread');
+      } catch (error) {
+        setKnowledgeTransferStatus(error.message || 'Could not create AI summary reference.');
+      }
+    }
+    async function exportKnowledgeThread() {
+      const sourceThreadId = selectedKnowledgeSourceThreadId();
+      if (!sourceThreadId) {
+        setKnowledgeTransferStatus('Choose a source thread.');
+        return;
+      }
+      try {
+        const payload = await postJsonPayload('/v1/threads/'+encodeURIComponent(sourceThreadId)+'/exports', {
+          target_thread_id: workbench.sessionId || sourceThreadId,
+          title: document.getElementById('knowledge-artifact-title')?.value || undefined,
+          max_chars: knowledgeMaxChars()
+        });
+        document.getElementById('knowledge-transfer-modal')?.close();
+        workbenchMessage('system', 'Transcript exported', 'Created output '+payload.output.output_id+' and reference '+payload.reference.reference_id+'.');
+        workbench.outputs = [];
+      } catch (error) {
+        setKnowledgeTransferStatus(error.message || 'Could not export transcript.');
+      }
+    }
+    async function createKnowledgeHandoff() {
+      const sourceThreadId = selectedKnowledgeSourceThreadId();
+      if (!sourceThreadId) {
+        setKnowledgeTransferStatus('Choose a source thread.');
+        return;
+      }
+      try {
+        const payload = await postJsonPayload('/v1/threads/'+encodeURIComponent(sourceThreadId)+'/handoffs', {
+          target_thread_id: workbench.sessionId || sourceThreadId,
+          title: document.getElementById('knowledge-artifact-title')?.value || undefined,
+          max_chars: knowledgeMaxChars()
+        });
+        document.getElementById('knowledge-transfer-modal')?.close();
+        workbenchMessage('system', 'Handoff created', 'Created handoff output '+payload.output.output_id+' and reference '+payload.reference.reference_id+'.');
+        workbench.outputs = [];
+      } catch (error) {
+        setKnowledgeTransferStatus(error.message || 'Could not create handoff.');
+      }
+    }
+    async function importKnowledgeOutput() {
+      if (!workbench.sessionId) {
+        setKnowledgeTransferStatus('Select or create a target thread first.');
+        return;
+      }
+      const outputId = selectedKnowledgeOutputId();
+      if (!outputId) {
+        setKnowledgeTransferStatus('Choose an output to import.');
+        return;
+      }
+      try {
+        const payload = await postJsonPayload('/v1/threads/'+encodeURIComponent(workbench.sessionId)+'/artifact-imports', {
+          source_output_id: outputId,
+          max_chars: knowledgeMaxChars()
+        });
+        document.getElementById('knowledge-transfer-modal')?.close();
+        workbenchMessage('system', 'Output imported', 'Imported output through reference '+payload.reference.reference_id+'. Excerpt:\n\n'+(payload.excerpt || 'No preview available.'));
+      } catch (error) {
+        setKnowledgeTransferStatus(error.message || 'Could not import output.');
       }
     }
     async function selectWorkbenchThread(sessionId) {
@@ -5797,7 +6330,7 @@ __CONTENT__
         clientInfo: {
           name: 'local-codex-enterprise-browser',
           title: 'Local Codex Enterprise Browser Chat',
-          version: '0.0.1-beta.6'
+          version: '0.0.1-beta.7'
         },
         capabilities: {
           experimentalApi: true,
@@ -5860,8 +6393,15 @@ __CONTENT__
             workbench.pendingAssistantText = '';
             completeWorkbenchAssistantTurn();
             (async () => {
+              const knowledgeReferenceId = workbench.pendingKnowledgeReferenceId;
+              workbench.pendingKnowledgeReferenceId = null;
               const saved = await recordWorkbenchThreadMessage('assistant', 'Codex', assistantText);
-              document.getElementById('workbench-chat')?.attachLastPersistedMessage?.('assistant', 'Codex', saved?.message);
+              const chat = document.getElementById('workbench-chat');
+              chat?.attachLastPersistedMessage?.('assistant', 'Codex', saved?.message);
+              if (knowledgeReferenceId && saved?.message?.message_id && Array.isArray(chat?.messages)) {
+                const last = chat.messages.findLast((message) => message.message_id === saved.message.message_id);
+                if (last) last.threadReferenceId = knowledgeReferenceId;
+              }
               await autoLabelWorkbenchThreadAfterFirstAiTurn();
             })().catch((error) => {
               workbenchMessage('system', 'History', 'Could not save Codex reply: '+error.message);
@@ -5884,7 +6424,7 @@ __CONTENT__
       if (!workbench.appThreadId) {
         await startWorkbenchRpcThread();
       }
-      const modelText = buildWorkbenchUserPrompt(text);
+      const modelText = settings.rawPrompt ? text : buildWorkbenchUserPrompt(text);
       if (settings.appendUser) workbenchMessage('user', 'You', text);
       if (settings.recordUser) {
         const saved = await recordWorkbenchThreadMessage('user', 'You', text);
@@ -6541,11 +7081,16 @@ fn chat_page(
       .thread-context-menu button.danger-menu-item {{ color: #ffb4a8; }}
       .chat-modal {{ border: 1px solid #333746; border-radius: 12px; background: #101219; color: #f5f6fa; padding: 18px; max-width: 420px; }}
       .output-modal {{ width: min(760px, calc(100vw - 48px)); max-width: 760px; }}
+      .knowledge-transfer-modal {{ width: min(820px, calc(100vw - 48px)); max-width: 820px; }}
       .chat-modal::backdrop {{ background: rgba(0,0,0,.62); }}
       .output-list {{ display: grid; gap: 10px; margin: 14px 0; max-height: 60vh; overflow: auto; }}
       .output-row {{ border: 1px solid #2a2d37; border-radius: 10px; background: #0d0f14; padding: 12px; }}
       .output-row strong {{ display: block; color: #f5f6fa; margin-bottom: 4px; }}
       .output-row code {{ color: #aab2c3; overflow-wrap: anywhere; }}
+      .knowledge-transfer-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 14px 0; }}
+      .knowledge-transfer-grid label {{ margin: 0; }}
+      .knowledge-transfer-grid select, .knowledge-transfer-grid input {{ width: 100%; }}
+      .knowledge-transfer-actions {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
       @media (max-width: 480px) {{ body {{ overflow: auto; }} main {{ height: auto; }} .chat-shell-fullscreen {{ --chat-content-width: 100%; position: static; height: auto; min-height: 100vh; overflow: visible; grid-template-columns: 1fr; }} .chat-rail {{ min-height: 44vh; border-right: 0; border-bottom: 1px solid #22242b; }} .chat-topbar {{ padding: 0 10px; }} .chat-title-wrap {{ max-width: 58vw; }} .workbench-status {{ font-size: 12px; }} .chat-composer-wrap {{ padding: 12px 14px 70px; }} .chat-composer {{ border-radius: 14px; }} .thread-title-input {{ width: 58vw; }} }}
       @media (min-width: 481px) and (max-width: 820px) {{ body {{ overflow: auto; }} main {{ height: auto; }} .chat-shell-fullscreen {{ --chat-content-width: 100%; position: static; height: auto; min-height: 100vh; overflow: visible; grid-template-columns: 1fr; }} .chat-rail {{ min-height: 38vh; border-right: 0; border-bottom: 1px solid #22242b; }} .chat-composer-wrap {{ padding: 16px 20px 74px; }} .chat-title-wrap {{ max-width: 64vw; }} }}
       @media (min-width: 821px) and (max-width: 1439px) {{ .chat-shell-fullscreen {{ --chat-content-width: 980px; grid-template-columns: 320px minmax(0, 1fr); }} }}
@@ -6555,6 +7100,7 @@ fn chat_page(
       <aside class="chat-rail">
         <button class="icon-button rail-collapse-button" title="Collapse sidebar" onclick="toggleChatRail()"><svg class="lucide-icon" data-icon="panel-left-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/></svg></button>
         <button class="rail-action" onclick="openWorkbenchOutputs()">My outputs</button>
+        <button class="rail-action" onclick="openKnowledgeTransferModal()">Use thread knowledge</button>
         <div class="rail-section-title">
           <span>Projects</span>
           <span class="section-tools">
@@ -6630,6 +7176,24 @@ fn chat_page(
       <p class="hint">Read-only assets assigned to your user. End outputs are stakeholder-facing deliverables; operational outputs are work records.</p>
       <div id="workbench-output-list" class="output-list"><p class="hint">Loading outputs...</p></div>
       <button onclick="document.getElementById('workbench-output-modal').close()">Close</button>
+    </dialog>
+    <dialog id="knowledge-transfer-modal" class="chat-modal knowledge-transfer-modal" data-reference-update-path="/v1/thread-references/">
+      <strong>Use thread knowledge</strong>
+      <p class="hint">Move bounded knowledge into the selected thread. References record provenance only; they do not execute work outside the current session/worker.</p>
+      <div class="knowledge-transfer-grid">
+        <label>Source thread<select id="knowledge-source-thread"></select></label>
+        <label>Existing output<select id="knowledge-source-output"></select></label>
+        <label>Artifact title<input id="knowledge-artifact-title" placeholder="Thread handoff"></label>
+        <label>Max characters<input id="knowledge-max-chars" type="number" min="64" max="20000" value="12000"></label>
+      </div>
+      <div class="knowledge-transfer-actions">
+        <button onclick="summarizeKnowledgeThread()">Summarize into this thread</button>
+        <button class="secondary" onclick="exportKnowledgeThread()">Export transcript</button>
+        <button class="secondary" onclick="createKnowledgeHandoff()">Create handoff</button>
+        <button class="secondary" onclick="importKnowledgeOutput()">Import output</button>
+        <button class="secondary" onclick="document.getElementById('knowledge-transfer-modal').close()">Close</button>
+      </div>
+      <p id="knowledge-transfer-status" class="hint"></p>
     </dialog>
     <dialog id="response-feedback-modal" class="chat-modal">
       <strong>Bad response</strong>
@@ -6827,6 +7391,233 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+struct BoundedContent {
+    content: String,
+    truncated: bool,
+}
+
+async fn create_thread_knowledge_output<S>(
+    state: AppState<S>,
+    trace: TraceContext,
+    headers: HeaderMap,
+    source_thread_id: String,
+    request: CreateThreadArtifactRequest,
+    reference_type: &str,
+    output_type: &str,
+) -> Result<(StatusCode, Json<ThreadReferenceOutputResponse>), ApiError>
+where
+    S: EnterpriseStore,
+{
+    let principal = authenticate(&state, &headers).await?;
+    authorize(&state, &trace, &principal, EnterpriseAction::ReadThreads).await?;
+    let source_session = state
+        .store
+        .get_session(&principal, &source_thread_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let target_thread_id = request
+        .target_thread_id
+        .clone()
+        .unwrap_or_else(|| source_session.session_id.clone());
+    let target_session = state
+        .store
+        .get_session(&principal, &target_thread_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let messages = state
+        .store
+        .list_session_messages(&principal, &source_session.session_id)
+        .await
+        .map_err(ApiError::storage)?;
+    let title = request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| default_thread_knowledge_title(reference_type, &source_session));
+    let bounded = if reference_type == "handoff" {
+        bounded_thread_handoff_markdown(&source_session, &messages, request.max_chars)
+    } else {
+        bounded_thread_markdown(&source_session, &messages, request.max_chars)
+    };
+    let artifact_path =
+        generated_thread_knowledge_artifact_path(&source_session.session_id, &title);
+    let output = state
+        .store
+        .create_output(CreateOutputInput {
+            owner_user_id: principal.user_id.clone(),
+            workspace_id: Some(target_session.workspace_id.clone()),
+            session_id: Some(source_session.session_id.clone()),
+            worker_id: source_session.last_worker_id.clone(),
+            category: OutputCategory::Deliverable,
+            output_type: output_type.to_string(),
+            title,
+            artifact_path,
+            status: "completed".to_string(),
+            metadata_json: serde_json::json!({
+                "source": "thread_reference",
+                "source_thread_id": source_session.session_id,
+                "target_thread_id": target_session.session_id,
+                "reference_type": reference_type,
+                "knowledge_origin": "user_generated",
+                "truncated": bounded.truncated,
+                "message_count": messages.len(),
+            }),
+        })
+        .await
+        .map_err(ApiError::storage)?;
+    let output_path = user_output_artifact_path(&state.config, &principal.user_id, &output)
+        .map_err(ApiError::storage)?;
+    if let Some(parent) = output_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+    tokio::fs::write(&output_path, bounded.content.as_bytes())
+        .await
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let reference = state
+        .store
+        .create_thread_reference(
+            &principal,
+            CreateThreadReferenceInput {
+                source_thread_id: source_session.session_id.clone(),
+                target_thread_id: target_session.session_id.clone(),
+                source_output_id: None,
+                output_id: Some(output.output_id.clone()),
+                reference_type: reference_type.to_string(),
+                knowledge_origin: "user_generated".to_string(),
+                status: "completed".to_string(),
+                metadata_json: serde_json::json!({
+                    "source_thread_id": source_session.session_id,
+                    "target_thread_id": target_session.session_id,
+                    "output_id": output.output_id,
+                    "reference_type": reference_type,
+                    "knowledge_origin": "user_generated",
+                    "truncated": bounded.truncated,
+                    "message_count": messages.len(),
+                }),
+            },
+        )
+        .await
+        .map_err(ApiError::storage)?;
+    record_audit(
+        &state,
+        EvidenceRecordContext::new(&trace)
+            .actor(principal.user_id.clone())
+            .workspace(target_session.workspace_id.clone())
+            .session(target_session.session_id.clone()),
+        "thread_reference.create",
+        TraceResult::Completed,
+        serde_json::json!({
+            "reference_id": reference.reference_id.clone(),
+            "source_thread_id": reference.source_thread_id.clone(),
+            "target_thread_id": reference.target_thread_id.clone(),
+            "output_id": reference.output_id.clone(),
+            "reference_type": reference.reference_type.clone(),
+            "knowledge_origin": reference.knowledge_origin.clone(),
+            "status": reference.status.clone(),
+            "truncated": bounded.truncated,
+        }),
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ThreadReferenceOutputResponse { reference, output }),
+    ))
+}
+
+fn default_thread_knowledge_title(reference_type: &str, session: &SessionRecord) -> String {
+    let title = session.title.as_deref().unwrap_or("Thread");
+    if reference_type == "handoff" {
+        format!("{title} Handoff")
+    } else {
+        format!("{title} Transcript Export")
+    }
+}
+
+fn bounded_thread_markdown(
+    session: &SessionRecord,
+    messages: &[SessionMessageRecord],
+    max_chars: Option<usize>,
+) -> BoundedContent {
+    let title = session.title.as_deref().unwrap_or("Untitled thread");
+    let mut content = format!(
+        "# Thread Export: {title}\n\nSource thread: `{}`\n\n## Transcript\n\n",
+        session.session_id
+    );
+    for message in messages {
+        content.push_str(&format!(
+            "### {}\n\n{}\n\n",
+            message.label,
+            sanitize_artifact_markdown_text(&message.text)
+        ));
+    }
+    bounded_text(content, max_chars)
+}
+
+fn bounded_thread_handoff_markdown(
+    session: &SessionRecord,
+    messages: &[SessionMessageRecord],
+    max_chars: Option<usize>,
+) -> BoundedContent {
+    let title = session.title.as_deref().unwrap_or("Untitled thread");
+    let source = bounded_thread_markdown(session, messages, max_chars).content;
+    let content = format!(
+        "# Thread Handoff: {title}\n\nSource thread: `{}`\n\n## Decisions\n\n{}\n\n## Completed Work\n\nSee source transcript excerpt below.\n\n## Open Questions\n\n{}\n\n## Next Actions\n\nReview this handoff in the target thread and decide the next session task.\n\n## Source Excerpt\n\n{}",
+        session.session_id,
+        extract_lines_for_handoff(messages, "decision"),
+        extract_lines_for_handoff(messages, "question"),
+        source
+    );
+    bounded_text(content, max_chars)
+}
+
+fn extract_lines_for_handoff(messages: &[SessionMessageRecord], needle: &str) -> String {
+    let needle = needle.to_ascii_lowercase();
+    let lines = messages
+        .iter()
+        .flat_map(|message| message.text.lines())
+        .filter(|line| line.to_ascii_lowercase().contains(&needle))
+        .map(|line| format!("- {}", sanitize_artifact_markdown_text(line)))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        "- No explicit entries found in the bounded source thread.".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn bounded_text(content: String, max_chars: Option<usize>) -> BoundedContent {
+    let limit = max_chars.unwrap_or(12_000).clamp(64, 20_000);
+    let mut truncated = false;
+    let mut bounded = String::new();
+    for (index, character) in content.chars().enumerate() {
+        if index >= limit {
+            truncated = true;
+            break;
+        }
+        bounded.push(character);
+    }
+    if truncated {
+        bounded.push_str("\n\n[Truncated by Local Codex for Enterprise.]\n");
+    }
+    BoundedContent {
+        content: bounded,
+        truncated,
+    }
+}
+
+fn generated_thread_knowledge_artifact_path(thread_id: &str, title: &str) -> String {
+    let slug = slugify_output_title(title);
+    format!("thread-knowledge/{thread_id}/{}-{slug}.md", Uuid::new_v4())
+}
+
+fn sanitize_artifact_markdown_text(value: &str) -> String {
+    value.replace('\0', "")
+}
+
 fn parse_role(value: &str) -> Result<EnterpriseRole, ApiError> {
     if value == "owner" {
         return Err(ApiError::new(
@@ -6872,10 +7663,10 @@ async fn user_workspace_roots_from_request(
     config: &EnterpriseConfig,
     request: &CreateUserRequest,
 ) -> anyhow::Result<Vec<String>> {
-    if let Some(roots) = &request.workspace_roots {
-        if !roots.is_empty() {
-            return Ok(roots.clone());
-        }
+    if let Some(roots) = &request.workspace_roots
+        && !roots.is_empty()
+    {
+        return Ok(roots.clone());
     }
     Ok(
         default_user_workspace_root_for_email(config, &request.email)

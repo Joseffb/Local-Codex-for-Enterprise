@@ -445,6 +445,26 @@ pub struct UserResponsePreferencesRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ThreadReferenceRecord {
+    pub reference_id: String,
+    pub owner_user_id: String,
+    pub source_thread_id: String,
+    pub target_thread_id: String,
+    pub source_output_id: Option<String>,
+    pub output_id: Option<String>,
+    pub reference_type: String,
+    pub knowledge_origin: String,
+    pub status: String,
+    pub metadata_json: serde_json::Value,
+    #[schema(value_type = String)]
+    pub created_at: DateTime<Utc>,
+    #[schema(value_type = String)]
+    pub updated_at: DateTime<Utc>,
+    #[schema(value_type = Option<String>)]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSessionMessageInput {
     pub kind: String,
@@ -465,6 +485,25 @@ pub struct UpsertResponseFeedbackInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateSessionTitleInput {
     pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateThreadReferenceInput {
+    pub source_thread_id: String,
+    pub target_thread_id: String,
+    pub source_output_id: Option<String>,
+    pub output_id: Option<String>,
+    pub reference_type: String,
+    pub knowledge_origin: String,
+    pub status: String,
+    pub metadata_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateThreadReferenceInput {
+    pub output_id: Option<String>,
+    pub status: String,
+    pub metadata_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -588,6 +627,22 @@ pub trait EnterpriseStore: Clone + Send + Sync + 'static {
         principal: &AuthPrincipal,
     ) -> Result<UserResponsePreferencesRecord>;
     async fn reset_response_preferences(&self, principal: &AuthPrincipal) -> Result<()>;
+    async fn create_thread_reference(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateThreadReferenceInput,
+    ) -> Result<ThreadReferenceRecord>;
+    async fn list_thread_references(
+        &self,
+        principal: &AuthPrincipal,
+        thread_id: &str,
+    ) -> Result<Vec<ThreadReferenceRecord>>;
+    async fn update_thread_reference(
+        &self,
+        principal: &AuthPrincipal,
+        reference_id: &str,
+        input: UpdateThreadReferenceInput,
+    ) -> Result<ThreadReferenceRecord>;
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -742,6 +797,7 @@ struct MemoryState {
     handoffs: HashMap<String, WorkerHandoffRecord>,
     sessions: HashMap<String, SessionRecord>,
     session_messages: HashMap<String, Vec<SessionMessageRecord>>,
+    thread_references: Vec<ThreadReferenceRecord>,
     response_feedback: HashMap<String, ResponseFeedbackRecord>,
     response_preferences: HashMap<String, UserResponsePreferencesRecord>,
     audit_events: Vec<AuditEventRecord>,
@@ -887,6 +943,30 @@ fn response_preference_summary(positive_tags: &[String], negative_tags: &[String
 
 fn feedback_key(owner_user_id: &str, message_id: &str) -> String {
     format!("{owner_user_id}:{message_id}")
+}
+
+fn validate_thread_reference_fields(
+    reference_type: &str,
+    knowledge_origin: &str,
+    status: &str,
+) -> Result<()> {
+    if !matches!(
+        reference_type,
+        "transcript_export" | "ai_summary" | "handoff" | "artifact_import"
+    ) {
+        anyhow::bail!("unsupported thread reference type");
+    }
+    if !matches!(knowledge_origin, "user_generated" | "ai_generated") {
+        anyhow::bail!("unsupported knowledge origin");
+    }
+    validate_thread_reference_status(status)
+}
+
+fn validate_thread_reference_status(status: &str) -> Result<()> {
+    if !matches!(status, "pending" | "completed" | "failed") {
+        anyhow::bail!("unsupported thread reference status");
+    }
+    Ok(())
 }
 
 fn feedback_reason_tags_from_json(value: serde_json::Value) -> Result<Vec<String>> {
@@ -1388,6 +1468,107 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         Ok(())
     }
 
+    async fn create_thread_reference(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateThreadReferenceInput,
+    ) -> Result<ThreadReferenceRecord> {
+        validate_thread_reference_fields(
+            &input.reference_type,
+            &input.knowledge_origin,
+            &input.status,
+        )?;
+        if let Some(output_id) = input.source_output_id.as_deref() {
+            self.get_output(principal, output_id).await?;
+        }
+        if let Some(output_id) = input.output_id.as_deref() {
+            self.get_output(principal, output_id).await?;
+        }
+        let mut state = self.state.lock().await;
+        state
+            .sessions
+            .get(&input.source_thread_id)
+            .filter(|session| {
+                session.owner_user_id == principal.user_id && session.deleted_at.is_none()
+            })
+            .context("source thread not found")?;
+        state
+            .sessions
+            .get(&input.target_thread_id)
+            .filter(|session| {
+                session.owner_user_id == principal.user_id && session.deleted_at.is_none()
+            })
+            .context("target thread not found")?;
+        let now = Utc::now();
+        let reference = ThreadReferenceRecord {
+            reference_id: Uuid::new_v4().to_string(),
+            owner_user_id: principal.user_id.clone(),
+            source_thread_id: input.source_thread_id,
+            target_thread_id: input.target_thread_id,
+            source_output_id: input.source_output_id,
+            output_id: input.output_id,
+            reference_type: input.reference_type,
+            knowledge_origin: input.knowledge_origin,
+            completed_at: (input.status == "completed").then_some(now),
+            status: input.status,
+            metadata_json: input.metadata_json,
+            created_at: now,
+            updated_at: now,
+        };
+        state.thread_references.push(reference.clone());
+        Ok(reference)
+    }
+
+    async fn list_thread_references(
+        &self,
+        principal: &AuthPrincipal,
+        thread_id: &str,
+    ) -> Result<Vec<ThreadReferenceRecord>> {
+        self.get_session(principal, thread_id).await?;
+        let state = self.state.lock().await;
+        let mut references: Vec<_> = state
+            .thread_references
+            .iter()
+            .filter(|reference| {
+                reference.owner_user_id == principal.user_id
+                    && (reference.source_thread_id == thread_id
+                        || reference.target_thread_id == thread_id)
+            })
+            .cloned()
+            .collect();
+        references.sort_by_key(|reference| std::cmp::Reverse(reference.created_at));
+        Ok(references)
+    }
+
+    async fn update_thread_reference(
+        &self,
+        principal: &AuthPrincipal,
+        reference_id: &str,
+        input: UpdateThreadReferenceInput,
+    ) -> Result<ThreadReferenceRecord> {
+        validate_thread_reference_status(&input.status)?;
+        if let Some(output_id) = input.output_id.as_deref() {
+            self.get_output(principal, output_id).await?;
+        }
+        let mut state = self.state.lock().await;
+        let reference = state
+            .thread_references
+            .iter_mut()
+            .find(|reference| {
+                reference.reference_id == reference_id
+                    && reference.owner_user_id == principal.user_id
+            })
+            .context("thread reference not found")?;
+        reference.output_id = input.output_id.or_else(|| reference.output_id.clone());
+        reference.status = input.status;
+        if let Some(metadata_json) = input.metadata_json {
+            reference.metadata_json = metadata_json;
+        }
+        reference.updated_at = Utc::now();
+        reference.completed_at = (reference.status == "completed").then_some(reference.updated_at);
+        Ok(reference.clone())
+    }
+
     async fn start_worker(
         &self,
         principal: &AuthPrincipal,
@@ -1397,7 +1578,7 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
         let mut state = self.state.lock().await;
         let authorized_roots = authorized_roots_for_user(&state, principal);
         let resolved_workspace_path = authorize_workspace(&authorized_roots, workspace_path)?;
-        let workspace_roots = authorized_roots.clone();
+        let workspace_roots = authorized_roots;
         let now = Utc::now();
         let worker = WorkerRecord {
             worker_id: Uuid::new_v4().to_string(),
@@ -1683,7 +1864,7 @@ impl EnterpriseStore for InMemoryEnterpriseStore {
             workspace_path,
             input.title,
         )?;
-        session.project_id = Some(project.project_id.clone());
+        session.project_id = Some(project.project_id);
         session.repository_id = input.repository_id;
         if state.sessions.contains_key(&session.session_id) {
             anyhow::bail!("session already exists");
@@ -2956,6 +3137,125 @@ impl EnterpriseStore for PostgresEnterpriseStore {
             .await
             .context("reset response preferences")?;
         Ok(())
+    }
+
+    async fn create_thread_reference(
+        &self,
+        principal: &AuthPrincipal,
+        input: CreateThreadReferenceInput,
+    ) -> Result<ThreadReferenceRecord> {
+        validate_thread_reference_fields(
+            &input.reference_type,
+            &input.knowledge_origin,
+            &input.status,
+        )?;
+        self.get_session(principal, &input.source_thread_id).await?;
+        self.get_session(principal, &input.target_thread_id).await?;
+        let source_output_id = input
+            .source_output_id
+            .as_deref()
+            .map(|output_id| Uuid::parse_str(output_id).context("parse source output id"))
+            .transpose()?;
+        if let Some(output_id) = input.source_output_id.as_deref() {
+            self.get_output(principal, output_id).await?;
+        }
+        let output_id = input
+            .output_id
+            .as_deref()
+            .map(|output_id| Uuid::parse_str(output_id).context("parse output id"))
+            .transpose()?;
+        if let Some(output_id) = input.output_id.as_deref() {
+            self.get_output(principal, output_id).await?;
+        }
+        let completed_at_expr = if input.status == "completed" {
+            Some(Utc::now())
+        } else {
+            None
+        };
+        let row = sqlx::query(
+            "INSERT INTO enterprise_thread_references
+             (reference_id, owner_user_id, source_thread_id, target_thread_id, source_output_id, output_id, reference_type, knowledge_origin, status, metadata_json, completed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING reference_id::text, owner_user_id::text, source_thread_id, target_thread_id, source_output_id::text, output_id::text, reference_type, knowledge_origin, status, metadata_json, created_at, updated_at, completed_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::parse_str(&principal.user_id).context("parse reference owner user id")?)
+        .bind(input.source_thread_id)
+        .bind(input.target_thread_id)
+        .bind(source_output_id)
+        .bind(output_id)
+        .bind(input.reference_type)
+        .bind(input.knowledge_origin)
+        .bind(input.status)
+        .bind(input.metadata_json)
+        .bind(completed_at_expr)
+        .fetch_one(&self.pool)
+        .await
+        .context("insert thread reference")?;
+        thread_reference_from_row(row)
+    }
+
+    async fn list_thread_references(
+        &self,
+        principal: &AuthPrincipal,
+        thread_id: &str,
+    ) -> Result<Vec<ThreadReferenceRecord>> {
+        self.get_session(principal, thread_id).await?;
+        let rows = sqlx::query(
+            "SELECT reference_id::text, owner_user_id::text, source_thread_id, target_thread_id, source_output_id::text, output_id::text, reference_type, knowledge_origin, status, metadata_json, created_at, updated_at, completed_at
+             FROM enterprise_thread_references
+             WHERE owner_user_id = $1 AND (source_thread_id = $2 OR target_thread_id = $2)
+             ORDER BY created_at DESC",
+        )
+        .bind(Uuid::parse_str(&principal.user_id).context("parse reference owner user id")?)
+        .bind(thread_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("list thread references")?;
+        rows.into_iter().map(thread_reference_from_row).collect()
+    }
+
+    async fn update_thread_reference(
+        &self,
+        principal: &AuthPrincipal,
+        reference_id: &str,
+        input: UpdateThreadReferenceInput,
+    ) -> Result<ThreadReferenceRecord> {
+        validate_thread_reference_status(&input.status)?;
+        let output_id = input
+            .output_id
+            .as_deref()
+            .map(|output_id| Uuid::parse_str(output_id).context("parse reference output id"))
+            .transpose()?;
+        if let Some(output_id) = input.output_id.as_deref() {
+            self.get_output(principal, output_id).await?;
+        }
+        let completed_at = if input.status == "completed" {
+            Some(Utc::now())
+        } else {
+            None
+        };
+        let row = sqlx::query(
+            "UPDATE enterprise_thread_references
+             SET output_id = COALESCE($3, output_id),
+                 status = $4,
+                 metadata_json = COALESCE($5, metadata_json),
+                 completed_at = $6,
+                 updated_at = now()
+             WHERE reference_id = $1 AND owner_user_id = $2
+             RETURNING reference_id::text, owner_user_id::text, source_thread_id, target_thread_id, source_output_id::text, output_id::text, reference_type, knowledge_origin, status, metadata_json, created_at, updated_at, completed_at",
+        )
+        .bind(Uuid::parse_str(reference_id).context("parse thread reference id")?)
+        .bind(Uuid::parse_str(&principal.user_id).context("parse reference owner user id")?)
+        .bind(output_id)
+        .bind(input.status)
+        .bind(input.metadata_json)
+        .bind(completed_at)
+        .fetch_optional(&self.pool)
+        .await
+        .context("update thread reference")?
+        .context("thread reference not found")?;
+        thread_reference_from_row(row)
     }
 
     async fn start_worker(
@@ -4741,6 +5041,24 @@ fn output_from_row(row: sqlx::postgres::PgRow) -> Result<OutputRecord> {
         metadata_json: row.try_get("metadata_json")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn thread_reference_from_row(row: sqlx::postgres::PgRow) -> Result<ThreadReferenceRecord> {
+    Ok(ThreadReferenceRecord {
+        reference_id: row.try_get("reference_id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        source_thread_id: row.try_get("source_thread_id")?,
+        target_thread_id: row.try_get("target_thread_id")?,
+        source_output_id: row.try_get("source_output_id")?,
+        output_id: row.try_get("output_id")?,
+        reference_type: row.try_get("reference_type")?,
+        knowledge_origin: row.try_get("knowledge_origin")?,
+        status: row.try_get("status")?,
+        metadata_json: row.try_get("metadata_json")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        completed_at: row.try_get("completed_at")?,
     })
 }
 

@@ -6,6 +6,19 @@ This project is a community fork and is not affiliated with, endorsed by, or sup
 
 ## [Unreleased]
 
+## [0.0.1-beta.7] - 2026-06-12
+
+### Added
+
+- Added cross-thread knowledge references for transcript exports, handoffs, output imports, and AI summaries.
+- Added server-generated Markdown output artifacts for bounded transcript exports and handoffs.
+- Added `/chat` knowledge-transfer UI for selecting accessible threads/outputs without dumping raw transcript content into the conversation.
+
+### Security
+
+- Thread reference metadata records provenance only: IDs, type, origin, status, truncation, and timestamps.
+- AI summaries run through the current target thread worker; no source-thread worker, worker-to-worker messaging, workflow runtime, or background execution was added.
+
 ## [0.0.1-beta.3] - 2026-06-09
 
 ### Changed

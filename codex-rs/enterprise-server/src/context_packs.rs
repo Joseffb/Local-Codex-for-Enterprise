@@ -212,7 +212,7 @@ pub fn validate_relative_path(path: &str) -> Result<String> {
     if path.starts_with('/') || path.starts_with('\\') || path.contains('\\') {
         anyhow::bail!("context pack file path is not allowed");
     }
-    if path.chars().any(|ch| ch.is_control()) {
+    if path.chars().any(char::is_control) {
         anyhow::bail!("context pack file path is not allowed");
     }
     let mut parts = Vec::new();
@@ -221,7 +221,7 @@ pub fn validate_relative_path(path: &str) -> Result<String> {
             || part == "."
             || part == ".."
             || part.starts_with('.')
-            || part.chars().any(|ch| ch.is_control())
+            || part.chars().any(char::is_control)
         {
             anyhow::bail!("context pack file path is not allowed");
         }
@@ -254,9 +254,7 @@ pub fn normalize_source_type(requested: Option<&str>) -> Result<String> {
 }
 
 pub fn is_system_file(relative_path: &str) -> bool {
-    STANDARD_FILENAMES
-        .iter()
-        .any(|filename| relative_path == *filename)
+    STANDARD_FILENAMES.contains(&relative_path)
 }
 
 pub fn infer_content_type(relative_path: &str) -> &'static str {

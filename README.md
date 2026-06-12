@@ -4,7 +4,7 @@ Local Codex for Enterprise is a community fork and self-hosted enterprise extens
 
 This repository is not affiliated with, endorsed by, or supported by OpenAI. It is derived from the open-source OpenAI Codex project and preserves the upstream Apache-2.0 license and attribution.
 
-Current beta: `0.0.1-beta.6`.
+Current beta: `0.0.1-beta.7`.
 
 ## What This Is
 
@@ -24,7 +24,7 @@ Current beta: `0.0.1-beta.6`.
 
 ## Current Status
 
-The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Context Pack upload/assignment/receipts, project-scoped chat threads, browser worker handoff, sanitized Markdown chat rendering, user response feedback, server-generated saved output artifacts, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
+The enterprise server currently supports health/config endpoints, first-run owner setup, password login, browser cookie auth, minimal user management, seeded RBAC role assignment, workspace root registration/validation, HTTPS-only repository clone intake, Context Pack upload/assignment/receipts, project-scoped chat threads, browser worker handoff, sanitized Markdown chat rendering, user response feedback, server-generated saved output artifacts, cross-thread knowledge references, trace-aware audit events, execution receipts, audit query APIs, and Docker Compose local evaluation.
 
 The product domain contract is defined in [docs/enterprise-domain-contract.md](docs/enterprise-domain-contract.md). In short: workspace roots are server allowlist boundaries, user workspaces are per-user filesystem spaces, projects are human work containers, repositories are cloned checkouts inside projects, and threads are chat histories attached to projects/repositories.
 
@@ -514,6 +514,14 @@ The demo covers Compose startup, `/healthz`, browser login, session creation, wo
 ## Roadmap
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for planned work. Scheduled sessions are listed there as deferred functionality that reuses the existing session, worker, trace, audit, receipt, and Context Pack loading lifecycle. Context Packs remain lifecycle packages; they are not executable workflow definitions, schedulers, governance runtimes, or automatic skill execution.
+
+## Cross-Thread Knowledge Transfer
+
+The browser workbench includes a "Use thread knowledge" action for bounded thread-to-thread knowledge movement. Users can export a transcript, create a handoff, import an existing output, or create a pending AI-summary reference into the selected target thread.
+
+References are provenance records, not execution instructions. Transcript exports, handoffs, and output imports are deterministic user-generated references. AI summaries are marked as AI-generated and are sent through the current target thread's existing worker connection. There is no source-thread worker, worker-to-worker messaging, background execution, workflow engine, or governance runtime in this feature.
+
+Generated transcript and handoff artifacts are saved as server-generated Markdown outputs. Reference and audit metadata store IDs, status, type, origin, truncation, and provenance only; they do not store transcript bodies, prompts, model outputs, auth headers, tokens, credentials, or private examples.
 
 ## Current Limitations
 

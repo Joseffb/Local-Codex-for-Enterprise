@@ -3575,6 +3575,449 @@ async fn assistant_message_can_be_saved_as_server_generated_output_snapshot() {
 }
 
 #[tokio::test]
+async fn user_moves_thread_knowledge_through_exports_handoffs_imports_and_ai_summary_references() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let output_root = temp_dir.path().join("output-artifacts");
+    std::fs::create_dir_all(&output_root).expect("output root");
+    let mut config = EnterpriseConfig::default();
+    config.output_artifact_root = output_root.to_string_lossy().to_string();
+    let router = api::build_router_with_store(InMemoryEnterpriseStore::default(), config);
+    let workspace_root = temp_dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let trace_id = Uuid::new_v4().to_string();
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        Some(&trace_id),
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED, "{}", bootstrap.text);
+    let token = bootstrap.json["api_token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let source = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "workspace_path": workspace_root,
+            "title": "Source research"
+        }),
+    )
+    .await;
+    assert_eq!(source.status, StatusCode::CREATED, "{}", source.text);
+    let source_thread_id = source.json["session"]["session_id"]
+        .as_str()
+        .expect("source thread id")
+        .to_string();
+
+    let target = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "workspace_path": workspace_root,
+            "title": "Target planning"
+        }),
+    )
+    .await;
+    assert_eq!(target.status, StatusCode::CREATED, "{}", target.text);
+    let target_thread_id = target.json["session"]["session_id"]
+        .as_str()
+        .expect("target thread id")
+        .to_string();
+
+    let source_messages = [
+        ("user", "You", "Identify the client portal reporting needs."),
+        (
+            "assistant",
+            "Codex",
+            "Decision: prioritize sales, inventory, customer, and returns dashboards.\nOpen question: confirm ERP export format.",
+        ),
+    ];
+    for (kind, label, text) in source_messages {
+        let message = json_request(
+            router.clone(),
+            "POST",
+            &format!("/v1/threads/{source_thread_id}/messages"),
+            Some(&token),
+            Some(&trace_id),
+            serde_json::json!({
+                "kind": kind,
+                "label": label,
+                "text": text
+            }),
+        )
+        .await;
+        assert_eq!(message.status, StatusCode::CREATED, "{}", message.text);
+    }
+
+    let export = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{source_thread_id}/exports"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "target_thread_id": target_thread_id,
+            "title": "Source Transcript Export",
+            "max_chars": 4096,
+            "artifact_path": "../ignored.md"
+        }),
+    )
+    .await;
+    assert_eq!(export.status, StatusCode::CREATED, "{}", export.text);
+    assert_eq!(
+        export.json["reference"]["reference_type"],
+        "transcript_export"
+    );
+    assert_eq!(
+        export.json["reference"]["knowledge_origin"],
+        "user_generated"
+    );
+    assert_eq!(export.json["reference"]["status"], "completed");
+    assert_eq!(
+        export.json["reference"]["source_thread_id"],
+        source_thread_id
+    );
+    assert_eq!(
+        export.json["reference"]["target_thread_id"],
+        target_thread_id
+    );
+    let export_output_id = export.json["output"]["output_id"]
+        .as_str()
+        .expect("export output id")
+        .to_string();
+    assert!(
+        export.json["output"]["artifact_path"]
+            .as_str()
+            .expect("artifact path")
+            .starts_with("thread-knowledge/")
+    );
+    assert!(!export.text.contains("prioritize sales"));
+
+    let export_download = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/outputs/{export_output_id}/download"),
+        Some(&token),
+        Some(&trace_id),
+    )
+    .await;
+    assert_eq!(
+        export_download.status,
+        StatusCode::OK,
+        "{}",
+        export_download.text
+    );
+    assert!(export_download.text.contains("Source research"));
+    assert!(export_download.text.contains("prioritize sales"));
+
+    let handoff = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{source_thread_id}/handoffs"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "target_thread_id": target_thread_id,
+            "title": "Portal Planning Handoff",
+            "max_chars": 4096
+        }),
+    )
+    .await;
+    assert_eq!(handoff.status, StatusCode::CREATED, "{}", handoff.text);
+    assert_eq!(handoff.json["reference"]["reference_type"], "handoff");
+    assert_eq!(
+        handoff.json["reference"]["knowledge_origin"],
+        "user_generated"
+    );
+    let handoff_output_id = handoff.json["output"]["output_id"]
+        .as_str()
+        .expect("handoff output id");
+    let handoff_download = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/outputs/{handoff_output_id}/download"),
+        Some(&token),
+        Some(&trace_id),
+    )
+    .await;
+    assert!(handoff_download.text.contains("## Decisions"));
+    assert!(handoff_download.text.contains("## Open Questions"));
+    assert!(handoff_download.text.contains("ERP export format"));
+
+    let import = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{target_thread_id}/artifact-imports"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "source_output_id": export_output_id,
+            "max_chars": 120
+        }),
+    )
+    .await;
+    assert_eq!(import.status, StatusCode::CREATED, "{}", import.text);
+    assert_eq!(
+        import.json["reference"]["reference_type"],
+        "artifact_import"
+    );
+    assert_eq!(
+        import.json["reference"]["knowledge_origin"],
+        "user_generated"
+    );
+    assert_eq!(import.json["excerpt_truncated"], true);
+    assert!(!import.text.contains("Decision: prioritize sales"));
+
+    let summary = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{target_thread_id}/references"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "source_thread_id": source_thread_id,
+            "reference_type": "ai_summary",
+            "max_chars": 4096
+        }),
+    )
+    .await;
+    assert_eq!(summary.status, StatusCode::CREATED, "{}", summary.text);
+    assert_eq!(summary.json["reference"]["reference_type"], "ai_summary");
+    assert_eq!(
+        summary.json["reference"]["knowledge_origin"],
+        "ai_generated"
+    );
+    assert_eq!(summary.json["reference"]["status"], "pending");
+    assert!(
+        summary.json["summary_prompt"]
+            .as_str()
+            .expect("summary prompt")
+            .contains("Summarize the referenced source thread")
+    );
+    assert!(
+        summary.json["summary_prompt"]
+            .as_str()
+            .expect("summary prompt")
+            .contains("confirm ERP export format")
+    );
+
+    let summary_reference_id = summary.json["reference"]["reference_id"]
+        .as_str()
+        .expect("summary reference id")
+        .to_string();
+    let completed = json_request(
+        router.clone(),
+        "PATCH",
+        &format!("/v1/thread-references/{summary_reference_id}"),
+        Some(&token),
+        Some(&trace_id),
+        serde_json::json!({
+            "status": "completed",
+            "output_id": handoff_output_id
+        }),
+    )
+    .await;
+    assert_eq!(completed.status, StatusCode::OK, "{}", completed.text);
+    assert_eq!(completed.json["reference"]["status"], "completed");
+    assert_eq!(completed.json["reference"]["output_id"], handoff_output_id);
+
+    let references = empty_request(
+        router.clone(),
+        "GET",
+        &format!("/v1/threads/{target_thread_id}/references"),
+        Some(&token),
+        Some(&trace_id),
+    )
+    .await;
+    assert_eq!(references.status, StatusCode::OK, "{}", references.text);
+    assert_eq!(
+        references.json["references"]
+            .as_array()
+            .expect("references")
+            .len(),
+        4
+    );
+
+    let audit = empty_request(
+        router,
+        "GET",
+        &format!("/v1/evidence-records?trace_id={trace_id}"),
+        Some(&token),
+        Some(&trace_id),
+    )
+    .await;
+    assert_eq!(audit.status, StatusCode::OK, "{}", audit.text);
+    assert!(audit.text.contains("thread_reference.create"));
+    assert!(audit.text.contains("knowledge_origin"));
+    assert!(!audit.text.contains("prioritize sales"));
+    assert!(!audit.text.contains("ERP export format"));
+}
+
+#[tokio::test]
+async fn cross_thread_references_reject_inaccessible_threads_and_chat_exposes_knowledge_modal() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let workspace_root = temp_dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    let mut config = EnterpriseConfig::default();
+    config.default_workspace_root = Some(workspace_root.to_string_lossy().to_string());
+    let router = api::build_router_with_store(InMemoryEnterpriseStore::default(), config);
+    let bootstrap = json_request(
+        router.clone(),
+        "POST",
+        "/v1/setup/enterprise",
+        None,
+        None,
+        serde_json::json!({
+            "owner_email": "owner@example.com",
+            "owner_password": "owner-password",
+            "workspace_roots": [workspace_root],
+        }),
+    )
+    .await;
+    assert_eq!(bootstrap.status, StatusCode::CREATED, "{}", bootstrap.text);
+    let admin_token = bootstrap.json["api_token"]
+        .as_str()
+        .expect("admin token")
+        .to_string();
+
+    let user = json_request(
+        router.clone(),
+        "POST",
+        "/v1/users",
+        Some(&admin_token),
+        None,
+        serde_json::json!({
+            "email": "developer@example.com",
+            "password": "developer-password",
+            "role": "developer",
+        }),
+    )
+    .await;
+    assert_eq!(user.status, StatusCode::CREATED, "{}", user.text);
+
+    let developer = json_request(
+        router.clone(),
+        "POST",
+        "/v1/auth/login",
+        None,
+        None,
+        serde_json::json!({
+            "email": "developer@example.com",
+            "password": "developer-password",
+        }),
+    )
+    .await;
+    assert_eq!(developer.status, StatusCode::OK, "{}", developer.text);
+    let developer_token = developer.json["api_token"]
+        .as_str()
+        .expect("developer token")
+        .to_string();
+    let developer_workspaces = empty_request(
+        router.clone(),
+        "GET",
+        "/v1/user-workspaces",
+        Some(&developer_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        developer_workspaces.status,
+        StatusCode::OK,
+        "{}",
+        developer_workspaces.text
+    );
+    let developer_workspace_path = developer_workspaces.json["user_workspaces"][0]["path"]
+        .as_str()
+        .expect("developer workspace path")
+        .to_string();
+
+    let admin_thread = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&admin_token),
+        None,
+        serde_json::json!({
+            "workspace_path": workspace_root,
+            "title": "Admin private thread"
+        }),
+    )
+    .await;
+    assert_eq!(
+        admin_thread.status,
+        StatusCode::CREATED,
+        "{}",
+        admin_thread.text
+    );
+    let admin_thread_id = admin_thread.json["session"]["session_id"]
+        .as_str()
+        .expect("admin thread id");
+
+    let developer_thread = json_request(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        Some(&developer_token),
+        None,
+        serde_json::json!({
+            "workspace_path": developer_workspace_path,
+            "title": "Developer thread"
+        }),
+    )
+    .await;
+    assert_eq!(
+        developer_thread.status,
+        StatusCode::CREATED,
+        "{}",
+        developer_thread.text
+    );
+    let developer_thread_id = developer_thread.json["session"]["session_id"]
+        .as_str()
+        .expect("developer thread id");
+
+    let denied = json_request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{developer_thread_id}/references"),
+        Some(&developer_token),
+        None,
+        serde_json::json!({
+            "source_thread_id": admin_thread_id,
+            "reference_type": "ai_summary"
+        }),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::NOT_FOUND, "{}", denied.text);
+
+    let chat = empty_request(router, "GET", "/chat", Some(&developer_token), None).await;
+    assert_eq!(chat.status, StatusCode::OK);
+    assert!(chat.text.contains("Use thread knowledge"));
+    assert!(chat.text.contains("knowledge-transfer-modal"));
+    assert!(chat.text.contains("Summarize into this thread"));
+    assert!(chat.text.contains("Export transcript"));
+    assert!(chat.text.contains("Create handoff"));
+    assert!(chat.text.contains("Import output"));
+    assert!(chat.text.contains("/v1/thread-references/"));
+    assert!(chat.text.contains("activeThreadGeneration"));
+}
+
+#[tokio::test]
 async fn rbac_page_explains_permissions_and_exposes_assignment_crud() {
     let router = api::build_test_router();
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -4129,13 +4572,13 @@ async fn login_page_redirects_home_and_nav_says_home_when_authenticated() {
     assert!(
         chat_with_auth
             .text
-            .contains("Local Codex for Enterprise v0.0.1-beta.6")
+            .contains("Local Codex for Enterprise v0.0.1-beta.7")
     );
     assert!(chat_with_auth.text.contains("Made with Codex"));
     assert!(
         chat_with_auth
             .text
-            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.6</span></div></div>"#)
+            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.7</span></div></div>"#)
     );
     let footer_index = chat_with_auth
         .text

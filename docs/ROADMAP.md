@@ -10,6 +10,25 @@ This roadmap tracks public product direction for Local Codex for Enterprise. It 
 - Preserve trace, audit, and receipt continuity without storing prompts, model outputs, credentials, handoff tokens, or private examples.
 - Keep the UI functional for setup, login, admin, projects, context packs, outputs, audit, and chat.
 
+## Implemented: Cross-Thread Knowledge Transfer MVP
+
+Cross-thread knowledge transfer now uses explicit references and outputs for knowledge continuity. The implementation supports transcript export, handoff creation, artifact import, and AI-summary prompt preparation from one accessible thread into the currently selected target thread.
+
+Implemented boundaries:
+
+- References move knowledge; they do not execute work.
+- Transcript exports, handoffs, and output imports are deterministic `user_generated` references.
+- AI summaries are `ai_generated` references and run through the current target thread's existing worker.
+- Reference records store provenance metadata only: IDs, type, origin, status, truncation, and timestamps.
+- Generated transcript and handoff content is stored in server-generated Markdown outputs, not in audit/receipt metadata.
+- No source-thread worker, worker-to-worker messaging, background execution, workflow engine, governance runtime, or agent orchestration framework was introduced.
+
+Remaining follow-up:
+
+- Improve presentation of reference activity in the chat transcript.
+- Add richer output previews and reference browsing.
+- Evaluate cross-thread prompting only after summaries, handoffs, and artifacts are mature.
+
 ## Near-Term Work
 
 - Polish the browser chat workbench so thread switching clears and reloads the selected thread history cleanly.
@@ -104,9 +123,9 @@ Deferred scheduled-session details:
 - Approval gates.
 - Fernain compatibility export.
 
-## Planned: Cross-Thread Knowledge Transfer
+## Later: Cross-Thread Knowledge Transfer Expansion
 
-Cross-thread knowledge transfer is planned for recurring reporting, long-running project work, and cases where a user needs work from one thread available in another thread. The goal is knowledge continuity, not agent-to-agent autonomy.
+Cross-thread knowledge transfer can expand for recurring reporting, long-running project work, and cases where a user needs work from one thread available in another thread. The goal remains knowledge continuity, not agent-to-agent autonomy.
 
 Problem examples:
 
@@ -114,11 +133,11 @@ Problem examples:
 - Read the latest report thread and discuss the findings.
 - Use conclusions from architecture thread A in implementation thread B.
 
-Core decision:
+Continuing decision:
 
-- Implement thread references, thread summaries, and thread artifacts before implementing thread messaging.
-- Focus on knowledge transfer, not agent communication.
+- Keep focusing on knowledge transfer, not agent communication.
 - Keep execution session-based.
+- Keep prompt-sending across threads deferred until references, summaries, handoffs, and artifacts prove useful.
 
 Initial capabilities:
 
