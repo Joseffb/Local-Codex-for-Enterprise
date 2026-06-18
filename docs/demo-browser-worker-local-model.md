@@ -26,7 +26,7 @@ Known release blocker: app-server `model/list` can still return upstream model c
 - A local model pulled:
 
   ```sh
-  docker model pull ai/qwen3-coder
+  docker model pull ai/glm-4.7-flash
   ```
 
 ## Start The Stack

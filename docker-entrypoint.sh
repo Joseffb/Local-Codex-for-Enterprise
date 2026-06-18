@@ -13,7 +13,7 @@ if [ -n "${CODEX_DOCKER_MODEL_CONTEXT_HOST:-}" ] && command -v docker >/dev/null
 fi
 
 if [ "${CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG:-1}" != "0" ]; then
-    model_id="${CODEX_MODEL:-ai/qwen3-coder}"
+    model_id="${CODEX_MODEL:-ai/glm-4.7-flash}"
     provider_id="${CODEX_MODEL_PROVIDER_ID:-docker-model-runner-container}"
     provider_name="${CODEX_MODEL_PROVIDER_NAME:-Docker Model Runner}"
     provider_base_url="${CODEX_MODEL_PROVIDER_BASE_URL:-http://host.docker.internal:12434/engines/v1}"

@@ -6,6 +6,13 @@ This project is a community fork and is not affiliated with, endorsed by, or sup
 
 ## [Unreleased]
 
+## [0.0.1-beta.9] - 2026-06-18
+
+### Changed
+
+- Changed the default Docker Model Runner starter model from `ai/qwen3-coder` to `ai/glm-4.7-flash`.
+- Updated the Enterprise container, Compose defaults, setup docs, local-model demo docs, and browser client version marker for the beta.9 release.
+
 ## [0.0.1-beta.8] - 2026-06-12
 
 ### Added

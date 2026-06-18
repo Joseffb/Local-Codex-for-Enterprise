@@ -4,7 +4,7 @@ Local Codex for Enterprise is a community fork and self-hosted enterprise extens
 
 This repository is not affiliated with, endorsed by, or supported by OpenAI. It is derived from the open-source OpenAI Codex project and preserves the upstream Apache-2.0 license and attribution.
 
-Current beta: `0.0.1-beta.8`.
+Current beta: `0.0.1-beta.9`.
 
 ## What This Is
 
@@ -116,7 +116,7 @@ Prerequisites:
 - A local Docker model pulled, for example:
 
   ```sh
-  docker model pull ai/qwen3-coder
+  docker model pull ai/glm-4.7-flash
   ```
 
 Start the enterprise stack:
@@ -170,7 +170,7 @@ The enterprise container:
 - Mounts the host Docker socket for local Docker services.
 - Points Docker Model Runner traffic at `http://host.docker.internal:12434/engines/v1`.
 - Launches workers through `codex-container-entrypoint app-server --listen unix://{socket_path}` so worker processes receive the same local Docker model provider config as the container CLI path.
-- Sets the default container model from `CODEX_MODEL`, defaulting to `ai/qwen3-coder`.
+- Sets the default container model from `CODEX_MODEL`, defaulting to `ai/glm-4.7-flash`.
 - Uses container `/tmp` for ephemeral worker sockets and logs.
 
 For a clean reset:
@@ -231,7 +231,7 @@ docker run --rm \
   -e LOCAL_CODEX_ENTERPRISE_HANDOFF_TOKEN_SECRET="REPLACE_WITH_LONG_RANDOM_SECRET" \
   -e LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT="/enterprise-workspaces" \
   -e CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG=1 \
-  -e CODEX_MODEL="ai/qwen3-coder" \
+  -e CODEX_MODEL="ai/glm-4.7-flash" \
   -e CODEX_MODEL_PROVIDER_ID="docker-model-runner-container" \
   -e CODEX_MODEL_PROVIDER_NAME="Docker Model Runner" \
   -e CODEX_MODEL_PROVIDER_BASE_URL="http://host.docker.internal:12434/engines/v1" \
@@ -412,10 +412,10 @@ Default model config:
 
 ```toml
 model_provider = "docker-model-runner"
-model = "ai/qwen3-coder"
+model = "ai/glm-4.7-flash"
 ```
 
-`ai/qwen3-coder` is a starter default, not a permanent product assumption. Change `model` through normal Codex config paths.
+`ai/glm-4.7-flash` is a starter default, not a permanent product assumption. Change `model` through normal Codex config paths.
 
 Built-in local providers:
 
@@ -573,7 +573,7 @@ docker run --rm \
   -e LOCAL_CODEX_ENTERPRISE_DEFAULT_WORKSPACE_ROOT="/enterprise-workspaces" \
   -e LOCAL_CODEX_ENTERPRISE_SCHEDULED_RUNNER_MODE="app_server_rpc" \
   -e CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG=1 \
-  -e CODEX_MODEL="ai/qwen3-coder" \
+  -e CODEX_MODEL="ai/glm-4.7-flash" \
   -e CODEX_MODEL_PROVIDER_ID="docker-model-runner-container" \
   -e CODEX_MODEL_PROVIDER_NAME="Docker Model Runner" \
   -e CODEX_MODEL_PROVIDER_BASE_URL="http://host.docker.internal:12434/engines/v1" \

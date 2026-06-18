@@ -33,7 +33,7 @@ impl Default for EnterpriseConfig {
         Self {
             mode: ServerMode::Enterprise,
             default_model_provider: "docker-model-runner".to_string(),
-            default_model: "ai/qwen3-coder".to_string(),
+            default_model: "ai/glm-4.7-flash".to_string(),
             bind_addr: "127.0.0.1:8787".to_string(),
             database_url: None,
             worker_command: "codex-app-server".to_string(),

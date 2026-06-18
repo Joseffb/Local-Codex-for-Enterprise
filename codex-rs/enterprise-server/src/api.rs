@@ -7177,7 +7177,7 @@ __CONTENT__
         clientInfo: {
           name: 'local-codex-enterprise-browser',
           title: 'Local Codex Enterprise Browser Chat',
-          version: '0.0.1-beta.8'
+          version: '0.0.1-beta.9'
         },
         capabilities: {
           experimentalApi: true,

@@ -46,7 +46,7 @@ services:
       HOME: /codex-home
       DOCKER_HOST: unix:///docker.sock
       CODEX_CONTAINER_DEFAULT_PROVIDER_CONFIG: "1"
-      CODEX_MODEL: ${CODEX_MODEL:-ai/qwen3-coder}
+      CODEX_MODEL: ${CODEX_MODEL:-ai/glm-4.7-flash}
       CODEX_MODEL_PROVIDER_ID: docker-model-runner-container
       CODEX_MODEL_PROVIDER_NAME: Docker Model Runner
       CODEX_MODEL_PROVIDER_BASE_URL: http://host.docker.internal:12434/engines/v1

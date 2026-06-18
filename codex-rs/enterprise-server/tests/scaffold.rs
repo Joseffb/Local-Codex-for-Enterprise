@@ -36,7 +36,7 @@ fn default_config_selects_enterprise_mode_and_local_model_defaults() {
 
     assert_eq!(config.mode, ServerMode::Enterprise);
     assert_eq!(config.default_model_provider, "docker-model-runner");
-    assert_eq!(config.default_model, "ai/qwen3-coder");
+    assert_eq!(config.default_model, "ai/glm-4.7-flash");
     assert!(config.scheduler_enabled);
     assert_eq!(config.scheduler_poll_seconds, 30);
     assert_eq!(config.scheduler_run_timeout_seconds, 1800);
@@ -5041,16 +5041,12 @@ async fn login_page_redirects_home_and_nav_says_home_when_authenticated() {
             .text
             .contains(r#"<a href="/login">Login</a>"#)
     );
-    assert!(
-        chat_with_auth
-            .text
-            .contains("Local Codex for Enterprise v0.0.1-beta.8")
-    );
+    assert!(chat_with_auth.text.contains("Local Codex for Enterprise"));
     assert!(chat_with_auth.text.contains("Made with Codex"));
     assert!(
         chat_with_auth
             .text
-            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.8</span></div></div>"#)
+            .contains(r#"<div class="chat-brand-corner"><strong>Local Codex for Enterprise</strong><div class="chat-brand-meta"><span class="chat-brand-motto">Made with Codex</span><span class="chat-brand-version">v0.0.1-beta.9</span></div></div>"#)
     );
     let footer_index = chat_with_auth
         .text
